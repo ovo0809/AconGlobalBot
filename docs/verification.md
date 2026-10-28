@@ -6,7 +6,7 @@
 
 - `npm run typecheck`：通过。
 - `npm run lint`：通过。
-- `npm test`：28/28 通过，覆盖报告规则、来源、结构、中文分页 PDF、真实 Request/Response 会话权限、CSRF、四入口、财务未知／拒答、版本、复核、邮件策略、部分失败与 unknown 对账、完整应用 SQLite online backup／恢复、假上游 WebSocket 协议。
+- `npm test`：29/29 通过，覆盖报告规则、来源、结构、中文分页 PDF、真实 Request/Response 会话权限、CSRF 与回环 Host 归一化、四入口、财务未知／拒答、版本、复核、邮件策略、部分失败与 unknown 对账、完整应用 SQLite online backup／恢复、假上游 WebSocket 协议。
 - `npm run build`：通过，无构建警告。数据库为运行时数据，不参与 Next 文件追踪。
 - `npm run test:e2e`：3 条 Chromium 流程通过，见下文。
 - `npm audit --audit-level=moderate`：0 vulnerabilities（当前锁定依赖检查结果）。

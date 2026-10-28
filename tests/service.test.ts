@@ -420,3 +420,15 @@ test('online backup and restore preserve the populated application database byte
     restored.close();
   }
 });
+
+test('same-origin requests use the browser Host when Next normalizes the URL hostname', async () => {
+  const browser = new BrowserSession();
+  const data = await browser.login('advisor2@aeconn.example');
+  const request = (origin: string) => new Request(`${ORIGIN}/api/action`, {
+    method: 'POST',
+    headers: { cookie: browser.cookie, 'x-csrf-token': browser.csrf, host: '127.0.0.1:3000', origin, 'content-type': 'application/json' },
+    body: JSON.stringify({ action: 'cancelSend', caseId: data.cases[0].id }),
+  });
+  assert.equal((await safeAction(request('http://127.0.0.1:3000'))).status, 200);
+  assert.equal((await safeAction(request('http://attacker.invalid'))).status, 403);
+});

@@ -30,7 +30,7 @@ function readAuth(request:Request):Auth|null {
   if(!token) return null;
   return db().prepare('SELECT * FROM auth_sessions WHERE token_hash=? AND expires_at>?').get(digest(token),Date.now()) as Auth|undefined ?? null;
 }
-function cookie(token:string,request:Request){return `aeconn_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${new URL(request.url).protocol==='https:'?'; Secure':''}`;}
+function cookie(token:string,request:Request){return `aeconn_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${new URL(request.url).protocol==='https:'||process.env.HTTPS_PROXY_ORIGIN?.startsWith('https://')?'; Secure':''}`;}
 function newAuth(request:Request,userId:string|null=null):{auth:Auth;cookie:string}{
   const token=randomBytes(32).toString('hex'); const auth:Auth={id:id(),user_id:userId,csrf:randomBytes(32).toString('hex'),mode:userId?'advisor':'anonymous',active_case:null,active_interview:null,last_ended_case:null,expires_at:Date.now()+8*60*60*1000};
   db().prepare('INSERT INTO auth_sessions(id,token_hash,user_id,csrf,mode,expires_at) VALUES(?,?,?,?,?,?)').run(auth.id,digest(token),userId,auth.csrf,auth.mode,auth.expires_at);
@@ -138,7 +138,9 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
 export async function action(request:Request):Promise<Response>{
   const auth=readAuth(request);requireThat(auth,401,'会话已过期，请刷新页面。');
   requireThat(request.headers.get('x-csrf-token')===auth.csrf,403,'会话校验失败，请刷新页面。');
-  const origin=request.headers.get('origin');requireThat(origin===new URL(request.url).origin,403,'请求来源校验失败。');
+  // Next may normalize Request.url to localhost; the browser's same-origin Host remains authoritative.
+  const requestUrl=new URL(request.url);const expectedOrigin=process.env.HTTPS_PROXY_ORIGIN||`${requestUrl.protocol}//${request.headers.get('host')||requestUrl.host}`;
+  requireThat(request.headers.get('origin')===expectedOrigin,403,'请求来源校验失败。');
   const raw=await request.text();requireThat(raw.length<=32_768,413,'输入过长。');let input:Input;try{input=JSON.parse(raw);}catch{throw new AppError(400,'请求格式错误。');}requireThat(input&&typeof input==='object'&&!Array.isArray(input),400,'请求格式错误。');
   const name=str(input,'action',80);requireThat(name,400,'缺少操作。');
   if(name==='login'){
