@@ -33,8 +33,11 @@ export function db():DatabaseSync {
     CREATE TABLE IF NOT EXISTS notification_jobs (id TEXT PRIMARY KEY, case_id TEXT NOT NULL, report_version INTEGER NOT NULL, recipient TEXT NOT NULL, notification_type TEXT NOT NULL, approval_id TEXT NOT NULL REFERENCES approvals(id), doc TEXT NOT NULL, UNIQUE(case_id,report_version,recipient,notification_type), FOREIGN KEY(case_id,report_version) REFERENCES reports(case_id,version));
     CREATE TABLE IF NOT EXISTS audit_events (id TEXT PRIMARY KEY, actor_id TEXT, case_id TEXT, action TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS voice_tokens (token_hash TEXT PRIMARY KEY, interview_id TEXT NOT NULL REFERENCES interviews(id), auth_id TEXT NOT NULL REFERENCES auth_sessions(id), expires_at INTEGER NOT NULL);
-    PRAGMA user_version=1;
+    CREATE TABLE IF NOT EXISTS report_jobs (case_id TEXT PRIMARY KEY REFERENCES cases(id), status TEXT NOT NULL, doc TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS interview_extractions (session_id TEXT PRIMARY KEY REFERENCES interviews(id), transcript_hash TEXT NOT NULL, updated_at TEXT NOT NULL);
+    PRAGMA user_version=2;
   `);
+  if(!database.prepare('PRAGMA table_info(interviews)').all().some(row=>row.name==='epoch'))database.exec('ALTER TABLE interviews ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0');
   seed(database); return database;
 }
 export function transaction<T>(fn:()=>T):T { const database=db(); database.exec('BEGIN IMMEDIATE'); try {const value=fn(); database.exec('COMMIT'); return value;} catch(error){database.exec('ROLLBACK');throw error;} }

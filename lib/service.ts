@@ -1,15 +1,16 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { audit, checkPassword, db, docs, id, now, pack, transaction, unpack } from './db';
 import { buildReport, renderPdf, validateAnalyses } from './report';
-import { analyzeWithProvider } from './providers';
-import { providerDisplayCapabilities } from './provider-config';
+import { analyzeWithProvider, interviewWithProvider } from './providers';
+import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-config';
+import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
 import { closeVoiceSession } from './voice-server';
 import { DryRunMailProvider } from './mail';
-import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, Review, Settings, User } from './domain';
+import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
 
 type Input=Record<string,unknown>;
 type Auth={id:string;user_id:string|null;csrf:string;mode:string;active_case:string|null;active_interview:string|null;last_ended_case:string|null;expires_at:number};
-type Interview={id:string;case_id:string;auth_id:string;state:string;entry:Category|null;current_question:string|null;deadline:number|null;incomplete:number;voice_state:string};
+type Interview={id:string;case_id:string;auth_id:string;state:string;entry:Category|null;current_question:string|null;deadline:number|null;incomplete:number;voice_state:string;epoch:number};
 export class AppError extends Error {constructor(public status:number,message:string){super(message);}}
 function requireThat(condition:unknown,status:number,message:string):asserts condition {if(!condition) throw new AppError(status,message);}
 const digest=(text:string)=>createHash('sha256').update(text).digest('hex');
@@ -17,14 +18,11 @@ const str=(input:Input,key:string,max=5000)=>typeof input[key]==='string'?String
 const categories:Category[]=['life','annuity','ltc','disability_income'];
 const factStatuses:FactStatus[]=['confirmed','reported_unverified','unknown','declined','conflicting'];
 const amountKeys=new Set(['income','expenses','debt','reserve','assets','budget']);
-export const questions:Record<string,string>={goal:'您最希望解决什么问题？大约计划什么时候开始？',horizon:'这个目标的时间范围是多久？',dependents:'哪些家人依赖您的收入？如果收入停止，家庭有哪些责任？',state:'您目前居住在哪个州？',employment:'您目前从事什么工作？收入是否稳定？',income:'您的收入大约是多少？请说明币种，以及每月或每年。',expenses:'家庭支出大约是多少？请说明币种及每月或每年。',debt:'目前有哪些债务？如提供金额，请说明币种和一次性余额。',reserve:'紧急储备大约是多少？请说明币种和一次性金额。',assets:'可支配资产大约是多少？请说明币种和一次性金额。',existing_life:'目前有哪些人寿保障？您认为是否覆盖家庭责任？',existing_di:'目前有哪些收入中断或伤残保障？',existing_ltc:'目前有哪些长期照护保障或安排？',budget:'您愿意考虑的预算是多少？请说明币种及每月或每年。',liquidity:'您对随时取用资金有哪些需要？',retirement:'您有哪些退休收入来源、计划和时间安排？',care:'如果未来需要长期照护，谁可以协助？您主要担心什么？'};
-const questionOrder=(entry:Category|null)=>{
-  const first=entry==='annuity'?['goal','retirement','liquidity']:entry==='ltc'?['goal','care']:entry==='disability_income'?['goal','employment','income']:['goal','dependents','existing_life'];
-  return [...new Set([...first,...Object.keys(questions)])];
-};
-const shared=globalThis as typeof globalThis & {aeconnReportLocks?:Map<string,Promise<ReportRecord>>;aeconnLoginAttempts?:Map<string,{count:number;until:number}>};
+export const questions:Record<string,string>=INTERVIEW_QUESTIONS;
+const shared=globalThis as typeof globalThis & {aeconnReportLocks?:Map<string,Promise<ReportRecord>>;aeconnLoginAttempts?:Map<string,{count:number;until:number}>;aeconnInterviewLocks?:Set<string>;aeconnReportWorker?:ReturnType<typeof setInterval>;aeconnReportWorkerBusy?:boolean};
 const locks=shared.aeconnReportLocks??=new Map();
 const loginAttempts=shared.aeconnLoginAttempts??=new Map();
+const interviewLocks=shared.aeconnInterviewLocks??=new Set();
 
 function readAuth(request:Request):Auth|null {
   const token=request.headers.get('cookie')?.match(/(?:^|;\s*)aeconn_session=([^;]+)/)?.[1];
@@ -57,12 +55,13 @@ function settingsFor(user:User):Settings {const row=db().prepare('SELECT setting
 function recipientsFor(record:Case){const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];const settings=settingsFor(owner);return [{email:settings.companyEmail,name:'公司邮箱（Charles 管理）',verified:settings.companyVerified},{email:owner.email,name:owner.name,verified:owner.emailVerified}];}
 function recipientFingerprint(record:Case){return digest(pack(recipientsFor(record)));}
 function reportRecord(content:ReportContent,record:Case):ReportRecord {return {...content,stale:content.version!==record.reportVersion||record.status==='needs_report',recipientFingerprint:recipientFingerprint(record),recipients:recipientsFor(record),pdfUrl:`/api/report?caseId=${encodeURIComponent(record.id)}&version=${content.version}&format=pdf`,pdfReady:true};}
-function addMessage(sessionId:string,caseId:string,role:'user'|'assistant',text:string,eventId=id(),turnId=eventId,interrupted=false):Message {
-  const message:Message={id:id(),caseId,sessionId,role,text,final:true,eventId,turnId,interrupted,createdAt:now(),playbackStatus:interrupted?'interrupted':'unknown',correctionOf:null};
+function addMessage(sessionId:string,caseId:string,role:'user'|'assistant',text:string,eventId=id(),turnId=eventId,interrupted=false,final=true,source:Message['source']='customer',actorId?:string):Message {
+  const message:Message={id:id(),caseId,sessionId,role,text,final,eventId,turnId,interrupted,createdAt:now(),playbackStatus:interrupted?'interrupted':'unknown',correctionOf:null,source,actorId};
   db().prepare('INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)').run(message.id,caseId,sessionId,eventId,turnId,role,pack(message));
   return docs<Message>('SELECT doc FROM messages WHERE session_id=? AND (event_id=? OR turn_id=?) AND role=?',sessionId,eventId,turnId,role)[0];
 }
-function askNext(session:Interview){const facts=factsFor(session.case_id);const key=questionOrder(session.entry).find(key=>!facts.some(field=>field.key===key));db().prepare('UPDATE interviews SET current_question=? WHERE id=?').run(key??null,session.id);addMessage(session.id,session.case_id,'assistant',key?questions[key]:'谢谢，已保存您提供的情况。您可以补充遗漏的信息，或点击结束并将手机交还顾问。');}
+function interviewInput(session:Interview):InterviewInput{const record=docs<Case>('SELECT doc FROM cases WHERE id=?',session.case_id)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];return {caseRecord:{id:session.case_id},entry:session.entry??'life',knownClient:{state:client.state,language:client.language},facts:factsFor(session.case_id),messages:messagesFor(session.case_id)};}
+function askNext(session:Interview,eventId?:string){const next=nextInterviewTurn(interviewInput(session));db().prepare('UPDATE interviews SET current_question=? WHERE id=?').run(next.targetKey,session.id);addMessage(session.id,session.case_id,'assistant',next.reply,eventId);}
 function validateFact(fact:ProfileField,messages:Message[]){
   requireThat(Object.hasOwn(questions,fact.key),400,'未知事实字段。');requireThat(factStatuses.includes(fact.factStatus),400,'事实状态无效。');
   requireThat(fact.value===null||typeof fact.value==='string'||typeof fact.value==='number',400,'事实值格式错误。');
@@ -73,15 +72,71 @@ function validateFact(fact:ProfileField,messages:Message[]){
 }
 function saveFact(caseId:string,fact:ProfileField){validateFact(fact,messagesFor(caseId));db().prepare('INSERT INTO profile_fields VALUES(?,?,?) ON CONFLICT(case_id,field_key) DO UPDATE SET doc=excluded.doc').run(caseId,fact.key,pack(fact));}
 function parseAnswer(key:string,text:string,messageId:string):ProfileField|null {
-  const base:ProfileField={key,value:text,currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:[messageId],confirmedBy:null,confirmedAt:null};
-  if(/^(不知道|未知|不清楚|需要补充|unknown)$/i.test(text)) return {...base,value:null,factStatus:'unknown'};
-  if(/^(不愿提供|不愿回答|拒答|跳过|declined)$/i.test(text)) return {...base,value:null,factStatus:'declined'};
-  if(!amountKeys.has(key))return base;
-  const amount=text.replace(/,/g,'').match(/(?<![\w.])-?\d+(?:\.\d+)?/);const currency=/USD|美元|美金|\$/i.test(text)?'USD':/CNY|人民币|元/i.test(text)?'CNY':/CAD|加元/i.test(text)?'CAD':/EUR|欧元/i.test(text)?'EUR':/HKD|港币/i.test(text)?'HKD':null;
-  const period=/每月|月|month/i.test(text)?'month':/每年|年|year/i.test(text)?'year':/一次|余额|总额|once/i.test(text)?'once':null;
-  if(!amount||!currency||!period||Number(amount[0])<0)return null;
-  return {...base,value:Number(amount[0]),currency,period};
+  return parseGroundedAnswer(key,text,messageId);
 }
+
+async function respondToText(session:Interview,text:string,eventId:string){
+  const replyId=`${eventId}:reply`;
+  if(db().prepare("SELECT id FROM messages WHERE session_id=? AND event_id=? AND role='assistant'").get(session.id,replyId))return;
+  requireThat(!interviewLocks.has(session.id),409,'上一条回答正在处理，请稍后重试。');
+  requireThat(session.voice_state==='ended'||session.voice_state==='error',409,'语音连接正在接收文字，请先停止语音或暂停后恢复文字访谈。');
+  interviewLocks.add(session.id);
+  try{
+    const message=addMessage(session.id,session.case_id,'user',text,eventId);
+    let turn;
+    try{turn=await interviewWithProvider(interviewInput(session));}
+    catch{throw new AppError(503,'您的回答已保存。云端访谈暂时未完成，请稍后重试或交还顾问；不会使用模拟回复冒充 AI。');}
+    requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
+    transaction(()=>{
+      if(turn){for(const fact of turn.facts)saveFact(session.case_id,fact);addMessage(session.id,session.case_id,'assistant',turn.reply,replyId);}
+      else if(session.current_question){const fact=parseAnswer(session.current_question,text,message.id);if(fact){saveFact(session.case_id,fact);askNext(session,replyId);}else addMessage(session.id,session.case_id,'assistant','请确认金额、币种和月／年／一次性周期，例如“5000 美元 每月”。也可以回答“不知道”或“不愿提供”。',replyId);}
+      else askNext(session,replyId);
+    });
+  }finally{interviewLocks.delete(session.id);}
+}
+
+async function finalizeInterviewFacts(caseId:string){
+  const sessions=db().prepare("SELECT * FROM interviews WHERE case_id=? AND state='ended'").all(caseId) as Interview[];
+  for(const session of sessions){
+    const input=interviewInput(session);
+    const finalized=input.messages.filter(m=>m.sessionId===session.id&&m.role==='user'&&m.final);
+    const hash=digest(pack(finalized));
+    const prior=db().prepare('SELECT transcript_hash FROM interview_extractions WHERE session_id=?').get(session.id);
+    if(prior?.transcript_hash===hash)continue;
+    // A real voice transcript must not silently finish with mock extraction.
+    if(finalized.some(m=>m.eventId.includes(':voice:')))requireThat(requireAnalysisConfig(),409,'语音事实提取需要完整的云端文字模型配置。');
+    const before=digest(pack({facts:input.facts,messages:input.messages}));
+    const output=finalized.length?await interviewWithProvider(input,true):null;
+    requireThat(before===digest(pack({facts:factsFor(caseId),messages:messagesFor(caseId)})),409,'提取期间资料已变化，请重试。');
+    transaction(()=>{for(const fact of output?.facts??[])saveFact(caseId,fact);db().prepare('INSERT INTO interview_extractions VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET transcript_hash=excluded.transcript_hash,updated_at=excluded.updated_at').run(session.id,hash,now());});
+  }
+}
+
+function reportJobFor(caseId:string):ReportJob|undefined{return docs<ReportJob>('SELECT doc FROM report_jobs WHERE case_id=?',caseId)[0];}
+function saveReportJob(job:ReportJob){db().prepare('INSERT INTO report_jobs VALUES(?,?,?) ON CONFLICT(case_id) DO UPDATE SET status=excluded.status,doc=excluded.doc').run(job.caseId,job.status,pack(job));}
+function enqueueReport(caseId:string){const old=reportJobFor(caseId);if(old&&['queued','generating'].includes(old.status))return;saveReportJob({caseId,status:'queued',attempts:old?.attempts??0,error:null,updatedAt:now()});}
+
+/** Persistent single-process queue. Work runs independently of any browser request. */
+export async function processReportJobs(){
+  if(shared.aeconnReportWorkerBusy)return;
+  shared.aeconnReportWorkerBusy=true;
+  try{
+    const job=transaction(()=>{const next=docs<ReportJob>("SELECT doc FROM report_jobs WHERE status='queued' ORDER BY rowid LIMIT 1")[0];if(next)saveReportJob({...next,status:'generating',attempts:next.attempts+1,error:null,updatedAt:now()});return next;});
+    if(job){
+      try{await generateReport(job.caseId);saveReportJob({...job,status:'ready',attempts:job.attempts+1,error:null,updatedAt:now()});}
+      catch{saveReportJob({...job,status:'failed',attempts:job.attempts+1,error:'事实提取或报告未完成，原对话已保存。请检查云端配置后重试。',updatedAt:now()});audit(null,job.caseId,'report.background_failed');}
+    }
+  }finally{shared.aeconnReportWorkerBusy=false;}
+}
+
+export function recoverReportJobs(){
+  // Called once by the server on startup, never by a request handler.
+  transaction(()=>{
+    for(const row of db().prepare("SELECT * FROM interviews WHERE state='finishing'").all() as Interview[]){db().prepare("UPDATE interviews SET state='ended',ended_at=?,voice_state='ended',incomplete=1 WHERE id=?").run(now(),row.id);const record=docs<Case>('SELECT doc FROM cases WHERE id=?',row.case_id)[0];record.status='needs_report';saveCase(record);enqueueReport(row.case_id);}
+    for(const job of docs<ReportJob>("SELECT doc FROM report_jobs WHERE status='generating'"))saveReportJob({...job,status:'queued',error:null,updatedAt:now()});
+  });
+}
+export function startReportWorker(){if(shared.aeconnReportWorker)return;recoverReportJobs();shared.aeconnReportWorker=setInterval(()=>{void processReportJobs();},500);shared.aeconnReportWorker.unref();}
 
 export function bootstrap(request:Request):Response {
   let auth=readAuth(request);let setCookie:string|undefined;if(!auth){const created=newAuth(request);auth=created.auth;setCookie=created.cookie;}
@@ -100,7 +155,7 @@ export function bootstrap(request:Request):Response {
         const clientIds=new Set(data.cases.map(record=>record.clientId));data.clients=docs<Client>('SELECT doc FROM clients').filter(client=>clientIds.has(client.id));
         data.cases=data.cases.map(record=>({...record,clientName:data.clients.find(client=>client.id===record.clientId)?.name}));
         const selected=new URL(request.url).searchParams.get('caseId')||auth.last_ended_case||data.cases[0]?.id;
-        if(selected){data.activeCase=caseFor(user,selected);data.activeCase.clientName=data.clients.find(client=>client.id===data.activeCase?.clientId)?.name;data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
+        if(selected){data.activeCase=caseFor(user,selected);data.activeCase.clientName=data.clients.find(client=>client.id===data.activeCase?.clientId)?.name;data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.reportJob=reportJobFor(selected);data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
       }
     }
   }
@@ -114,14 +169,14 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
   const task=(async()=>{
     let record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];requireThat(record,404,'案例不存在。');
     requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(caseId),409,'请先结束访谈，等待转写收尾。');
+    await finalizeInterviewFacts(caseId);
     const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];
-    const messages=messagesFor(caseId);let facts=factsFor(caseId);const incomplete=!!db().prepare('SELECT id FROM interviews WHERE case_id=? AND incomplete=1').get(caseId);
+    const messages=messagesFor(caseId);const facts=factsFor(caseId);const incomplete=!!db().prepare('SELECT id FROM interviews WHERE case_id=? AND incomplete=1').get(caseId);
     const before=digest(pack({messages,facts}));
     const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
     const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];if(prior)return reportRecord(prior,record);
     const output=await analyzeWithProvider({messages,facts});const {analyses,provider}=output;
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
-    if(output.facts){for(const fact of output.facts)validateFact(fact,messages);const merged=new Map(facts.map(f=>[f.key,f]));for(const fact of output.facts){const old=merged.get(fact.key);if(!old||old.factStatus==='reported_unverified')merged.set(fact.key,{...fact,confirmedBy:null,confirmedAt:null,factStatus:fact.factStatus==='confirmed'?'reported_unverified':fact.factStatus});}facts=[...merged.values()];}
     validateAnalyses(analyses,facts,messages);
     const snapshotId=digest(pack({before:digest(pack({messages,facts})),reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
     record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];const version=record.reportVersion+1;
@@ -146,7 +201,7 @@ export async function action(request:Request):Promise<Response>{
     const attempt=loginAttempts.get(email);requireThat(!attempt||attempt.until<Date.now()||attempt.count<10,429,'登录尝试过多，请一分钟后重试。');
     loginAttempts.set(email,{count:attempt&&attempt.until>Date.now()?attempt.count+1:1,until:Date.now()+60_000});
     const row=db().prepare('SELECT id,password_hash FROM users WHERE email=?').get(email);requireThat(row&&checkPassword(password,String(row.password_hash)),401,'邮箱或密码不正确。');
-    const created=newAuth(request,String(row.id));db().prepare('UPDATE auth_sessions SET expires_at=0 WHERE id=?').run(auth.id);audit(String(row.id),null,'auth.login');return json({ok:true},200,created.cookie);
+    loginAttempts.delete(email);const created=newAuth(request,String(row.id));db().prepare('UPDATE auth_sessions SET expires_at=0 WHERE id=?').run(auth.id);audit(String(row.id),null,'auth.login');return json({ok:true},200,created.cookie);
   }
   const user=userFor(auth);
   if(auth.mode==='client')requireThat(['chooseEntry','message','pause','resume','end','voiceToken'].includes(name),403,'客户模式期间禁止内部操作。');
@@ -154,20 +209,18 @@ export async function action(request:Request):Promise<Response>{
   if(name==='end'){
     if(auth.mode==='advisor'&&auth.last_ended_case){if(input.caseId)requireThat(input.caseId===auth.last_ended_case,409,'结束案例不匹配。');caseFor(user,auth.last_ended_case,true);return json({ok:true,caseId:auth.last_ended_case});}
     const session=currentInterview(auth);if(input.caseId)requireThat(input.caseId===session.case_id,403,'案例范围不匹配。');
-    transaction(()=>{db().prepare("UPDATE interviews SET state='finishing',deadline=? WHERE id=?").run(Date.now()+1700,session.id);db().prepare("UPDATE auth_sessions SET mode='advisor',last_ended_case=active_case,active_case=NULL,active_interview=NULL WHERE id=?").run(auth.id);db().prepare('DELETE FROM voice_tokens WHERE interview_id=?').run(session.id);});
+    transaction(()=>{db().prepare("UPDATE interviews SET state='finishing',epoch=epoch+1,deadline=? WHERE id=?").run(Date.now()+1700,session.id);db().prepare("UPDATE auth_sessions SET mode='advisor',last_ended_case=active_case,active_case=NULL,active_interview=NULL WHERE id=?").run(auth.id);db().prepare('DELETE FROM voice_tokens WHERE interview_id=?').run(session.id);});
     await closeVoiceSession(session.id);
-    db().prepare("UPDATE interviews SET state='ended',ended_at=?,voice_state='ended' WHERE id=?").run(now(),session.id);const record=caseFor(user,session.case_id,true);record.status='needs_report';saveCase(record);audit(user.id,record.id,'interview.ended');return json({ok:true,caseId:record.id});
+    const record=caseFor(user,session.case_id,true);transaction(()=>{db().prepare("UPDATE interviews SET state='ended',ended_at=?,voice_state='ended' WHERE id=?").run(now(),session.id);record.status='needs_report';saveCase(record);enqueueReport(record.id);audit(user.id,record.id,'interview.ended');});return json({ok:true,caseId:record.id});
   }
   if(['chooseEntry','message','pause','resume','voiceToken'].includes(name)){
     const session=currentInterview(auth);if(input.caseId)requireThat(input.caseId===session.case_id,403,'案例范围不匹配。');
     if(name==='chooseEntry'){requireThat(session.state==='active'&&!session.entry,409,'入口已选定。');const entry=str(input,'entry') as Category;requireThat(categories.includes(entry),400,'请选择四个入口之一。');db().prepare('UPDATE interviews SET entry=? WHERE id=?').run(entry,session.id);const record=caseFor(user,session.case_id,true);record.entry=entry;saveCase(record);session.entry=entry;askNext(session);}
     if(name==='message'){
       requireThat(session.state==='active'&&session.entry,409,'请先选择入口并恢复访谈。');const text=str(input,'text',4000),eventId=str(input,'eventId',100);requireThat(text&&eventId,400,'消息及事件编号不能为空。');
-      if(!db().prepare("SELECT id FROM messages WHERE session_id=? AND event_id=? AND role='user'").get(session.id,eventId)){
-        transaction(()=>{const message=addMessage(session.id,session.case_id,'user',text,eventId);if(session.current_question){const fact=parseAnswer(session.current_question,text,message.id);if(fact){saveFact(session.case_id,fact);askNext(session);}else addMessage(session.id,session.case_id,'assistant','请确认金额、币种和月／年／一次性周期，例如“5000 美元 每月”。也可以回答“不知道”或“不愿提供”。');}else addMessage(session.id,session.case_id,'assistant','已保存补充。顾问会在内部复核，您可以继续补充或结束访谈。');});
-      }
+      await respondToText(session,text,eventId);
     }
-    if(name==='pause'){db().prepare("UPDATE interviews SET state='paused',voice_state='ended',deadline=? WHERE id=?").run(Date.now()+1700,session.id);await closeVoiceSession(session.id);db().prepare('UPDATE interviews SET deadline=NULL WHERE id=?').run(session.id);}
+    if(name==='pause'){db().prepare("UPDATE interviews SET state='paused',epoch=epoch+1,voice_state='ended',deadline=? WHERE id=?").run(Date.now()+1700,session.id);await closeVoiceSession(session.id);db().prepare('UPDATE interviews SET deadline=NULL WHERE id=?').run(session.id);}
     if(name==='resume'){db().prepare("UPDATE interviews SET state='active' WHERE id=?").run(session.id);}
     if(name==='voiceToken'){requireThat(session.state==='active'&&session.entry,409,'请先选择入口并恢复访谈。');requireThat(providerDisplayCapabilities().voiceConfigured,409,'实时语音未配置，可继续文字访谈或明确标记的模拟演示。');const token=randomBytes(32).toString('hex');db().prepare('INSERT INTO voice_tokens VALUES(?,?,?,?)').run(digest(token),session.id,auth.id,Date.now()+30_000);return json({ok:true,token});}
     return json({ok:true});
@@ -181,14 +234,17 @@ export async function action(request:Request):Promise<Response>{
   }
   if(name==='createCase'){const client=docs<Client>('SELECT doc FROM clients WHERE id=?',str(input,'clientId'))[0];requireThat(user.role==='advisor'&&client?.ownerAgentId===user.id,403,'无权为此客户创建访谈。');return json({ok:true,caseId:createCase(client.id,user.id).id});}
   if(name==='enterClient'){
-    const record=caseFor(user,str(input,'caseId'),true);requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'此案例已有进行中的访谈。请回到原设备结束，或新建一次访谈。');requireThat(record.reportVersion===0,409,'已有报告的案例请新建访谈，以保留历史。');
+    const record=caseFor(user,str(input,'caseId'),true);requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，请等待完成或新建访谈。');requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'此案例已有进行中的访谈。请回到原设备结束，或新建一次访谈。');requireThat(record.reportVersion===0,409,'已有报告的案例请新建访谈，以保留历史。');
     const sessionId=id();transaction(()=>{db().prepare("INSERT INTO interviews(id,case_id,auth_id,state,created_at) VALUES(?,?,?,'active',?)").run(sessionId,record.id,auth.id,now());db().prepare("UPDATE auth_sessions SET mode='client',active_case=?,active_interview=?,last_ended_case=NULL WHERE id=?").run(record.id,sessionId,auth.id);record.status='interviewing';saveCase(record);});audit(user.id,record.id,'client_mode.entered');return json({ok:true,caseId:record.id});
   }
-  if(name==='generateReport'){const record=caseFor(user,str(input,'caseId'),true);const report=await generateReport(record.id);return json({ok:true,version:report.version});}
+  if(name==='generateReport'){const record=caseFor(user,str(input,'caseId'),true);const old=reportJobFor(record.id);try{const report=await generateReport(record.id);saveReportJob({caseId:record.id,status:'ready',attempts:(old?.attempts??0)+1,error:null,updatedAt:now()});return json({ok:true,version:report.version});}catch(error){saveReportJob({caseId:record.id,status:'failed',attempts:(old?.attempts??0)+1,error:'报告未完成，原对话已保存，请重试。',updatedAt:now()});throw error;}}
   if(name==='updateFact'){
     const record=caseFor(user,str(input,'caseId'));requireThat(!locks.has(record.id),409,'报告正在生成，请稍后修改。');requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'请先结束访谈再更正事实。');const key=str(input,'key',60),reason=str(input,'reason',2000),factStatus=str(input,'factStatus') as FactStatus;requireThat(reason,400,'请填写更正理由。');
-    const value=['unknown','declined'].includes(factStatus)?null:input.value;requireThat(value===null||typeof value==='string'||typeof value==='number',400,'事实值格式无效。');
-    transaction(()=>{const message=addMessage(`advisor-correction-${record.id}`,record.id,'user',`顾问事实更正：${key}=${value??factStatus}；理由：${reason}`);const fact:ProfileField={key,value:value as string|number|null,currency:str(input,'currency',3)||null,period:str(input,'period',10)||null,factStatus,sourceMessageIds:[message.id],confirmedBy:factStatus==='confirmed'?user.id:null,confirmedAt:factStatus==='confirmed'?now():null};saveFact(record.id,fact);record.status='needs_report';saveCase(record);audit(user.id,record.id,'fact.corrected',{key,reasonRecorded:true});});
+    const empty=['unknown','declined','conflicting'].includes(factStatus);const value=empty?null:input.value;requireThat(value===null||typeof value==='string'||typeof value==='number',400,'事实值格式无效。');requireThat(empty||value!==null,400,'已有事实需要值；未知请选择未知状态。');
+    const currency=empty?null:str(input,'currency',3)||null,period=empty?null:str(input,'period',10)||null;
+    requireThat(amountKeys.has(key)||currency===null&&period===null,400,'非金额事实不能设置币种或周期。');
+    const old=factsFor(record.id).find(f=>f.key===key);requireThat(factStatus!=='conflicting'||old?.sourceMessageIds.length,400,'标记冲突需要已有事实来源，并在理由中记录冲突内容。');
+    transaction(()=>{const eventId=id();const message=addMessage(`advisor-correction-${record.id}`,record.id,'user',`顾问事实更正：${key}=${value??factStatus}；理由：${reason}`,eventId,eventId,false,true,'advisor',user.id);const fact:ProfileField={key,value:value as string|number|null,currency,period,factStatus,sourceMessageIds:factStatus==='conflicting'?[...new Set([...(old?.sourceMessageIds??[]),message.id])]:[message.id],confirmedBy:factStatus==='confirmed'?user.id:null,confirmedAt:factStatus==='confirmed'?now():null};saveFact(record.id,fact);record.status='needs_report';saveCase(record);audit(user.id,record.id,'fact.corrected',{key,reasonRecorded:true});});
     const report=await generateReport(record.id);return json({ok:true,version:report.version});
   }
   if(name==='submitReview'){const record=caseFor(user,str(input,'caseId'),true);requireThat(record.reportVersion>0&&record.status!=='needs_report',409,'请先生成当前报告。');record.assignedReviewerId='charles';record.status='pending_review';saveCase(record);audit(user.id,record.id,'review.submitted');return json({ok:true});}
@@ -219,11 +275,12 @@ export function reportDownload(request:Request):Response {const auth=readAuth(re
 export function notifications(request:Request):Response {const auth=readAuth(request);requireThat(auth,401,'请先登录。');const record=caseFor(requireAdvisorMode(auth),new URL(request.url).searchParams.get('caseId')||'');return json(docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=?',record.id));}
 
 export const voiceHooks={
+  getContext(sessionId:string){const session=db().prepare('SELECT * FROM interviews WHERE id=?').get(sessionId) as Interview|undefined;requireThat(session,404,'访谈不存在。');return JSON.stringify(buildInterviewContext(interviewInput(session)));},
   consumeToken(token:string){return transaction(()=>{const row=db().prepare('SELECT * FROM voice_tokens WHERE token_hash=?').get(digest(token));if(!row)return null;db().prepare('DELETE FROM voice_tokens WHERE token_hash=?').run(digest(token));if(Number(row.expires_at)<Date.now())return null;const session=db().prepare("SELECT i.* FROM interviews i JOIN auth_sessions a ON a.id=i.auth_id WHERE i.id=? AND i.auth_id=? AND i.state='active' AND a.mode='client' AND a.active_interview=i.id AND a.expires_at>?").get(String(row.interview_id),String(row.auth_id),Date.now()) as Interview|undefined;return session?{sessionId:session.id,caseId:session.case_id}:null;});},
   isActive(sessionId:string){return !!db().prepare("SELECT i.id FROM interviews i JOIN auth_sessions a ON a.id=i.auth_id WHERE i.id=? AND i.state='active' AND a.mode='client' AND a.active_interview=i.id AND a.expires_at>?").get(sessionId,Date.now());},
-  persist(sessionId:string,event:{eventId:string;turnId:string;role:'user'|'assistant';text:string;interrupted?:boolean}){
+  persist(sessionId:string,event:{eventId:string;turnId:string;role:'user'|'assistant';text:string;interrupted?:boolean;final?:boolean}){
     const session=db().prepare('SELECT * FROM interviews WHERE id=?').get(sessionId) as Interview|undefined;if(!session||!(session.state==='active'||['finishing','paused'].includes(session.state)&&Number(session.deadline)>Date.now())||!event.text?.trim())return;
-    addMessage(sessionId,session.case_id,event.role,event.text.slice(0,8000),event.eventId,event.turnId,event.interrupted);
+    addMessage(sessionId,session.case_id,event.role,event.text.slice(0,8000),event.eventId,event.turnId,event.interrupted,event.final??true);
   },
   status(sessionId:string,state:string){if(state==='incomplete'||state==='transcript_incomplete'){db().prepare('UPDATE interviews SET incomplete=1 WHERE id=?').run(sessionId);return;}db().prepare("UPDATE interviews SET voice_state=? WHERE id=? AND state IN ('active','finishing','paused')").run(state,sessionId);}
 };

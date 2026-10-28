@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import PDFDocument from 'pdfkit';
-import type { AnalysisItem, Category, DemandStatus, Message, ProfileField, ReportContent, ReportInput } from './domain';
+import { messageSource, type AnalysisItem, type Category, type DemandStatus, type Message, type ProfileField, type ReportContent, type ReportInput } from './domain';
 
 const CATEGORIES: Category[] = ['life', 'annuity', 'ltc', 'disability_income'];
 const STATUSES: DemandStatus[] = ['priority_discussion', 'secondary_discussion', 'defer', 'insufficient_information', 'review_existing'];
@@ -152,6 +152,19 @@ function displayFact(fact: ProfileField): string {
   return `${String(fact.value)}${unit ? ` (${unit})` : ''}`;
 }
 
+const sourceKindLabel = { customer: '客户自述', advisor: '顾问更正', synthetic: '合成资料' } as const;
+
+function factSourceSummary(fact: ProfileField, messagesById: Map<string, Message>): string {
+  if (!fact.sourceMessageIds.length) {
+    return fact.confirmedBy ? `无消息来源 ID；人工确认 actor_id=${fact.confirmedBy}` : '无消息来源 ID';
+  }
+  return fact.sourceMessageIds.map((id) => {
+    const message = messagesById.get(id)!;
+    const actor = message.actorId ? `；actor_id=${message.actorId}` : '';
+    return `${id} [${sourceKindLabel[messageSource(message)]}${actor}]`;
+  }).join('、');
+}
+
 const bullets = (lines: string[]) => lines.length ? lines.map((line) => `• ${line}`).join('\n') : '• 无';
 
 export function buildReport(input: ReportInput): ReportContent {
@@ -160,14 +173,15 @@ export function buildReport(input: ReportInput): ReportContent {
   if (input.caseRecord.clientId !== input.client.id) throw new Error('报告客户与案例关联不一致');
   if (input.caseRecord.ownerAgentId !== input.owner.id) throw new Error('报告归属顾问与案例不一致');
 
-  const factLines = input.facts.map((fact) => `${fact.key}: ${displayFact(fact)} [${factStatusLabel[fact.factStatus]}]`);
+  const messagesById = new Map(input.messages.map((message) => [message.id, message]));
+  const factLines = input.facts.map((fact) => `${fact.key}: ${displayFact(fact)} [${factStatusLabel[fact.factStatus]}]；来源：${factSourceSummary(fact, messagesById)}`);
   const directionLines = input.analyses.map((entry) => `${categoryLabel[entry.category]} — ${statusLabel[entry.status]}：${entry.reasonSummary}`);
   const evidenceLines = input.analyses.map((entry) => `${categoryLabel[entry.category]}：${entry.evidenceRefs.length ? entry.evidenceRefs.join('、') : '无引用；资料不足'}`);
   const limitationLines = input.analyses.flatMap((entry) => [
     ...entry.constraints.map((constraint) => `${categoryLabel[entry.category]}：${constraint}`),
     ...entry.missingFields.map((field) => `${categoryLabel[entry.category]}缺失：${field}`),
   ]);
-  if (input.incompleteTranscript) limitationLines.unshift('访谈收尾转写超时，最后一轮可能不完整。');
+  if (input.incompleteTranscript) limitationLines.unshift('部分语音转写未完成或收尾超时；未确认的残留片段未作为事实，需顾问核对。');
   const questionLines = [...new Set(input.analyses.flatMap((entry) => entry.nextQuestions))];
   const specialLines = limitationLines.filter((line) => /(专项|转移|转保|退保|冲突)/.test(line));
   const reviewNote = input.reviewNote?.trim();
@@ -227,7 +241,7 @@ export async function renderPdf(report: ReportContent): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const doc = new PDFDocument({
       size: 'A4',
-      margins: { top: 62, bottom: 58, left: 54, right: 54 },
+      margins: { top: 62, bottom: 80, left: 54, right: 54 },
       bufferPages: true,
       info: { Title: report.title, Author: 'Aeconn AI Agent Demo', Subject: `Case ${report.caseId}, report v${report.version}` },
     });
@@ -262,12 +276,17 @@ export async function renderPdf(report: ReportContent): Promise<Buffer> {
     doc.moveDown(0.7);
 
     for (const section of report.sections) {
-      if (doc.y > doc.page.height - 135) doc.addPage();
-      doc.fillColor('#0F766E').fontSize(14).text(section.title, { lineGap: 2 });
+      const width=doc.page.width-108;
+      const headingHeight=doc.fontSize(14).heightOfString(section.title,{width,lineGap:2});
+      const bodyHeight=doc.fontSize(10.2).heightOfString(section.body,{width,lineGap:5,paragraphGap:4});
+      const sectionHeight=headingHeight+bodyHeight+30;
+      const usableHeight=doc.page.height-doc.page.margins.top-doc.page.margins.bottom;
+      if (doc.y > doc.page.height - 180 || sectionHeight<=usableHeight&&doc.y+sectionHeight>doc.page.height-doc.page.margins.bottom) doc.addPage();
+      doc.fillColor('#0F766E').fontSize(14).text(section.title,54,doc.y,{width,lineGap:2});
       const lineY = doc.y + 3;
       doc.moveTo(54, lineY).lineTo(doc.page.width - 54, lineY).lineWidth(0.7).strokeColor('#B7DCD6').stroke();
       doc.moveDown(0.65);
-      doc.fillColor('#20383E').fontSize(10.2).text(section.body, { lineGap: 5, paragraphGap: 4 });
+      doc.fillColor('#20383E').fontSize(10.2).text(section.body,54,doc.y,{width,lineGap:5,paragraphGap:4});
       doc.moveDown(0.85);
     }
 

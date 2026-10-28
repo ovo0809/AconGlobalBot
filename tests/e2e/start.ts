@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { createServer } from 'node:http';
 import next from 'next';
 import { attachVoiceServer } from '../../lib/voice-server';
-import { voiceHooks } from '../../lib/service';
+import { voiceHooks, startReportWorker } from '../../lib/service';
 
 const databasePath = resolve(process.env.DATABASE_PATH || './tmp/e2e.sqlite');
 const expectedDatabasePath = resolve(process.cwd(), 'tmp', 'e2e.sqlite');
@@ -19,6 +19,7 @@ async function start() {
   const handle = app.getRequestHandler();
   const server = createServer((request, response) => void handle(request, response));
   attachVoiceServer(server, voiceHooks);
+  startReportWorker();
   server.listen(port, hostname, () => console.log(`Aeconn E2E: http://${hostname}:${port}`));
 }
 void start();

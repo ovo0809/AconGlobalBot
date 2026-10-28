@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import nextEnv from '@next/env';
 import next from 'next';
 import { attachVoiceServer, type VoiceHooks } from './lib/voice-server';
+import { acquireRuntimeLock } from './lib/runtime-lock';
 
 const { loadEnvConfig } = nextEnv;
 loadEnvConfig(process.cwd());
@@ -20,11 +21,13 @@ if (!loopback) {
 }
 
 const app = next({ dev: !production, hostname, port });
+const releaseRuntimeLock=acquireRuntimeLock(process.env.DATABASE_PATH||'./data/aeconn.sqlite');
+process.once('exit',releaseRuntimeLock);
 const handle = app.getRequestHandler();
 
 await app.prepare();
 const serviceModulePath = './lib/service';
-const serviceModule = await import(serviceModulePath) as { voiceHooks?: VoiceHooks };
+const serviceModule = await import(serviceModulePath) as { voiceHooks?: VoiceHooks; startReportWorker:()=>void };
 if (!serviceModule.voiceHooks) throw new Error('lib/service.ts must export voiceHooks.');
 const server = createServer((request, response) => {
   response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -32,6 +35,7 @@ const server = createServer((request, response) => {
   void handle(request, response);
 });
 attachVoiceServer(server, serviceModule.voiceHooks);
+serviceModule.startReportWorker();
 
 server.listen(port, hostname, () => {
   console.log(`Aeconn Demo: http://${hostname}:${port} (${production ? 'production' : 'development'})`);

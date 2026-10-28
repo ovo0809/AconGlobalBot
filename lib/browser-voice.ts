@@ -13,10 +13,11 @@ export interface BrowserVoiceOptions {
 }
 
 type ServerEvent =
-  | { type: 'ready' }
+  | { type: 'ready'; inputSampleRate?: number; outputSampleRate?: number }
   | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean }
-  | { type: 'audio'; data: string; mimeType: string }
-  | { type: 'interrupted' | 'turnComplete' | 'ending' }
+  | { type: 'audio'; data: string; mimeType: string; itemId?: string }
+  | { type: 'interrupted'; itemId?: string }
+  | { type: 'turnComplete' | 'ending' | 'reconnecting' }
   | { type: 'closed'; retryable?: boolean }
   | { type: 'unavailable' | 'error'; message: string };
 
@@ -58,6 +59,14 @@ export class BrowserVoiceClient {
   private silentGain: GainNode | null = null;
   private playbackSources = new Set<AudioBufferSourceNode>();
   private playbackCursor = 0;
+  private playbackQueue:Promise<void>=Promise.resolve();
+  private playbackGeneration=0;
+  private inputSampleRate = 16_000;
+  private outputSampleRate = 24_000;
+  private outputItemId: string | null = null;
+  private outputStartedAt = 0;
+  private outputStartedAtContext:number|null=null;
+  private outputReceivedMs = 0;
   private currentAudio: string[] = [];
   private lastAudio: string[] = [];
   private reconnectAttempts = 0;
@@ -84,9 +93,14 @@ export class BrowserVoiceClient {
     this.paused = false;
     this.reconnectAttempts = 0;
     this.setState('connecting');
-    await this.ensureMicrophone();
-    window.addEventListener('pagehide', this.pageHide);
-    await this.connectSocket();
+    try {
+      await this.ensureMicrophone();
+      window.addEventListener('pagehide', this.pageHide);
+      await this.connectSocket();
+    } catch (cause) {
+      await this.closeResources(false);
+      throw cause;
+    }
   }
 
   private async ensureMicrophone() {
@@ -119,7 +133,7 @@ export class BrowserVoiceClient {
       for (const chunk of this.captureChunks) { joined.set(chunk, offset); offset += chunk.length; }
       this.captureChunks = [];
       this.captureFrames = 0;
-      const pcm = downsampleToPcm16(joined, inputRate);
+      const pcm = downsampleToPcm16(joined, inputRate, this.inputSampleRate);
       this.socket.send(JSON.stringify({ audio: bytesToBase64(pcm) }));
     };
     this.silentGain = this.captureContext.createGain();
@@ -171,35 +185,64 @@ export class BrowserVoiceClient {
     let event: ServerEvent;
     try { event = JSON.parse(raw) as ServerEvent; } catch { return; }
     if (this.intentionallyClosed && event.type !== 'ending') return;
-    if (event.type === 'ready') { this.reconnectAttempts = 0; this.setState('listening'); }
+    if (event.type === 'ready') {
+      if(event.inputSampleRate===16_000||event.inputSampleRate===24_000)this.inputSampleRate=event.inputSampleRate;
+      if(event.outputSampleRate===24_000)this.outputSampleRate=event.outputSampleRate;
+      this.setState('listening');
+    }
     else if (event.type === 'transcript') {
       if (event.final) this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted) });
       else this.options.onInterim?.({ role: event.role, text: event.text });
       if (event.role === 'user') this.setState(event.final ? 'thinking' : 'listening');
     } else if (event.type === 'audio') {
-      if (!this.intentionallyClosed) { this.currentAudio.push(event.data); this.setState('speaking'); void this.playPcm(event.data); }
+      if (!this.intentionallyClosed) {
+        if(event.itemId&&event.itemId!==this.outputItemId){this.outputItemId=event.itemId;this.outputStartedAt=Date.now();this.outputStartedAtContext=null;this.outputReceivedMs=0;}
+        this.outputReceivedMs+=this.pcmDurationMs(event.data);
+        this.currentAudio.push(event.data); this.setState('speaking');
+        const generation=this.playbackGeneration;
+        this.playbackQueue=this.playbackQueue.then(()=>this.playPcm(event.data,generation));
+      }
     }
-    else if (event.type === 'interrupted') { this.stopPlayback(); this.options.onInterrupted?.(); this.setState('listening'); }
-    else if (event.type === 'turnComplete') { if (this.currentAudio.length) this.lastAudio = [...this.currentAudio]; this.currentAudio = []; this.setState('listening'); }
+    else if (event.type === 'interrupted') {
+      const itemId=event.itemId||this.outputItemId;
+      const contextPlayed=this.playbackContext&&this.outputStartedAtContext!==null?(this.playbackContext.currentTime-this.outputStartedAtContext)*1_000:Date.now()-this.outputStartedAt;
+      const playedMs=Math.max(0,Math.min(this.outputReceivedMs,contextPlayed));
+      this.stopPlayback();this.currentAudio=[];
+      if(itemId&&this.socket?.readyState===WebSocket.OPEN)this.socket.send(JSON.stringify({truncate:{itemId,audioEndMs:Math.round(playedMs)}}));
+      this.outputItemId=null;this.outputReceivedMs=0;this.options.onInterrupted?.();this.setState('listening');
+    }
+    else if (event.type === 'turnComplete') { if (this.currentAudio.length) this.lastAudio = [...this.currentAudio]; this.currentAudio = []; this.outputItemId=null;this.outputStartedAtContext=null;this.outputReceivedMs=0;this.setState('listening'); }
+    else if (event.type === 'reconnecting') { this.stopPlayback(); this.setState('reconnecting'); }
     else if (event.type === 'ending' && !this.intentionallyClosed) void this.stopAll();
-    else if (event.type === 'unavailable' || event.type === 'error') this.error(event.message);
+    else if (event.type === 'unavailable' || event.type === 'error') {
+      this.error(event.message);
+      void this.closeResources(false);
+    }
   }
 
-  private async playPcm(encoded: string) {
-    if (!this.playbackContext) this.playbackContext = new AudioContext({ sampleRate: 24_000, latencyHint: 'interactive' });
+  private async playPcm(encoded: string,generation=this.playbackGeneration) {
+    if (!this.playbackContext) this.playbackContext = new AudioContext({ sampleRate: this.outputSampleRate, latencyHint: 'interactive' });
     await this.playbackContext.resume();
+    if(generation!==this.playbackGeneration)return;
     const pcm = base64ToInt16(encoded);
-    const buffer = this.playbackContext.createBuffer(1, pcm.length, 24_000);
+    const buffer = this.playbackContext.createBuffer(1, pcm.length, this.outputSampleRate);
     const output = buffer.getChannelData(0);
     for (let index = 0; index < pcm.length; index += 1) output[index] = pcm[index] / (pcm[index] < 0 ? 0x8000 : 0x7fff);
     const source = this.playbackContext.createBufferSource();
     source.buffer = buffer;
     source.connect(this.playbackContext.destination);
     this.playbackCursor = Math.max(this.playbackContext.currentTime, this.playbackCursor);
+    if(this.outputStartedAtContext===null)this.outputStartedAtContext=this.playbackCursor;
     source.start(this.playbackCursor);
     this.playbackCursor += buffer.duration;
     this.playbackSources.add(source);
     source.onended = () => this.playbackSources.delete(source);
+  }
+
+  private pcmDurationMs(encoded:string){
+    const padding=encoded.endsWith('==')?2:encoded.endsWith('=')?1:0;
+    const bytes=Math.max(0,Math.floor(encoded.length*3/4)-padding);
+    return bytes/2/this.outputSampleRate*1_000;
   }
 
   sendText(text: string) {
@@ -210,10 +253,16 @@ export class BrowserVoiceClient {
     return true;
   }
   setMuted(muted: boolean) { this.isMuted = muted; for (const track of this.stream?.getAudioTracks() || []) track.enabled = !muted; }
-  stopPlayback() { for (const source of this.playbackSources) { try { source.stop(); } catch {} } this.playbackSources.clear(); this.playbackCursor = this.playbackContext?.currentTime || 0; }
-  async replayLast() { this.stopPlayback(); for (const chunk of this.lastAudio) await this.playPcm(chunk); }
+  stopPlayback() { this.playbackGeneration+=1;this.playbackQueue=Promise.resolve();for (const source of this.playbackSources) { try { source.stop(); } catch {} } this.playbackSources.clear(); this.playbackCursor = this.playbackContext?.currentTime || 0; }
+  async replayLast() { this.stopPlayback();const generation=this.playbackGeneration;for (const chunk of this.lastAudio) await this.playPcm(chunk,generation); }
   async pause() { if (this.voiceState === 'paused' || this.voiceState === 'ended') return; this.paused = true; await this.closeResources(false); this.setState('paused'); }
-  async resume() { if (!this.paused) return; this.paused = false; this.setState('connecting'); await this.ensureMicrophone(); await this.connectSocket(); }
+  async resume() {
+    if (!this.paused) return;
+    this.paused = false;
+    this.setState('connecting');
+    try { await this.ensureMicrophone(); window.addEventListener('pagehide',this.pageHide); await this.connectSocket(); }
+    catch (cause) { await this.closeResources(false); throw cause; }
+  }
   async stopAll() {
     this.intentionallyClosed = true;
     this.paused = false;

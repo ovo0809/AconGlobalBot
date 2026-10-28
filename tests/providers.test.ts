@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Message, ProfileField } from '../lib/domain';
-import { analyzeWithProvider, buildCloudSafeInput, providerCapabilities, validateProviderAnalyses, validateProviderFacts } from '../lib/providers';
+import { analyzeWithProvider, interviewWithProvider, buildCloudSafeInput, providerCapabilities, validateProviderAnalyses, validateProviderFacts } from '../lib/providers';
 
 const messages: Message[] = [{ id: 'm1', caseId: 'c1', sessionId: 's1', turnId: 't1', eventId: 'e1', role: 'user', text: '邮箱 alex@example.com，电话 415-555-1212，年收入 80000 美元。', final: true, interrupted: false, createdAt: '2026-01-01' }];
 const facts: ProfileField[] = [
@@ -91,4 +91,44 @@ test('cloud analysis requires an explicit selector and does not enable realtime 
   process.env.LLM_PROVIDER = 'mock';
   process.env.VOICE_PROVIDER = 'gemini';
   assert.deepEqual(providerCapabilities(), { analysis:'mock:demo_unapproved', voice:'configured_not_verified' });
+});
+
+test('OpenAI structured interview uses server credentials, saved context and validates grounded facts', async (t) => {
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];
+  const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  let content:unknown={reply:'您希望什么时候开始？',facts:[{key:'income',value:80000,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['m1']}]};
+  const network=t.mock.method(globalThis,'fetch',async (url:unknown,options:RequestInit)=>{
+    assert.equal(url,'https://api.openai.com/v1/responses');
+    assert.equal((options.headers as Record<string,string>).Authorization,'Bearer synthetic-key');
+    const payload=JSON.parse(String(options.body));
+    assert.equal(payload.store,false);assert.equal(payload.text.format.strict,true);assert.equal(payload.text.format.name,'aeconn_interview');
+    assert.match(payload.input[0].content,/knownFacts/);assert.doesNotMatch(payload.input[0].content,/alex@example.com/);
+    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(content)}]}]}));
+  });
+  const input={entry:'life' as const,messages:[{...messages[0],text:'年收入 80000 美元。'},{...messages[0],id:'m2',text:'邮箱 alex@example.com'}],facts:[]};
+  const result=await interviewWithProvider(input);
+  assert.equal(result?.facts[0].value,80000);assert.equal(result?.facts[0].confirmedBy,null);
+  content={reply:'收到。',facts:[{key:'income',value:99999,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['m1']}]};
+  await assert.rejects(()=>interviewWithProvider(input),/not present/);
+  assert.equal(network.mock.callCount(),2);
+  delete process.env.OPENAI_API_KEY;
+  await assert.rejects(()=>interviewWithProvider(input),/requires/);
+  assert.equal(network.mock.callCount(),2,'incomplete cloud setup must fail, not call a model or fall back to mock');
+});
+
+test('OpenAI report cannot use unsaved transcript evidence or mutate saved facts', async (t) => {
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  let supported=true;
+  t.mock.method(globalThis,'fetch',async (_url:unknown,options:RequestInit)=>{
+    const request=JSON.parse(String(options.body));assert.equal(request.text.format.name,'aeconn_report');
+    assert.equal(request.text.format.schema.properties.facts,undefined);
+    const analyses=['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:supported?[]:['m1'],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}));
+    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({analyses,facts:[{key:'income',value:99999}]})}]}]}));
+  });
+  const output=await analyzeWithProvider({messages,facts:[]});assert.equal(output.facts,undefined);assert.equal(output.provider,'openai:synthetic-model');
+  supported=false;await assert.rejects(()=>analyzeWithProvider({messages,facts:[]}),/outside this case/);
 });

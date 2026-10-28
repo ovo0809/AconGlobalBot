@@ -18,6 +18,7 @@ function messagesFor(facts: ProfileField[], caseId = 'case-1'): Message[] {
     final: true,
     interrupted: false,
     createdAt: '2026-10-01T12:00:00.000Z',
+    source: 'synthetic' as const,
   }));
 }
 
@@ -116,6 +117,27 @@ test('report has immutable identifiers, programmatic contact data and six requir
   assert.match(report.fullText, /六、给 Charles 的交接摘要与专项审核项/);
   assert.match(report.fullText, /本版本人工复核意见：approved：已核对合成案例引用与缺失项/);
   assert.ok(report.headerLines?.some((line) => line.includes('归属顾问：合成顾问 林 / advisor-1')));
+  assert.match(report.sections[0].body, /来源：[^\n]+ \[合成资料\]/);
+});
+
+test('report labels customer, advisor and synthetic fact sources without guessing actor names', () => {
+  const facts: ProfileField[] = [
+    { key: 'goal', value: '保障家庭', currency: null, period: null, factStatus: 'reported_unverified', sourceMessageIds: ['customer-source'], confirmedBy: null, confirmedAt: null },
+    { key: 'income', value: 5000, currency: 'USD', period: 'month', factStatus: 'confirmed', sourceMessageIds: ['advisor-source'], confirmedBy: 'advisor-9', confirmedAt: '2026-10-01T12:00:00.000Z' },
+    { key: 'dependents', value: '一名子女', currency: null, period: null, factStatus: 'reported_unverified', sourceMessageIds: ['synthetic-source'], confirmedBy: null, confirmedAt: null },
+  ];
+  const input = reportInput(facts);
+  input.messages = [
+    { id: 'customer-source', caseId: 'case-1', sessionId: 'session-1', turnId: 't1', eventId: 'e1', role: 'user', text: '保障家庭', final: true, interrupted: false, createdAt: input.createdAt, source: 'customer' },
+    { id: 'advisor-source', caseId: 'case-1', sessionId: 'advisor-correction-case-1', turnId: 't2', eventId: 'e2', role: 'user', text: '顾问事实更正', final: true, interrupted: false, createdAt: input.createdAt, source: 'advisor', actorId: 'advisor-9' },
+    { id: 'synthetic-source', caseId: 'case-1', sessionId: 'seed-case-1', turnId: 't3', eventId: 'e3', role: 'user', text: '合成自述', final: true, interrupted: false, createdAt: input.createdAt, source: 'synthetic' },
+  ];
+  input.analyses = analyzeDemo(facts);
+  const report = buildReport(input);
+  assert.match(report.sections[0].body, /customer-source \[客户自述\]/);
+  assert.match(report.sections[0].body, /advisor-source \[顾问更正；actor_id=advisor-9\]/);
+  assert.match(report.sections[0].body, /synthetic-source \[合成资料\]/);
+  assert.doesNotMatch(report.sections[0].body, /林顾问|Charles/);
 });
 
 test('renders a real, embedded-font PDF with enough content to span pages', async () => {

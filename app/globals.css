@@ -21,3 +21,8 @@
 .section-actions{align-items:center;display:flex;gap:8px}.section-actions select{font-size:1rem;min-height:32px;padding:3px 8px;width:auto}
 /* All rendered text stays at 16px or larger. */
 label,input,select,textarea,.button,.tabs button,.case-item,.end-button,.message-form input,.message-form button,.voice-start b,.category-grid b{font-size:1rem}.history-message p,.bubble p,.report-sections details p,.email-preview pre,.section-heading p,.timeline-heading p,.privacy-intro,.story-copy p{font-size:1rem}.voice-row b,.send-confirm p{font-size:1rem}
+.interim-row .bubble{border:1px dashed var(--teal-2);opacity:.82}.interim-row .bubble>span{color:var(--teal-2);display:block;font-weight:800;margin-bottom:5px}
+.loader-small{height:24px;width:24px}.disclosure .button{margin-left:auto}
+.interview-source{margin-top:10px}
+.pending-message{align-items:center;background:#fff7e8;border:1px solid #ecd6ad;border-radius:14px;display:flex;gap:12px;margin-bottom:12px;padding:12px}.pending-message>.icon{color:#95691c;flex:0 0 auto}.pending-message>div{min-width:0}.pending-message b{display:block}.pending-message p{margin:3px 0 0;overflow-wrap:anywhere}.pending-message .button{flex:0 0 auto;margin-left:auto}
+@media(max-width:520px){.pending-message{align-items:flex-start;flex-wrap:wrap}.pending-message .button{margin-left:36px}}

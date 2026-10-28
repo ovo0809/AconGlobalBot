@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import type { Bootstrap, ReportRecord } from '../lib/domain';
+import type { Bootstrap, Message, ReportJob, ReportRecord } from '../lib/domain';
 
 const databaseRoot = mkdtempSync(join(tmpdir(), 'aeconn-service-test-'));
 process.env.DATABASE_PATH = join(databaseRoot, 'service.sqlite');
@@ -15,6 +15,8 @@ delete process.env.GEMINI_API_KEY;
 delete process.env.GEMINI_MODEL;
 delete process.env.GEMINI_LIVE_MODEL;
 delete process.env.VOICE_PROVIDER;
+delete process.env.OPENAI_API_KEY;
+delete process.env.OPENAI_MODEL;
 
 const servicePromise = import('../lib/service');
 const ORIGIN = 'http://localhost';
@@ -431,4 +433,118 @@ test('same-origin requests use the browser Host when Next normalizes the URL hos
   });
   assert.equal((await safeAction(request('http://127.0.0.1:3000'))).status, 200);
   assert.equal((await safeAction(request('http://attacker.invalid'))).status, 403);
+});
+
+async function drainReportJobs(){
+  const {db}=await import('../lib/db');const service=await servicePromise;
+  for(let i=0;i<30&&db().prepare("SELECT 1 FROM report_jobs WHERE status='queued'").get();i++)await service.processReportJobs();
+  assert.equal(db().prepare("SELECT 1 FROM report_jobs WHERE status='queued'").get(),undefined);
+}
+
+test('end persists a report job that completes without a browser request, with immutable PDF and no mail',async()=>{
+  await drainReportJobs();
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'后台持久队列');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'background-goal'});
+  const ended=await advisor.action({action:'end',caseId});assert.equal(ended.response.status,200);
+  let state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.mode,'advisor');assert.equal(state.activeCase?.id,caseId);assert.equal(state.reportJob?.status,'queued');assert.equal(state.reports.length,0);
+  const {db,pack,unpack}=await import('../lib/db');
+  // Simulate a process stopping after claiming the durable job.
+  const job=state.reportJob!;db().prepare("UPDATE report_jobs SET status='generating',doc=? WHERE case_id=?").run(pack({...job,status:'generating'}),caseId);
+  (await servicePromise).recoverReportJobs();
+  assert.equal(unpack<ReportJob>(db().prepare('SELECT doc FROM report_jobs WHERE case_id=?').get(caseId)!.doc).status,'queued');
+  await drainReportJobs();
+  state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.reportJob?.status,'ready');assert.equal(state.reports.length,1);assert.equal(state.notifications.length,0);
+  assert.equal((await advisor.report(caseId,1)).status,200);
+  await (await servicePromise).processReportJobs();assert.equal(((await advisor.bootstrap(caseId)).data as Bootstrap).reports.length,1);
+});
+
+test('real-provider interview and background voice extraction save sourced facts before report analysis (fake HTTP)',async(t)=>{
+  await drainReportJobs();
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  const {db,docs}=await import('../lib/db');
+  let phase='text';let caseId='';
+  t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+    const request=JSON.parse(String(options.body));const prompt=request.input[0].content as string;
+    let output:unknown;
+    const customer=docs<Message>("SELECT doc FROM messages WHERE case_id=? AND role='user' ORDER BY rowid",caseId);
+    if(request.text.format.name==='aeconn_interview'){
+      if(phase==='text')output={reply:'哪些家人依赖您的收入？',facts:[{key:'goal',value:'家庭保障',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:[customer[0].id]}]};
+      else{assert.match(prompt,/conversation is ended/);const voice=customer.find(m=>m.text==='每月收入 5000 美元。')!;output={reply:'访谈已保存。',facts:[{key:'income',value:5000,currency:'USD',period:'month',factStatus:'reported_unverified',sourceMessageIds:[voice.id]}]};}
+    }else{
+      assert.match(prompt,/SAVED FACTS/);assert.match(prompt,/5000/);assert.doesNotMatch(prompt,/残留草稿/);
+      const saved=db().prepare("SELECT doc FROM profile_fields WHERE case_id=? AND field_key='income'").get(caseId);assert.ok(saved,'facts must be durable before report call');
+      output={analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'待补充资料。',missingFields:['budget'],constraints:[],nextQuestions:[]}))};
+    }
+    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(output)}]}]}));
+  });
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');caseId=await createCase(advisor,'云端事实链');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  const sent=await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'cloud-goal'});assert.equal(sent.response.status,200,JSON.stringify(sent.data));
+  assert.equal((await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'cloud-goal'})).response.status,200);
+  const client=(await advisor.bootstrap()).data as Bootstrap;const sessionId=client.clientSession!.id;
+  assert.match((await servicePromise).voiceHooks.getContext(sessionId),/家庭保障/);
+  (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'每月收入 5000 美元。',eventId:'test:voice:income',turnId:'voice-income',final:true});
+  (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'残留草稿 999999',eventId:'test:voice:partial',turnId:'voice-partial',final:false});
+  (await servicePromise).voiceHooks.status(sessionId,'transcript_incomplete');
+  phase='finalize';assert.equal((await advisor.action({action:'end',caseId})).response.status,200);
+  (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'迟到不应保存',eventId:'late-voice',turnId:'late',final:true});
+  await drainReportJobs();const state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.reportJob?.status,'ready');assert.equal(state.facts.find(f=>f.key==='income')?.value,5000);assert.equal(state.facts.find(f=>f.key==='income')?.confirmedBy,null);
+  assert.equal(state.messages.filter(m=>m.eventId==='cloud-goal').length,1);assert.equal(state.messages.some(m=>m.eventId==='late-voice'),false);
+  assert.equal(state.messages.find(m=>m.eventId==='test:voice:partial')?.final,false);assert.equal(state.notifications.length,0);
+});
+
+test('cloud failure keeps conversation, fails background job without a mock report, and supports explicit retry',async(t)=>{
+  await drainReportJobs();const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'失败重试');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  let fail=true;
+  t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+    if(fail)return new Response('{}',{status:503});
+    const request=JSON.parse(String(options.body));const result=request.text.format.name==='aeconn_interview'?{reply:'访谈已保存。',facts:[]}:{analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}))};
+    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(result)}]}]}));
+  });
+  assert.equal((await advisor.action({action:'message',caseId,text:'需要更多保障',eventId:'failed-message'})).response.status,503);
+  assert.equal(((await advisor.bootstrap()).data as Bootstrap).messages.some(m=>m.eventId==='failed-message'),true);
+  await advisor.action({action:'end',caseId});await drainReportJobs();let state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.reportJob?.status,'failed');assert.equal(state.reports.length,0);assert.equal(state.notifications.length,0);
+  fail=false;const retry=await advisor.action({action:'generateReport',caseId});assert.equal(retry.response.status,200,JSON.stringify(retry.data));
+  state=(await advisor.bootstrap(caseId)).data as Bootstrap;assert.equal(state.reportJob?.status,'ready');assert.equal(state.reports.length,1);assert.match(state.reports[0].provider,/openai/);
+});
+
+test('pause and resume invalidate an in-flight cloud turn instead of resurrecting its late reply',async(t)=>{
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'暂停代次');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  let resolveRequest!:(value:Response)=>void;let markStarted!:()=>void;const started=new Promise<void>(resolve=>{markStarted=resolve;});
+  t.mock.method(globalThis,'fetch',async()=>{markStarted();return await new Promise<Response>(resolve=>{resolveRequest=resolve;});});
+  const pending=advisor.action({action:'message',caseId,text:'家庭保障',eventId:'delayed-turn'});await started;
+  assert.equal((await advisor.action({action:'pause',caseId})).response.status,200);
+  assert.equal((await advisor.action({action:'resume',caseId})).response.status,200);
+  resolveRequest(new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'这条迟到的问题不应出现。',facts:[]})}]}]})));
+  assert.equal((await pending).response.status,409);
+  const state=(await advisor.bootstrap()).data as Bootstrap;assert.equal(state.messages.some(m=>m.eventId==='delayed-turn:reply'),false);assert.equal(state.messages.filter(m=>m.eventId==='delayed-turn').length,1);
+  process.env.LLM_PROVIDER='mock';await advisor.action({action:'end',caseId});await drainReportJobs();
+});
+
+test('mock money parsing never changes CAD into CNY or truncates ambiguous magnitudes; manual sources are explicit',async()=>{
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'币种来源');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'disability_income'});
+  await advisor.action({action:'message',caseId,text:'不知道',eventId:'money-goal'});await advisor.action({action:'message',caseId,text:'不愿提供',eventId:'money-job'});
+  await advisor.action({action:'message',caseId,text:'5万 USD 每年',eventId:'money-bad'});await advisor.action({action:'message',caseId,text:'5000 加元 每月',eventId:'money-good'});
+  await advisor.action({action:'end',caseId});await drainReportJobs();let state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.facts.find(f=>f.key==='income')?.value,5000);assert.equal(state.facts.find(f=>f.key==='income')?.currency,'CAD');
+  const invalid=await advisor.action({action:'updateFact',caseId,key:'goal',value:'保护家庭',currency:'USD',period:'year',factStatus:'confirmed',reason:'测试不允许非金额单位'});assert.equal(invalid.response.status,400);
+  const correction=await advisor.action({action:'updateFact',caseId,key:'goal',value:'保护家庭',factStatus:'confirmed',reason:'顾问核对后的更正'});assert.equal(correction.response.status,200);
+  state=(await advisor.bootstrap(caseId)).data as Bootstrap;const corrected=state.facts.find(f=>f.key==='goal')!;const message=state.messages.find(m=>m.id===corrected.sourceMessageIds[0])!;
+  assert.equal(message.source,'advisor');assert.equal(message.actorId,'advisor-1');assert.match(state.reports[0].fullText,/顾问更正/);
 });
