@@ -94,8 +94,11 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   await page.getByRole('button', { name: '通知预览' }).click();
   await expect(page.getByText('当前仅预览，不会实际发送')).toBeVisible();
   await page.getByRole('button', { name: '确认发送（仅预览）' }).click();
-  await expect(page.getByText('company@aeconn.example')).toBeVisible();
-  await expect(page.getByText('dry_run').first()).toBeVisible();
+  const deliveries = page.locator('.delivery-list');
+  await expect(deliveries.locator(':scope > div')).toHaveCount(2);
+  await expect(deliveries.getByText('company@aeconn.example', { exact: true })).toBeVisible();
+  await expect(deliveries.getByText('advisor1@aeconn.example', { exact: true })).toBeVisible();
+  await expect(deliveries.getByText('dry_run', { exact: true })).toHaveCount(2);
 });
 
 test('Charles 复核与管理员配置保持角色边界', async ({ page }) => {
