@@ -283,4 +283,3 @@ test('rejects unsafe customer replies and mixed-case input before provider outpu
   }
   assert.throws(() => buildInterviewContext({ entry: 'life', facts: [], messages: [message('one', 'user', '案例一'), message('two', 'user', '案例二', { caseId: 'case-2' })] }), /different cases/);
 });
-

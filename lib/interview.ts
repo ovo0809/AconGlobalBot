@@ -390,4 +390,3 @@ export function validateInterviewTurn(raw: unknown, input: InterviewInput): Inte
     facts,
   };
 }
-
