@@ -223,7 +223,7 @@ function CaseWorkspace({data,busy,act,reportOpen,setReportOpen,setToast,setHando
 
 function ConversationView({data}:{data:Bootstrap}) {
   const messages=data.messages;
-  return <section className="conversation-view"><div className="timeline-heading"><div><h3>访谈记录</h3><p>最终转写会成为事实来源；临时字幕不会进入画像。</p></div><span className="source-pill">{data.capabilities.voice.includes('gemini')?'真实语音已配置':'模拟语音／文字记录'}</span></div>
+  return <section className="conversation-view"><div className="timeline-heading"><div><h3>访谈记录</h3><p>最终转写会成为事实来源；临时字幕不会进入画像。</p></div><span className="source-pill">{data.capabilities.voiceConfigured?'真实语音已配置':'模拟语音／文字记录'}</span></div>
     <div className="message-history">{messages.length?messages.map(message=><article key={message.id} className={`history-message ${message.role}`}><span className="message-role">{message.role==='assistant'?'Aeconn 助手':'客户'}</span><p>{message.text}</p><footer><time>{new Date(message.createdAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time>{message.interrupted&&<span>已被打断</span>}{!message.final&&<span className="warning-text">转写待确认</span>}</footer></article>):<EmptyState title="还没有访谈记录" body="进入客户模式，选择一个入口后即可开始。"/>}</div>
   </section>;
 }
@@ -308,7 +308,7 @@ function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Boot
     window.addEventListener('pagehide',pauseOnLeave);
     return()=>window.removeEventListener('pagehide',pauseOnLeave);
   },[data.csrf]);
-  const started=Boolean(session.entry); const voiceConfigured=data.capabilities.voice.includes('gemini');
+  const started=Boolean(session.entry); const voiceConfigured=data.capabilities.voiceConfigured;
   const stateLabel:Record<BrowserVoiceState,string>={idle:'等待开始',connecting:'正在连接',listening:'正在听您说',thinking:'正在思考',speaking:'正在回答',reconnecting:'连接恢复中',paused:'访谈已暂停',ended:'访谈已结束',error:'语音不可用'};
   async function choose(entry:Category){await act({action:'chooseEntry',entry});setVoiceState('idle');}
   async function startVoice(){

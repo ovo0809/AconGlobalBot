@@ -6,10 +6,12 @@
 
 - `npm run typecheck`：通过。
 - `npm run lint`：通过。
-- `npm test`：29/29 通过，覆盖报告规则、来源、结构、中文分页 PDF、真实 Request/Response 会话权限、CSRF 与回环 Host 归一化、四入口、财务未知／拒答、版本、复核、邮件策略、部分失败与 unknown 对账、完整应用 SQLite online backup／恢复、假上游 WebSocket 协议。
+- `npm test`：32/32 通过，覆盖报告规则、来源、结构、中文分页 PDF、真实 Request/Response 会话权限、CSRF 与回环 Host 归一化、四入口、财务未知／拒答、版本、复核、邮件策略、部分失败与 unknown 对账、完整应用 SQLite online backup／恢复、假上游 WebSocket 协议及原型模式禁止云端请求。
 - `npm run build`：通过，无构建警告。数据库为运行时数据，不参与 Next 文件追踪。
 - `npm run test:e2e`：3 条 Chromium 流程通过，见下文。
 - `npm audit --audit-level=moderate`：0 vulnerabilities（当前锁定依赖检查结果）。
+
+初始基准提交 `7a67d47` 为 29 项自动测试。本轮 Provider 边界更新增加 3 项回归测试并重新运行全套检查：缺省／mock 模式即使存在云端密钥也不请求模型；分析与语音必须分别显式开启；mock 语音不会连接上游。使用假 HTTP／本地 WebSocket 验证，未访问真实云端。项目依赖和锁文件未增加 Ollama 或其他本地模型运行时。
 
 ## 浏览器验证
 

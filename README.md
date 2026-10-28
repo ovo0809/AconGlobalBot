@@ -2,7 +2,7 @@
 
 面向 Aeconn 真人保险顾问的中文本地 Demo：建立合成客户档案 → 受限客户访谈 → 结束并交还手机 → 内部报告与中文 PDF → 顾问确认两份邮件预览 → Charles 复核。
 
-实现依据：[Notion「02｜可直接复制给 Codex 的开发 Prompt」V1.3](https://app.notion.com/p/406d9731c2408174a24dfa30ff68ee52)。这是合成数据演示程序，不是获准处理真实客户资料的生产系统。模型默认模拟，邮件始终默认 dry-run；真实连续语音需另外配置并在目标手机验收。
+实现依据：[Notion「02｜可直接复制给 Codex 的开发 Prompt」V1.3](https://app.notion.com/p/406d9731c2408174a24dfa30ff68ee52)。这是合成数据 UI 原型，不是获准处理真实客户资料的生产系统。当前分析回复和语音选择器都默认 `mock`，邮件默认 dry-run；云端 AI 与真实连续语音需后续显式启用并在目标手机验收。
 
 项目文档：[产品需求 PRD](PRD.md) · [MVP 范围与交付状态](mvp.md) · [工程验证记录](docs/verification.md)
 
@@ -12,7 +12,7 @@
 
 ## 启动
 
-需要 **Node.js 24.x** 和 Git。依赖版本由 `package-lock.json` 锁定，不需要 Docker、本地大模型或额外数据库服务。
+需要 **Node.js 24.x** 和 Git。依赖版本由 `package-lock.json` 锁定。当前原型不需要 API 密钥、本地模型、独立显卡、模型权重、Docker 或额外数据库服务。
 
 Windows PowerShell：
 
@@ -67,16 +67,23 @@ npm run dev
 | 服务端会话、CSRF、顾问隔离、管理员隔离、客户模式限制 | 已实现并自动测试 |
 | 六字段建档、12 个合成场景、文字访谈、未知／拒答、事实来源 | 已实现并自动测试 |
 | 四类别规则、六块报告、中文分页 PDF、版本与复核 | 已实现；规则标记 `demo_unapproved`，未做业务正确率验收 |
-| 模型分析 | 默认 mock；Gemini 结构化提取／分析适配器已实现，真实服务未验证 |
-| 连续语音 | Gemini Live 真实适配器已实现；本地假上游协议测试通过，真实服务与手机待验收 |
+| 模型分析 | 当前 `LLM_PROVIDER=mock`；Gemini 结构化适配器保留但未开启，真实服务未验证 |
+| 连续语音 | 当前 `VOICE_PROVIDER=mock`；Gemini Live 适配器保留但未开启，本地假上游协议通过，真实服务与手机待验收 |
 | 邮件 | 完整 dry-run 正文／PDF 已实现；真实传输接口有策略保护，但未配置真实发送服务 |
 | 备份／恢复 | SQLite online backup，包含数据库内 PDF 与版本，自动测试通过 |
 
 详细证据与限制见 [验证记录](docs/verification.md)、[决策记录](decisions.md)、[模型及语音配置](docs/providers.md)、[PDF 验证](docs/report-validation.md)。
 
-## 可选云端配置
+## 后续启用云端 AI 与连续语音
 
-只在本机 `.env.local` 填写密钥，不上传 GitHub，也不粘贴到聊天记录。最少配置：
+当前 UI 原型保持下面两项默认值，即使系统环境中已有 Gemini 密钥也不会自动调用网络：
+
+```dotenv
+LLM_PROVIDER=mock
+VOICE_PROVIDER=mock
+```
+
+进入云端服务验证阶段时，才在本机 `.env.local` 显式选择 Gemini，并填写密钥与准确模型名。不要上传 GitHub，也不要粘贴到聊天记录：
 
 ```dotenv
 LLM_PROVIDER=gemini
@@ -86,7 +93,9 @@ GEMINI_MODEL=当前账户可用的准确分析模型名
 GEMINI_LIVE_MODEL=当前账户可用的准确Live模型名
 ```
 
-型号需要从供应商当前控制台确认，代码不猜测或固定未经验证的型号。分析和连续语音可以分别启用。姓名、电话、邮箱和完整生日等建档字段不直接提交给分析模型；用户在自由文本内主动透露的身份信息不能保证完全自动去除，因此仍只使用合成资料。
+只有 Provider 选择器与所需配置同时满足时，云端能力才启用；分析和连续语音可以分别验证。型号需要从供应商当前控制台确认，代码不猜测或固定未经验证的型号。姓名、电话、邮箱和完整生日等建档字段不直接提交给分析模型；用户在自由文本内主动透露的身份信息不能保证完全自动去除，因此仍只使用合成资料。
+
+模型 Provider 只产生候选事实和分析。权限、案例归属、状态、收件人、发送批准和人工确认仍由业务层控制。未来如有离线或成本需求，可以在同一边界新增 Ollama Provider；当前没有实现、安装或自动拉取 Ollama 模型，也不保证只替换 URL 就能获得同等质量、延迟或连续语音能力。
 
 手机测试需受信任 HTTPS，电脑 localhost 能录音不代表手机通过局域网 HTTP 能录音。默认只监听回环地址。受控测试步骤见 [迁移与 HTTPS](docs/operations.md)；不应直接将默认 Demo 暴露到互联网。
 
@@ -115,7 +124,8 @@ npm run restore -- ./data/backups/manual.sqlite ./data/restored.sqlite
 - `app/`：响应式界面和服务端 API。
 - `lib/service.ts` / `lib/db.ts`：权限、状态机、来源、SQLite schema、批准与 Outbox。
 - `lib/report.ts` / `lib/scenarios.ts`：独立示范规则、合成数据、报告和 PDF。
-- `lib/providers.ts` / `lib/voice-server.ts` / `lib/browser-voice.ts`：可替换模型和实时语音边界。
+- `lib/provider-config.ts` / `lib/providers.ts`：集中选择 Provider，隔离 Mock／Gemini 实现与业务逻辑。
+- `lib/voice-server.ts` / `lib/browser-voice.ts`：实时语音的服务端中继与浏览器边界。
 - `lib/mail.ts`：预览、发送策略、accepted/delivered/unknown 边界及对账流程。
 - `scripts/`、`tests/`、`.github/workflows/`：备份恢复、自动验证、CI。
 

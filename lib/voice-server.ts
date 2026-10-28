@@ -3,6 +3,7 @@ import type { Duplex } from 'node:stream';
 import type { Server } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
+import { realtimeVoiceConfig } from './provider-config';
 
 export type VoiceStatus = 'connecting' | 'listening' | 'thinking' | 'speaking' | 'reconnecting' | 'ended' | 'error' | 'transcript_incomplete';
 
@@ -200,12 +201,12 @@ function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks: Voice
   const identity = hooks.consumeToken(token);
   if (!identity || !hooks.isActive(identity.sessionId)) return browser.close(1008, 'invalid or expired token');
 
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  const model = process.env.GEMINI_LIVE_MODEL?.trim();
-  if (!apiKey || !model) {
+  const config = realtimeVoiceConfig();
+  if (!config) {
     send(browser, { type: 'unavailable', message: '实时语音未配置，可继续使用文字。' });
     return browser.close(1013, 'voice not configured');
   }
+  const { apiKey, model } = config;
   const active: ActiveVoice = {
     sessionId: identity.sessionId,
     browser,

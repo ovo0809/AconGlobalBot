@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { audit, checkPassword, db, docs, id, now, pack, transaction, unpack } from './db';
-import { analyzeDemo, buildReport, renderPdf, validateAnalyses } from './report';
+import { buildReport, renderPdf, validateAnalyses } from './report';
 import { analyzeWithProvider } from './providers';
+import { providerDisplayCapabilities } from './provider-config';
 import { closeVoiceSession } from './voice-server';
 import { DryRunMailProvider } from './mail';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, Review, Settings, User } from './domain';
@@ -84,7 +85,7 @@ function parseAnswer(key:string,text:string,messageId:string):ProfileField|null 
 
 export function bootstrap(request:Request):Response {
   let auth=readAuth(request);let setCookie:string|undefined;if(!auth){const created=newAuth(request);auth=created.auth;setCookie=created.cookie;}
-  const capabilities={analysis:process.env.LLM_PROVIDER==='gemini'&&process.env.GEMINI_API_KEY&&process.env.GEMINI_MODEL?'gemini（未完成真实服务验收）':'mock（模拟分析）',voice:process.env.VOICE_PROVIDER==='gemini'&&process.env.GEMINI_API_KEY&&process.env.GEMINI_LIVE_MODEL?'gemini（待真机验证）':'实时语音未配置',mail:'dry-run（未发送）'};
+  const capabilities={...providerDisplayCapabilities(),mail:'dry-run（未发送）'};
   const data:Bootstrap={csrf:auth.csrf,mode:'anonymous',user:null,clients:[],cases:[],activeCase:null,messages:[],facts:[],reports:[],notifications:[],reviews:[],capabilities,demo:true};
   if(auth.user_id){const user=userFor(auth);
     if(auth.mode==='client'){
@@ -118,12 +119,9 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
     const before=digest(pack({messages,facts}));
     const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
     const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];if(prior)return reportRecord(prior,record);
-    let analyses=analyzeDemo(facts);let provider='mock（模拟规则，非真实模型分析）';
-    if(process.env.LLM_PROVIDER==='gemini'){
-      const output=await analyzeWithProvider({messages,facts});analyses=output.analyses;provider=output.provider;
-      requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
-      if(output.facts){for(const fact of output.facts)validateFact(fact,messages);const merged=new Map(facts.map(f=>[f.key,f]));for(const fact of output.facts){const old=merged.get(fact.key);if(!old||old.factStatus==='reported_unverified')merged.set(fact.key,{...fact,confirmedBy:null,confirmedAt:null,factStatus:fact.factStatus==='confirmed'?'reported_unverified':fact.factStatus});}facts=[...merged.values()];}
-    }
+    const output=await analyzeWithProvider({messages,facts});const {analyses,provider}=output;
+    requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
+    if(output.facts){for(const fact of output.facts)validateFact(fact,messages);const merged=new Map(facts.map(f=>[f.key,f]));for(const fact of output.facts){const old=merged.get(fact.key);if(!old||old.factStatus==='reported_unverified')merged.set(fact.key,{...fact,confirmedBy:null,confirmedAt:null,factStatus:fact.factStatus==='confirmed'?'reported_unverified':fact.factStatus});}facts=[...merged.values()];}
     validateAnalyses(analyses,facts,messages);
     const snapshotId=digest(pack({before:digest(pack({messages,facts})),reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
     record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];const version=record.reportVersion+1;
@@ -171,7 +169,7 @@ export async function action(request:Request):Promise<Response>{
     }
     if(name==='pause'){db().prepare("UPDATE interviews SET state='paused',voice_state='ended',deadline=? WHERE id=?").run(Date.now()+1700,session.id);await closeVoiceSession(session.id);db().prepare('UPDATE interviews SET deadline=NULL WHERE id=?').run(session.id);}
     if(name==='resume'){db().prepare("UPDATE interviews SET state='active' WHERE id=?").run(session.id);}
-    if(name==='voiceToken'){requireThat(session.state==='active'&&session.entry,409,'请先选择入口并恢复访谈。');requireThat(process.env.VOICE_PROVIDER==='gemini'&&process.env.GEMINI_API_KEY&&process.env.GEMINI_LIVE_MODEL,409,'实时语音未配置，可继续文字访谈或明确标记的模拟演示。');const token=randomBytes(32).toString('hex');db().prepare('INSERT INTO voice_tokens VALUES(?,?,?,?)').run(digest(token),session.id,auth.id,Date.now()+30_000);return json({ok:true,token});}
+    if(name==='voiceToken'){requireThat(session.state==='active'&&session.entry,409,'请先选择入口并恢复访谈。');requireThat(providerDisplayCapabilities().voiceConfigured,409,'实时语音未配置，可继续文字访谈或明确标记的模拟演示。');const token=randomBytes(32).toString('hex');db().prepare('INSERT INTO voice_tokens VALUES(?,?,?,?)').run(digest(token),session.id,auth.id,Date.now()+30_000);return json({ok:true,token});}
     return json({ok:true});
   }
   requireAdvisorMode(auth);

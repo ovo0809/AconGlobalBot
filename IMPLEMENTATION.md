@@ -2,7 +2,7 @@
 
 Source: Notion page 02, revision 2026-10-27, https://app.notion.com/p/406d9731c2408174a24dfa30ff68ee52
 
-One Next.js / TypeScript application, Node 24 built-in SQLite, custom Node server for a same-origin Gemini Live WebSocket relay. Server owns sessions, scope, facts, versions and recipients. Defaults: loopback only, synthetic data, mock analysis, dry-run mail. No actual email is sent during development.
+One Next.js / TypeScript application, Node 24 built-in SQLite, custom Node server for a same-origin voice WebSocket relay. Server owns sessions, scope, facts, versions and recipients. Current UI prototype defaults both provider selectors to mock, uses synthetic data and dry-run mail, and makes no cloud AI call. No API key, local model, GPU or model-weight download is required. Gemini adapters remain available for a later explicitly configured cloud-validation phase. No actual email is sent during development.
 
 ## Work ownership
 - Root: package/config, lib/domain.ts, lib/db.ts, lib/service.ts, API routes, integration tests, docs, GitHub publication.
@@ -33,10 +33,13 @@ GET /api/notifications?caseId=... => jobs with complete body and attachment URL 
 GET /api/bootstrap?caseId=... selects internal case. Advisors only own clients; Charles only handed-off cases; admin gets settings/users, no business data.
 
 ## Provider integration
-lib/providers.ts exports async analyzeWithProvider(input: {messages: Message[], facts: ProfileField[]}) returning {facts?: ProfileField[], analyses: AnalysisItem[], provider:string}; no PII fields passed. Missing key uses explicitly marked mock. Prefer report.ts analyzeDemo(facts) for fallback; exact interface coordinate with report agent.
+lib/provider-config.ts centralizes provider selection and validates required environment values. Default `LLM_PROVIDER=mock` and `VOICE_PROVIDER=mock` must not initiate cloud traffic even when cloud credentials exist. Cloud use requires an explicit provider selection plus its key and model setting.
+lib/providers.ts defines the LLMProvider boundary and Mock/Gemini implementations, and exports a facade returning `{facts?: ProfileField[], analyses: AnalysisItem[], provider:string}`. Provider output is limited to candidate facts and analyses. Service/business logic continues to own permission, scope, numeric validation, state, recipients, approval and human confirmation. Direct identity fields are excluded from the cloud payload.
 lib/voice-server.ts exports attachVoiceServer(httpServer, hooks). Hooks: consumeToken(token:string): {sessionId:string,caseId:string}|null; isActive(sessionId:string):boolean; persist(sessionId:string,event:{eventId:string,turnId:string,role:'user'|'assistant',text:string,interrupted?:boolean}):void; status(sessionId:string,state:string):void. Model/instructions locked server-side. Transport uses /voice?token= one-use short credential. Late events never reopen ended sessions. Expose closeVoiceSession(sessionId) for end; end permits bounded drain but closes input instantly.
 server.ts loads env via @next/env, prepares Next, handles HTTP, attaches voice with hooks exported from lib/service.ts. Listen 127.0.0.1 by default. npm dev/start via tsx server.ts.
 lib/browser-voice.ts exports a class with documented small UI interface; coordinate directly with UI agent. Supports microphone PCM stream, output audio playback, VAD state, interruption, subtitles, mute, stop all tracks and audio on end, pause/background handling, finite reconnect. Clearly state true service/hardware tests not run without credentials.
+
+Ollama is a possible future Provider, not a current dependency. Do not add packages, installation steps or automatic model pulls for it. A future implementation requires separate quality, hardware, structured-output and voice evaluation; never treat a base URL swap as full compatibility.
 
 ## Report integration
 lib/report.ts exports analyzeDemo(facts:ProfileField[]):AnalysisItem[], validateAnalyses(analyses, facts, messages):void, buildReport(input:ReportInput): ReportContent, renderPdf(report:ReportContent):Promise<Buffer>. ReportInput/ReportContent defined lib/domain.ts. Six sections, Chinese embedded font, pagination, immutable version content. No contact data guessed by LLM.

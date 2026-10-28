@@ -77,6 +77,8 @@ test('voice relay rejects cross-origin browser upgrades before consuming a token
 test('voice relay locks setup, persists final turns, forwards audio, and drains before close', async () => {
   const oldKey = process.env.GEMINI_API_KEY;
   const oldModel = process.env.GEMINI_LIVE_MODEL;
+  const oldProvider = process.env.VOICE_PROVIDER;
+  process.env.VOICE_PROVIDER = 'gemini';
   process.env.GEMINI_API_KEY = 'test-only-key';
   process.env.GEMINI_LIVE_MODEL = 'test-live-model';
 
@@ -154,4 +156,33 @@ test('voice relay locks setup, persists final turns, forwards audio, and drains 
   await new Promise<void>((resolve) => upstream.close(() => resolve()));
   if (oldKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = oldKey;
   if (oldModel === undefined) delete process.env.GEMINI_LIVE_MODEL; else process.env.GEMINI_LIVE_MODEL = oldModel;
+  if (oldProvider === undefined) delete process.env.VOICE_PROVIDER; else process.env.VOICE_PROVIDER = oldProvider;
+});
+
+test('mock voice refuses an upstream connection even when cloud credentials exist', async (t) => {
+  const keys = ['VOICE_PROVIDER', 'GEMINI_API_KEY', 'GEMINI_LIVE_MODEL'] as const;
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  t.after(() => { for (const key of keys) { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; } });
+  process.env.VOICE_PROVIDER = 'mock';
+  process.env.GEMINI_API_KEY = 'synthetic-unused-key';
+  process.env.GEMINI_LIVE_MODEL = 'synthetic-unused-model';
+  const upstream = new WebSocketServer({host:'127.0.0.1',port:0});
+  await new Promise<void>(resolve => upstream.once('listening',resolve));
+  const upstreamAddress = upstream.address();
+  assert(upstreamAddress && typeof upstreamAddress !== 'string');
+  let connections = 0;
+  upstream.on('connection', socket => { connections++; socket.close(1013, 'unexpected upstream'); });
+  const hooks:VoiceHooks = {consumeToken:()=>({sessionId:'mock-voice',caseId:'mock-case'}),isActive:()=>true,persist:()=>undefined,status:()=>undefined};
+  const server = createServer();
+  const relay = attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`});
+  await new Promise<void>(resolve => server.listen(0,'127.0.0.1',resolve));
+  t.after(async () => { await relay.close(); await new Promise<void>(resolve => server.close(()=>resolve())); await new Promise<void>(resolve => upstream.close(()=>resolve())); });
+  const address=server.address();
+  assert(address && typeof address !== 'string');
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=synthetic`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:string[]=[];
+  socket.on('message',data=>events.push(data.toString()));
+  assert.equal((await waitForClose(socket)).code,1013);
+  assert(events.some(event=>event.includes('实时语音未配置')));
+  assert.equal(connections,0);
 });

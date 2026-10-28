@@ -1,4 +1,5 @@
 import type { AnalysisItem, Category, Message, ProfileField } from './domain';
+import { analysisProviderConfig, realtimeVoiceConfig, type CloudModelConfig } from './provider-config';
 
 export interface ProviderAnalysisInput {
   messages: Message[];
@@ -9,6 +10,11 @@ export interface ProviderAnalysisResult {
   facts?: ProfileField[];
   analyses: AnalysisItem[];
   provider: string;
+}
+
+/** Providers propose facts and analyses; permissions, state and approval stay in the service. */
+export interface LLMProvider {
+  analyze(input:ProviderAnalysisInput):Promise<ProviderAnalysisResult>;
 }
 
 const CATEGORIES: Category[] = ['life', 'annuity', 'ltc', 'disability_income'];
@@ -66,12 +72,6 @@ const ANALYSIS_SCHEMA = {
   },
   required: ['facts', 'analyses'],
 } as const;
-
-function providerConfig() {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  const model = process.env.GEMINI_MODEL?.trim();
-  return apiKey && model ? { apiKey, model } : null;
-}
 
 function redactText(text: string): string {
   return text
@@ -193,12 +193,27 @@ async function demoFallback(facts: ProfileField[]): Promise<AnalysisItem[]> {
   }
 }
 
-export async function analyzeWithProvider(input: ProviderAnalysisInput): Promise<ProviderAnalysisResult> {
-  const config = providerConfig();
-  if (!config) {
-    return { analyses: await demoFallback(input.facts), provider: 'mock:demo_unapproved' };
+export class MockLLMProvider implements LLMProvider {
+  async analyze(input:ProviderAnalysisInput):Promise<ProviderAnalysisResult> {
+    return { analyses:await demoFallback(input.facts),provider:'mock:demo_unapproved' };
   }
+}
 
+export class GeminiLLMProvider implements LLMProvider {
+  constructor(private readonly config:CloudModelConfig){}
+  analyze(input:ProviderAnalysisInput){return analyzeWithGemini(input,this.config);}
+}
+
+export function createLLMProvider():LLMProvider {
+  const config=analysisProviderConfig();
+  return config?new GeminiLLMProvider(config):new MockLLMProvider();
+}
+
+export function analyzeWithProvider(input:ProviderAnalysisInput):Promise<ProviderAnalysisResult> {
+  return createLLMProvider().analyze(input);
+}
+
+async function analyzeWithGemini(input:ProviderAnalysisInput,config:CloudModelConfig):Promise<ProviderAnalysisResult> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Number(process.env.GEMINI_TIMEOUT_MS || 30_000));
   try {
@@ -224,7 +239,7 @@ export async function analyzeWithProvider(input: ProviderAnalysisInput): Promise
 
 export function providerCapabilities() {
   return {
-    analysis: providerConfig() ? 'configured_not_verified' : 'mock:demo_unapproved',
-    voice: process.env.GEMINI_API_KEY?.trim() && process.env.GEMINI_LIVE_MODEL?.trim() ? 'configured_not_verified' : 'not_configured',
+    analysis: analysisProviderConfig() ? 'configured_not_verified' : 'mock:demo_unapproved',
+    voice: realtimeVoiceConfig() ? 'configured_not_verified' : 'not_configured',
   };
 }
