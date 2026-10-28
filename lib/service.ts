@@ -4,16 +4,16 @@ import { buildReport, renderPdf, validateAnalyses } from './report';
 import { analyzeWithProvider, interviewWithProvider, ProviderExtractionValidationError } from './providers';
 import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-config';
 import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
-import { closeVoiceSession, type VoiceDiagnosticEvent } from './voice-server';
+import { closeVoiceSession, forgetVoiceSession, type VoiceDiagnosticEvent } from './voice-server';
 import { DryRunMailProvider } from './mail';
-import { getUsageSummary, recoverUsageReservations, UsageBudgetError } from './ai-usage';
+import { getUsageSummary, purgeCaseUsage, recoverUsageReservations, UsageBudgetError } from './ai-usage';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
 
 type Input=Record<string,unknown>;
 type Auth={id:string;user_id:string|null;csrf:string;mode:string;active_case:string|null;active_interview:string|null;last_ended_case:string|null;expires_at:number};
 type Interview={id:string;case_id:string;auth_id:string;state:string;entry:Category|null;current_question:string|null;deadline:number|null;incomplete:number;voice_state:string;epoch:number};
-export class AppError extends Error {constructor(public status:number,message:string){super(message);}}
-function requireThat(condition:unknown,status:number,message:string):asserts condition {if(!condition) throw new AppError(status,message);}
+export class AppError extends Error {constructor(public status:number,message:string,public code?:string){super(message);}}
+function requireThat(condition:unknown,status:number,message:string,code?:string):asserts condition {if(!condition) throw new AppError(status,message,code);}
 const digest=(text:string)=>createHash('sha256').update(text).digest('hex');
 const str=(input:Input,key:string,max=5000)=>typeof input[key]==='string'?String(input[key]).trim().slice(0,max):'';
 const categories:Category[]=['life','annuity','ltc','disability_income'];
@@ -39,12 +39,12 @@ function newAuth(request:Request,userId:string|null=null):{auth:Auth;cookie:stri
 function userFor(auth:Auth):User {requireThat(auth.user_id,401,'请先登录。');const user=docs<User>('SELECT doc FROM users WHERE id=?',auth.user_id)[0];requireThat(user,401,'会话已失效。');return user;}
 function requireAdvisorMode(auth:Auth):User {requireThat(auth.mode==='advisor',403,'客户模式期间无法访问内部资料，请先结束访谈并交还手机。');return userFor(auth);}
 function caseFor(user:User,caseId:string,ownerOnly=false,includeDeleted=false):Case {
-  const record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];requireThat(record,404,'案例不存在。');
+  const record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];requireThat(record,404,'案例不存在。','CASE_NOT_FOUND');
   const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];
-  requireThat(owner?.orgId===user.orgId && (record.ownerAgentId===user.id && user.role==='advisor' || !ownerOnly && user.role==='reviewer' && record.assignedReviewerId===user.id),403,'您无权查看此案例。');requireThat(includeDeleted||!record.deletedAt,404,'案例不存在。');return record;
+  requireThat(owner?.orgId===user.orgId && (record.ownerAgentId===user.id && user.role==='advisor' || !ownerOnly && user.role==='reviewer' && record.assignedReviewerId===user.id),403,'您无权查看此案例。');requireThat(includeDeleted||!record.deletedAt,404,'案例不存在。','CASE_NOT_FOUND');return record;
 }
 function saveCase(record:Case){record.updatedAt=now();db().prepare('UPDATE cases SET reviewer_id=?,doc=? WHERE id=?').run(record.assignedReviewerId,pack(record),record.id);}
-function caseDisplayName(record:Case,clientName:string|undefined){if(!clientName)return undefined;const rows=db().prepare('SELECT id FROM cases WHERE client_id=? ORDER BY rowid').all(record.clientId) as {id:string}[];const index=rows.findIndex(row=>row.id===record.id);return index>0?`${clientName}（${index}）`:clientName;}
+function caseDisplayName(record:Case,clientName:string|undefined){if(!clientName)return undefined;const number=record.caseNumber??0;return number>0?`${clientName}（${number}）`:clientName;}
 function currentInterview(auth:Auth):Interview {
   requireThat(auth.mode==='client'&&auth.active_interview&&auth.active_case,403,'当前不在客户访谈模式。');
   const session=db().prepare('SELECT * FROM interviews WHERE id=? AND auth_id=? AND case_id=?').get(auth.active_interview,auth.id,auth.active_case) as Interview|undefined;
@@ -158,9 +158,13 @@ export function bootstrap(request:Request):Response {
       data.usage=getUsageSummary(user.orgId);
       if(user.role==='admin'){data.settings=settingsFor(user);data.users=docs<User>('SELECT doc FROM users WHERE org_id=?',user.orgId);}
       else {
-        data.cases=(user.role==='advisor'?docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id):docs<Case>('SELECT doc FROM cases WHERE reviewer_id=? ORDER BY rowid DESC',user.id)).filter(record=>!record.deletedAt);
-        const clientIds=new Set(data.cases.map(record=>record.clientId));data.clients=docs<Client>('SELECT doc FROM clients').filter(client=>clientIds.has(client.id));
-        data.cases=data.cases.map(record=>({...record,clientName:caseDisplayName(record,data.clients.find(client=>client.id===record.clientId)?.name)}));
+        const scopedCases=user.role==='advisor'?docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id):docs<Case>('SELECT doc FROM cases WHERE reviewer_id=? ORDER BY rowid DESC',user.id);
+        data.cases=scopedCases.filter(record=>!record.deletedAt);
+        if(user.role==='advisor')data.deletedCases=scopedCases.filter(record=>record.deletedAt);
+        const allClientIds=new Set(scopedCases.map(record=>record.clientId)),activeClientIds=new Set(data.cases.map(record=>record.clientId));
+        const scopedClients=docs<Client>('SELECT doc FROM clients').filter(client=>allClientIds.has(client.id));data.clients=scopedClients.filter(client=>activeClientIds.has(client.id));
+        data.cases=data.cases.map(record=>({...record,clientName:caseDisplayName(record,scopedClients.find(client=>client.id===record.clientId)?.name)}));
+        if(data.deletedCases)data.deletedCases=data.deletedCases.map(record=>({...record,clientName:caseDisplayName(record,scopedClients.find(client=>client.id===record.clientId)?.name)}));
         const requested=new URL(request.url).searchParams.get('caseId');const selected=requested||(auth.last_ended_case&&data.cases.some(record=>record.id===auth.last_ended_case)?auth.last_ended_case:data.cases[0]?.id);
         if(selected){data.activeCase=caseFor(user,selected);data.usage=getUsageSummary(user.orgId,selected,true);data.activeCase.clientName=caseDisplayName(data.activeCase,data.clients.find(client=>client.id===data.activeCase?.clientId)?.name);data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.reportJob=reportJobFor(selected);data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
       }
@@ -169,7 +173,7 @@ export function bootstrap(request:Request):Response {
   return json(data,200,setCookie);
 }
 export function json(value:unknown,status=200,setCookie?:string):Response {const headers:Record<string,string>={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, private','Vary':'Cookie'};if(setCookie)headers['Set-Cookie']=setCookie;return new Response(JSON.stringify(value),{status,headers});}
-export function errorResponse(error:unknown){if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。'},error instanceof AppError?error.status:error instanceof UsageBudgetError?429:500);}
+export function errorResponse(error:unknown){if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。',...(error instanceof AppError&&error.code?{code:error.code}:{})},error instanceof AppError?error.status:error instanceof UsageBudgetError?429:500);}
 
 async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:string):Promise<ReportRecord>{
   const existing=locks.get(caseId);if(existing){requireThat(!reviewNote,409,'另一份报告正在生成，请完成后再提交复核。');return existing;}
@@ -236,15 +240,34 @@ export async function action(request:Request):Promise<Response>{
   if(name==='createClient'){
     requireThat(user.role==='advisor',403,'仅顾问可以建档。');const nameValue=str(input,'name',100),birthday=str(input,'birthday',10),gender=str(input,'gender',40),phone=str(input,'phone',40),email=str(input,'email',254),maritalStatus=str(input,'maritalStatus',40);
     requireThat(nameValue&&gender&&maritalStatus&&/^\d{4}-\d{2}-\d{2}$/.test(birthday)&&Number.isFinite(Date.parse(birthday))&&new Date(birthday).toISOString().slice(0,10)===birthday&&birthday>='1900-01-01'&&birthday<=now().slice(0,10),400,'请完整填写姓名、有效生日、性别和婚姻状态。');requireThat(/^\+?[\d\s()-]{7,25}$/.test(phone)&&/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),400,'请填写有效电话号码与邮箱。');
-    const client:Client={id:id(),name:nameValue,birthday,gender,phone,email,maritalStatus,state:str(input,'state',80),language:str(input,'language',50)||'普通话',ownerAgentId:user.id,consentStatus:'purpose_explained_demo',createdAt:now()};
+    const client:Client={id:id(),name:nameValue,birthday,gender,phone,email,maritalStatus,state:str(input,'state',80),language:str(input,'language',50)||'普通话',ownerAgentId:user.id,consentStatus:'purpose_explained_demo',createdAt:now(),nextCaseNumber:0};
     const caseRecord=transaction(()=>{db().prepare('INSERT INTO clients VALUES(?,?,?)').run(client.id,user.id,pack(client));return createCase(client.id,user.id);});audit(user.id,caseRecord.id,'client.created');return json({ok:true,clientId:client.id,caseId:caseRecord.id});
   }
-  if(name==='createCase'){const client=docs<Client>('SELECT doc FROM clients WHERE id=?',str(input,'clientId'))[0];requireThat(user.role==='advisor'&&client?.ownerAgentId===user.id,403,'无权为此客户创建访谈。');return json({ok:true,caseId:createCase(client.id,user.id).id});}
-  if(name==='deleteCase'||name==='restoreCase'){
-    requireThat(user.role==='advisor',403,'仅归属顾问可以管理案例。');const record=caseFor(user,str(input,'caseId'),true,name==='restoreCase');
-    if(name==='restoreCase'){requireThat(record.deletedAt,409,'案例未被删除。');record.deletedAt=null;record.deletedBy=null;saveCase(record);audit(user.id,record.id,'case.restored');return json({ok:true,nextCaseId:record.id});}
+  if(name==='createCase'){const client=docs<Client>('SELECT doc FROM clients WHERE id=?',str(input,'clientId'))[0];requireThat(user.role==='advisor'&&client?.ownerAgentId===user.id,403,'无权为此客户创建访谈。');return json({ok:true,caseId:transaction(()=>createCase(client.id,user.id)).id});}
+  if(name==='deleteCase'||name==='restoreCase'||name==='purgeCase'){
+    requireThat(user.role==='advisor',403,'仅归属顾问可以管理案例。');const record=caseFor(user,str(input,'caseId'),true,name!=='deleteCase');
+    if(name==='restoreCase'){requireThat(record.deletedAt,409,'案例未被删除。');transaction(()=>{record.deletedAt=null;record.deletedBy=null;saveCase(record);audit(user.id,record.id,'case.restored');});return json({ok:true,nextCaseId:record.id});}
     requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'进行中的访谈不能删除，请先结束访谈。');requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能删除案例。');
-    record.deletedAt=now();record.deletedBy=user.id;saveCase(record);db().prepare('UPDATE auth_sessions SET last_ended_case=NULL WHERE id=? AND last_ended_case=?').run(auth.id,record.id);audit(user.id,record.id,'case.soft_deleted');
+    if(name==='purgeCase'){
+      requireThat(record.deletedAt,409,'请先将案例移入已删除案例。');requireThat(str(input,'confirmation',20)==='永久删除',400,'请输入“永久删除”确认此操作。');
+      const sessions=db().prepare('SELECT id FROM interviews WHERE case_id=?').all(record.id) as {id:string}[];
+      requireThat(!sessions.some(session=>interviewLocks.has(session.id)),409,'访谈消息仍在处理，请稍后重试。');
+      requireThat(!db().prepare("SELECT id FROM ai_usage_calls WHERE case_id=? AND status='reserved'").get(record.id),409,'仍有进行中的调用记录，请等待结算后再永久删除。');
+      transaction(()=>{
+        purgeCaseUsage(record.id);
+        db().prepare("UPDATE auth_sessions SET mode=CASE WHEN active_case=? OR active_interview IN (SELECT id FROM interviews WHERE case_id=?) THEN 'advisor' ELSE mode END,active_case=CASE WHEN active_case=? THEN NULL ELSE active_case END,active_interview=CASE WHEN active_interview IN (SELECT id FROM interviews WHERE case_id=?) THEN NULL ELSE active_interview END,last_ended_case=CASE WHEN last_ended_case=? THEN NULL ELSE last_ended_case END WHERE active_case=? OR active_interview IN (SELECT id FROM interviews WHERE case_id=?) OR last_ended_case=?").run(record.id,record.id,record.id,record.id,record.id,record.id,record.id,record.id);
+        db().prepare('DELETE FROM voice_tokens WHERE interview_id IN (SELECT id FROM interviews WHERE case_id=?)').run(record.id);
+        db().prepare('DELETE FROM interview_extractions WHERE session_id IN (SELECT id FROM interviews WHERE case_id=?)').run(record.id);
+        db().prepare('DELETE FROM notification_jobs WHERE case_id=?').run(record.id);
+        db().prepare('DELETE FROM approvals WHERE case_id=?').run(record.id);
+        for(const table of ['reviews','reports','profile_fields','messages','report_jobs','audit_events','interviews'])db().prepare(`DELETE FROM ${table} WHERE case_id=?`).run(record.id);
+        db().prepare('DELETE FROM cases WHERE id=?').run(record.id);
+        if(!db().prepare('SELECT id FROM cases WHERE client_id=? LIMIT 1').get(record.clientId))db().prepare('DELETE FROM clients WHERE id=?').run(record.clientId);
+      });
+      for(const session of sessions)forgetVoiceSession(session.id);
+      return json({ok:true});
+    }
+    transaction(()=>{record.deletedAt=now();record.deletedBy=user.id;saveCase(record);db().prepare('UPDATE auth_sessions SET last_ended_case=NULL WHERE id=? AND last_ended_case=?').run(auth.id,record.id);audit(user.id,record.id,'case.soft_deleted');});
     const next=docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id).find(item=>!item.deletedAt);return json({ok:true,nextCaseId:next?.id??null});
   }
   if(name==='enterClient'){
@@ -284,7 +307,7 @@ export async function action(request:Request):Promise<Response>{
   }
   throw new AppError(400,'未知操作。');
 }
-function createCase(clientId:string,ownerId:string):Case {const createdAt=now();const record:Case={id:id(),clientId,ownerAgentId:ownerId,status:'new',entry:null,createdAt,updatedAt:createdAt,assignedReviewerId:null,reportVersion:0};db().prepare('INSERT INTO cases VALUES(?,?,?,?,?)').run(record.id,clientId,ownerId,null,pack(record));return record;}
+function createCase(clientId:string,ownerId:string):Case {const createdAt=now(),client=docs<Client>('SELECT doc FROM clients WHERE id=?',clientId)[0];requireThat(client&&client.ownerAgentId===ownerId,403,'您无权为此客户建立案例。');const caseNumber=client.nextCaseNumber??0;client.nextCaseNumber=caseNumber+1;const record:Case={id:id(),clientId,ownerAgentId:ownerId,status:'new',entry:null,createdAt,updatedAt:createdAt,assignedReviewerId:null,reportVersion:0,caseNumber};db().prepare('UPDATE clients SET doc=? WHERE id=?').run(pack(client),client.id);db().prepare('INSERT INTO cases(id,client_id,owner_id,reviewer_id,doc) VALUES(?,?,?,?,?)').run(record.id,clientId,ownerId,null,pack(record));return record;}
 export function reportDownload(request:Request):Response {const auth=readAuth(request);requireThat(auth,401,'请先登录。');const user=requireAdvisorMode(auth),params=new URL(request.url).searchParams,record=caseFor(user,params.get('caseId')||'');const version=Number(params.get('version'));const row=db().prepare('SELECT doc,pdf FROM reports WHERE case_id=? AND version=?').get(record.id,version);requireThat(row,404,'报告不存在。');if(params.get('format')!=='pdf')return json(reportRecord(unpack<ReportContent>(row.doc),record));return new Response(new Uint8Array(row.pdf as Uint8Array),{headers:{'Content-Type':'application/pdf','Content-Disposition':`inline; filename="aeconn-${record.id}-v${version}.pdf"`,'Cache-Control':'no-store, private','Vary':'Cookie','X-Content-Type-Options':'nosniff'}});}
 export function notifications(request:Request):Response {const auth=readAuth(request);requireThat(auth,401,'请先登录。');const record=caseFor(requireAdvisorMode(auth),new URL(request.url).searchParams.get('caseId')||'');return json(docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=?',record.id));}
 

@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { backup, DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import type { Bootstrap, Message, ReportJob, ReportRecord } from '../lib/domain';
-import { beginUsage, completeUsage, getUsageProgress } from '../lib/ai-usage';
+import { beginUsage, completeUsage, getUsageProgress, getUsageSummary, recordUsage } from '../lib/ai-usage';
 
 const databaseRoot = mkdtempSync(join(tmpdir(), 'aeconn-service-test-'));
 process.env.DATABASE_PATH = join(databaseRoot, 'service.sqlite');
@@ -223,19 +224,119 @@ test('owner can soft-delete and restore stable numbered cases without deleting u
   assert.equal((await otherOwnerSession.action({action:'deleteCase',caseId:thirdId})).response.status,409,'a queued report blocks deletion');
   await drainReportJobs();
 
+  const {db}=await import('../lib/db');
+  db().exec("CREATE TEMP TRIGGER fail_soft_delete_audit BEFORE INSERT ON audit_events WHEN NEW.action='case.soft_deleted' BEGIN SELECT RAISE(ABORT,'synthetic soft delete rollback'); END");
+  assert.equal((await otherOwnerSession.action({action:'deleteCase',caseId:thirdId})).response.status,500);
+  db().exec('DROP TRIGGER fail_soft_delete_audit');
+  assert.equal((await otherOwnerSession.bootstrap(thirdId)).response.status,200,'audit failure rolls back the soft-delete state');
   const deleted=await otherOwnerSession.action({action:'deleteCase',caseId:thirdId});
   assert.equal(deleted.response.status,200,JSON.stringify(deleted.data));assert.equal(deleted.data.nextCaseId,secondId);
   state=(await otherOwnerSession.bootstrap()).data as Bootstrap;
   assert.equal(state.cases.some(record=>record.id===thirdId),false);
   const endedOwnerBootstrap=await owner.bootstrap();assert.equal(endedOwnerBootstrap.response.status,200);assert.notEqual((endedOwnerBootstrap.data as Bootstrap).activeCase?.id,thirdId,'a deleted last-ended case falls back safely');
-  assert.equal((await otherOwnerSession.bootstrap(thirdId)).response.status,404,'deleted cases cannot be selected directly');
+  const deletedBootstrap=await otherOwnerSession.bootstrap(thirdId);assert.equal(deletedBootstrap.response.status,404,'deleted cases cannot be selected directly');assert.equal((deletedBootstrap.data as {code?:string}).code,'CASE_NOT_FOUND');
   assert.deepEqual(getUsageProgress(usage.id),{costMicros:0,reservedMicros:50_000},'soft delete retains usage reservations');
 
+  db().exec("CREATE TEMP TRIGGER fail_restore_audit BEFORE INSERT ON audit_events WHEN NEW.action='case.restored' BEGIN SELECT RAISE(ABORT,'synthetic restore rollback'); END");
+  assert.equal((await otherOwnerSession.action({action:'restoreCase',caseId:thirdId})).response.status,500);
+  db().exec('DROP TRIGGER fail_restore_audit');
+  assert.ok(((await otherOwnerSession.bootstrap()).data as Bootstrap).deletedCases?.some(record=>record.id===thirdId),'audit failure rolls back the restored state');
   const restored=await otherOwnerSession.action({action:'restoreCase',caseId:thirdId});
   assert.equal(restored.response.status,200);assert.equal(restored.data.nextCaseId,thirdId);
   state=(await otherOwnerSession.bootstrap(thirdId)).data as Bootstrap;
   assert.equal(state.activeCase?.clientName,'Mike（2）');assert.equal(state.cases.find(record=>record.id===thirdId)?.clientName,'Mike（2）');
   completeUsage(usage.id,'released');
+});
+
+test('permanent deletion requires ownership, explicit confirmation and atomically removes every case-linked record',async()=>{
+  await drainReportJobs();
+  const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');
+  createdCounter+=1;
+  const created=await owner.action({action:'createClient',name:'永久删除合成客户',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`purge-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'});
+  assert.equal(created.response.status,200,JSON.stringify(created.data));
+  const clientId=String(created.data.clientId),caseId=String(created.data.caseId);
+  await owner.action({action:'enterClient',caseId});await owner.action({action:'chooseEntry',caseId,entry:'life'});
+  await owner.action({action:'message',caseId,text:'我想保障家庭。',eventId:'purge-goal'});await owner.action({action:'end',caseId});await drainReportJobs();
+  let state=(await owner.bootstrap(caseId)).data as Bootstrap;const report=state.reports[0];assert.ok(report);
+  const approved=await owner.action({action:'approveSend',caseId,version:report.version,snapshotId:report.snapshotId,recipientFingerprint:report.recipientFingerprint});assert.equal(approved.response.status,200,JSON.stringify(approved.data));
+  const {db,id,now,pack}=await import('../lib/db');
+  const interview=db().prepare('SELECT id,auth_id FROM interviews WHERE case_id=?').get(caseId) as {id:string;auth_id:string};
+  const reviewId=id();db().prepare('INSERT INTO reviews VALUES(?,?,?)').run(reviewId,caseId,pack({id:reviewId,caseId,reportVersion:report.version,reviewerId:'charles',decision:'approved',reason:'合成测试',createdAt:now()}));
+  db().prepare('INSERT INTO voice_tokens VALUES(?,?,?,?)').run(`purge-token-${createdCounter}`,interview.id,interview.auth_id,Date.now()+60_000);
+  const deleted=await owner.action({action:'deleteCase',caseId});assert.equal(deleted.response.status,200,JSON.stringify(deleted.data));
+  state=(await owner.bootstrap()).data as Bootstrap;assert.equal(state.deletedCases?.find(item=>item.id===caseId)?.clientName,'永久删除合成客户');
+  assert.equal(state.clients.some(client=>client.id===clientId),false,'a deleted-only client profile is not returned with the recycle-bin summary');
+  assert.equal((await owner.report(caseId,report.version)).status,404,'soft-deleted reports cannot be downloaded directly');
+  const pendingUsage=beginUsage({context:{caseId},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000});
+  assert.equal((await owner.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,409,'an unsettled call blocks permanent deletion');completeUsage(pendingUsage.id,'released');
+  const settledUsage=beginUsage({context:{caseId},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000});recordUsage(settledUsage.id,'purge-settled','responses',{input_tokens:1_000,output_tokens:100,input_tokens_details:{cached_tokens:0}});completeUsage(settledUsage.id,'settled');
+  const usageBeforePurge=getUsageSummary('org-demo'),settledRowBefore=db().prepare('SELECT * FROM ai_usage_calls WHERE id=?').get(settledUsage.id),settledEventsBefore=db().prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id=?').get(settledUsage.id) as {count:number};
+
+  const other=new BrowserSession();await other.login('advisor2@aeconn.example');const otherState=(await other.bootstrap()).data as Bootstrap;assert.equal(otherState.deletedCases?.some(item=>item.id===caseId)??false,false);assert.equal(otherState.clients.some(item=>item.id===clientId),false);assert.equal((await other.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const reviewer=new BrowserSession();await reviewer.login('charles@aeconn.example');const reviewerState=(await reviewer.bootstrap()).data as Bootstrap;assert.equal(reviewerState.deletedCases,undefined);assert.equal(reviewerState.clients.some(item=>item.id===clientId),false);assert.equal((await reviewer.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const admin=new BrowserSession();await admin.login('admin@aeconn.example');const adminState=(await admin.bootstrap()).data as Bootstrap;assert.equal(adminState.deletedCases,undefined);assert.equal(adminState.clients.some(item=>item.id===clientId),false);assert.equal((await admin.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const clientMode=new BrowserSession();await clientMode.login('advisor1@aeconn.example');const activeId=await createCase(clientMode,'永久删除权限');await clientMode.action({action:'enterClient',caseId:activeId});const clientState=(await clientMode.bootstrap()).data as Bootstrap;assert.equal(clientState.deletedCases,undefined);assert.equal(clientState.clients.some(item=>item.id===clientId),false);assert.equal((await clientMode.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const activeRow=db().prepare('SELECT doc FROM cases WHERE id=?').get(activeId) as {doc:string},activeRecord=JSON.parse(activeRow.doc);db().prepare('UPDATE cases SET doc=? WHERE id=?').run(pack({...activeRecord,deletedAt:now(),deletedBy:'advisor-1'}),activeId);
+  assert.equal((await owner.action({action:'purgeCase',caseId:activeId,confirmation:'永久删除'})).response.status,409,'an inconsistent archived case with a live interview is still protected');db().prepare('UPDATE cases SET doc=? WHERE id=?').run(activeRow.doc,activeId);await clientMode.action({action:'end',caseId:activeId});
+  assert.equal((await owner.action({action:'purgeCase',caseId})).response.status,400);
+
+  db().exec(`CREATE TEMP TRIGGER fail_case_purge BEFORE DELETE ON cases WHEN OLD.id='${caseId}' BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END`);
+  assert.equal((await owner.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,500);
+  db().exec('DROP TRIGGER fail_case_purge');
+  assert.ok(db().prepare('SELECT id FROM cases WHERE id=?').get(caseId),'transaction rollback keeps the case');
+  assert.ok(db().prepare('SELECT id FROM messages WHERE case_id=?').get(caseId),'transaction rollback keeps case history');
+  assert.deepEqual(db().prepare('SELECT * FROM ai_usage_calls WHERE id=?').get(settledUsage.id),settledRowBefore,'transaction rollback keeps the original usage call');assert.equal((db().prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id=?').get(settledUsage.id) as {count:number}).count,settledEventsBefore.count);
+  const usageAfterRollback=getUsageSummary('org-demo');assert.deepEqual(usageAfterRollback.day,usageBeforePurge.day);assert.deepEqual(usageAfterRollback.month,usageBeforePurge.month);
+
+  // Stale pointers from any browser are cleared as part of the same deletion transaction.
+  db().prepare("UPDATE auth_sessions SET mode='client',active_case=?,active_interview=?,last_ended_case=? WHERE user_id='advisor-1' AND id<>?").run(caseId,interview.id,caseId,interview.auth_id);
+  const purged=await owner.action({action:'purgeCase',caseId,confirmation:'永久删除'});assert.equal(purged.response.status,200,JSON.stringify(purged.data));
+  const count=(sql:string,value:string)=>Number((db().prepare(sql).get(value) as {count:number}).count);
+  for(const table of ['cases','messages','profile_fields','reports','reviews','approvals','notification_jobs','audit_events','report_jobs','interviews','ai_usage_calls'])assert.equal(count(`SELECT COUNT(*) count FROM ${table} WHERE ${table==='cases'?'id':'case_id'}=?`,caseId),0,table);
+  assert.equal(count('SELECT COUNT(*) count FROM interview_extractions WHERE session_id=?',interview.id),0);
+  assert.equal(count('SELECT COUNT(*) count FROM voice_tokens WHERE interview_id=?',interview.id),0);
+  assert.equal(db().prepare('SELECT id FROM ai_usage_calls WHERE id=?').get(settledUsage.id),undefined);assert.equal((db().prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id=?').get(settledUsage.id) as {count:number}).count,0);
+  const usageAfterPurge=getUsageSummary('org-demo');assert.deepEqual(usageAfterPurge.day,usageBeforePurge.day);assert.deepEqual(usageAfterPurge.month,usageBeforePurge.month);
+  assert.equal(db().prepare('SELECT id FROM clients WHERE id=?').get(clientId),undefined,'the last case removes the client profile');
+  assert.equal(db().prepare('SELECT id FROM auth_sessions WHERE active_case=? OR active_interview=? OR last_ended_case=?').get(caseId,interview.id,caseId),undefined);
+  const service=await servicePromise;
+  service.voiceHooks.persist(interview.id,{role:'user',text:'永久删除后的迟到语音',eventId:'purge:late',turnId:'purge-late',final:true});
+  service.voiceHooks.status(interview.id,'transcript_incomplete');
+  service.voiceHooks.diagnostic(interview.id,{code:'voice_usage_unverified',stage:'runtime'});
+  assert.throws(()=>service.voiceHooks.getContext(interview.id),/访谈不存在/);
+  assert.equal(count('SELECT COUNT(*) count FROM messages WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate messages');
+  assert.equal(count('SELECT COUNT(*) count FROM audit_events WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate audit history');
+  assert.equal((await owner.bootstrap(caseId)).response.status,404);assert.equal((await owner.report(caseId,report.version)).status,404);
+});
+
+test('permanent deletion preserves sibling clients and never reuses or renumbers case suffixes',async()=>{
+  await drainReportJobs();const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');
+  createdCounter+=1;const created=await owner.action({action:'createClient',name:'编号稳定客户',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`stable-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'});
+  const clientId=String(created.data.clientId),baseId=String(created.data.caseId),secondId=String((await owner.action({action:'createCase',clientId})).data.caseId),thirdId=String((await owner.action({action:'createCase',clientId})).data.caseId);
+  await owner.action({action:'deleteCase',caseId:secondId});assert.equal((await owner.action({action:'purgeCase',caseId:secondId,confirmation:'永久删除'})).response.status,200);
+  const fourthId=String((await owner.action({action:'createCase',clientId})).data.caseId);const state=(await owner.bootstrap(fourthId)).data as Bootstrap;
+  const names=new Map(state.cases.filter(item=>item.clientId===clientId).map(item=>[item.id,item.clientName]));
+  assert.equal(names.get(baseId),'编号稳定客户');assert.equal(names.get(thirdId),'编号稳定客户（2）');assert.equal(names.get(fourthId),'编号稳定客户（3）');assert.ok(state.clients.some(client=>client.id===clientId));
+  const {db,unpack}=await import('../lib/db');const seededRow=db().prepare("SELECT doc FROM cases WHERE id='case-1'").get() as {doc:string},seededClientRow=db().prepare("SELECT clients.doc FROM clients JOIN cases ON cases.client_id=clients.id WHERE cases.id='case-1'").get() as {doc:string};
+  const seeded=unpack<import('../lib/domain').Case>(seededRow.doc),seededClient=unpack<import('../lib/domain').Client>(seededClientRow.doc);
+  assert.equal(seeded.caseNumber,0,'existing rows receive stable persisted numbers during migration');assert.equal(seededClient.nextCaseNumber,1);
+});
+
+test('case-number migration preserves the first valid number and repairs later duplicates above the prior maximum',()=>{
+  const migrationPath=join(databaseRoot,'duplicate-number-migration.sqlite'),options={cwd:process.cwd(),env:{...process.env,DATABASE_PATH:migrationPath},encoding:'utf8' as const};
+  const setup=spawnSync(process.execPath,['--import','tsx','--input-type=module','--eval',`const {db,pack,unpack}=await import('./lib/db.ts');const d=db(),row=d.prepare("SELECT client_id,owner_id,doc FROM cases WHERE id='case-1'").get(),record=unpack(row.doc);record.id='case-duplicate';record.caseNumber=0;d.prepare('INSERT INTO cases(id,client_id,owner_id,reviewer_id,doc) VALUES(?,?,?,?,?)').run(record.id,row.client_id,row.owner_id,null,pack(record));`],options);
+  assert.equal(setup.status,0,setup.stderr);
+  const migrated=spawnSync(process.execPath,['--import','tsx','--input-type=module','--eval',`const {db,unpack}=await import('./lib/db.ts');const rows=db().prepare("SELECT doc FROM cases WHERE id IN ('case-1','case-duplicate') ORDER BY rowid").all().map(row=>unpack(row.doc).caseNumber);console.log(JSON.stringify(rows));`],options);
+  assert.equal(migrated.status,0,migrated.stderr);assert.deepEqual(JSON.parse(migrated.stdout.trim()),[0,1]);
+});
+
+test('failed case creation rolls back its persistent suffix counter',async()=>{
+  const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');createdCounter+=1;
+  const created=await owner.action({action:'createClient',name:'编号事务客户',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`counter-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'}),clientId=String(created.data.clientId);
+  const {db}=await import('../lib/db');db().exec(`CREATE TEMP TRIGGER fail_case_create BEFORE INSERT ON cases WHEN NEW.client_id='${clientId}' BEGIN SELECT RAISE(ABORT,'synthetic creation rollback'); END`);
+  assert.equal((await owner.action({action:'createCase',clientId})).response.status,500);db().exec('DROP TRIGGER fail_case_create');
+  const nextId=String((await owner.action({action:'createCase',clientId})).data.caseId),state=(await owner.bootstrap(nextId)).data as Bootstrap;
+  assert.equal(state.activeCase?.clientName,'编号事务客户（1）','a failed insert cannot consume a case suffix');
 });
 
 test('all four entries start and end through restricted client mode', async () => {

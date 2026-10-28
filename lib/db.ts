@@ -37,14 +37,16 @@ export function db():DatabaseSync {
     CREATE TABLE IF NOT EXISTS interview_extractions (session_id TEXT PRIMARY KEY REFERENCES interviews(id), transcript_hash TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS ai_usage_calls (id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id), case_id TEXT NOT NULL REFERENCES cases(id), session_id TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, transcription_model TEXT NOT NULL DEFAULT 'gpt-4o-mini-transcribe', operation TEXT NOT NULL, status TEXT NOT NULL, reserved_micros INTEGER NOT NULL, actual_micros INTEGER NOT NULL DEFAULT 0, budget_day_utc TEXT NOT NULL, budget_month_utc TEXT NOT NULL, rate_card_version TEXT NOT NULL, created_at TEXT NOT NULL, settled_at TEXT);
     CREATE TABLE IF NOT EXISTS ai_usage_events (id TEXT PRIMARY KEY, call_id TEXT NOT NULL REFERENCES ai_usage_calls(id), event_key TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, input_text_tokens INTEGER NOT NULL DEFAULT 0, input_audio_tokens INTEGER NOT NULL DEFAULT 0, cached_text_tokens INTEGER NOT NULL DEFAULT 0, cached_audio_tokens INTEGER NOT NULL DEFAULT 0, output_text_tokens INTEGER NOT NULL DEFAULT 0, output_audio_tokens INTEGER NOT NULL DEFAULT 0, transcription_ms INTEGER NOT NULL DEFAULT 0, estimated_usd_micros INTEGER NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(call_id,event_key));
+    CREATE TABLE IF NOT EXISTS ai_deleted_usage_daily (org_id TEXT NOT NULL REFERENCES organizations(id), day_utc TEXT NOT NULL, cost_micros INTEGER NOT NULL, PRIMARY KEY(org_id,day_utc));
+    CREATE TABLE IF NOT EXISTS ai_deleted_usage_holds (org_id TEXT PRIMARY KEY REFERENCES organizations(id), cost_micros INTEGER NOT NULL, held_micros INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS ai_usage_calls_org_day ON ai_usage_calls(org_id,budget_day_utc,status);
     CREATE INDEX IF NOT EXISTS ai_usage_calls_org_month ON ai_usage_calls(org_id,budget_month_utc,status);
     CREATE INDEX IF NOT EXISTS ai_usage_calls_case ON ai_usage_calls(case_id,status);
-    PRAGMA user_version=4;
+    PRAGMA user_version=5;
   `);
   if(!database.prepare('PRAGMA table_info(interviews)').all().some(row=>row.name==='epoch'))database.exec('ALTER TABLE interviews ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0');
   if(!database.prepare('PRAGMA table_info(ai_usage_calls)').all().some(row=>row.name==='transcription_model'))database.exec("ALTER TABLE ai_usage_calls ADD COLUMN transcription_model TEXT NOT NULL DEFAULT 'gpt-4o-mini-transcribe'");
-  seed(database); return database;
+  seed(database); migrateCaseNumbers(database); return database;
 }
 export function transaction<T>(fn:()=>T):T { const database=db(); database.exec('BEGIN IMMEDIATE'); try {const value=fn(); database.exec('COMMIT'); return value;} catch(error){database.exec('ROLLBACK');throw error;} }
 export function docs<T>(sql:string,...args:(string|number|null)[]):T[] { return db().prepare(sql).all(...args).map(row=>unpack<T>(row.doc)); }
@@ -80,6 +82,29 @@ function seed(database:DatabaseSync) {
         database.prepare('INSERT INTO profile_fields VALUES(?,?,?)').run(caseId,fact.key,pack(fact));
       }
     });
+    database.exec('COMMIT');
+  }catch(error){database.exec('ROLLBACK');throw error;}
+}
+
+function migrateCaseNumbers(database:DatabaseSync) {
+  database.exec('BEGIN IMMEDIATE');
+  try{
+    const clients=database.prepare('SELECT id,doc FROM clients ORDER BY rowid').all() as {id:string;doc:string}[];
+    for(const row of clients){
+      const client=unpack<Client>(row.doc);
+      const cases=database.prepare('SELECT id,doc FROM cases WHERE client_id=? ORDER BY rowid').all(row.id) as {id:string;doc:string}[];
+      const existingNumbers=cases.map(item=>unpack<Case>(item.doc).caseNumber).filter((value):value is number=>Number.isSafeInteger(value)&&Number(value)>=0);
+      const used=new Set<number>(),seen=new Set<number>();
+      let candidate=existingNumbers.length?Math.max(...existingNumbers)+1:0;
+      for(const item of cases){
+        const record=unpack<Case>(item.doc);
+        const number=record.caseNumber;
+        if(!Number.isSafeInteger(number)||Number(number)<0||seen.has(Number(number))){while(used.has(candidate))candidate+=1;record.caseNumber=candidate;used.add(candidate);seen.add(candidate);candidate+=1;database.prepare('UPDATE cases SET doc=? WHERE id=?').run(pack(record),record.id);}
+        else{used.add(Number(number));seen.add(Number(number));}
+      }
+      const next=Math.max(client.nextCaseNumber??0,used.size?Math.max(...used)+1:0);
+      if(client.nextCaseNumber!==next){client.nextCaseNumber=next;database.prepare('UPDATE clients SET doc=? WHERE id=?').run(pack(client),client.id);}
+    }
     database.exec('COMMIT');
   }catch(error){database.exec('ROLLBACK');throw error;}
 }

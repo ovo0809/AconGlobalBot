@@ -50,6 +50,7 @@ interface ActiveVoice {
   livenessTimer: NodeJS.Timeout | null;
   finalizeTimer: NodeJS.Timeout | null;
   resumeHandle: string | null;
+  resumeDisabled: boolean;
   upstreamReconnects: number;
   context: string;
   lastOutputItemId: string | null;
@@ -285,7 +286,7 @@ async function handleUpstream(active: ActiveVoice, source: WebSocket, raw: WebSo
     return;
   }
   const resumption = message.sessionResumptionUpdate as { resumable?: unknown; newHandle?: unknown } | undefined;
-  if (resumption?.resumable === true && typeof resumption.newHandle === 'string' && resumption.newHandle) {
+  if (!active.resumeDisabled && resumption?.resumable === true && typeof resumption.newHandle === 'string' && resumption.newHandle) {
     active.resumeHandle = resumption.newHandle;
     resumeStates.set(active.sessionId, { handle: resumption.newHandle, expiresAt: Date.now() + RESUME_TTL_MS });
     return;
@@ -907,6 +908,7 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
     livenessTimer: null,
     finalizeTimer: null,
     resumeHandle: priorResume&&priorResume.expiresAt>Date.now()?priorResume.handle:null,
+    resumeDisabled: false,
     upstreamReconnects: 0,
     context,
     lastOutputItemId:null,
@@ -1043,6 +1045,17 @@ export function closeVoiceSession(sessionId: string, timeoutMs = 1_500): Promise
     }else active.upstream.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
   }
   return active.drainPromise;
+}
+
+/** Discard provider resumption data after a session's durable records are permanently removed. */
+export function forgetVoiceSession(sessionId: string): void {
+  resumeStates.delete(sessionId);
+  const active = sessions.get(sessionId);
+  if (active) {
+    active.resumeHandle = null;
+    active.resumeDisabled = true;
+  }
+  // Active ownership and setup locks finish through their existing close/finally paths.
 }
 
 export function hasVoiceSession(sessionId: string) {

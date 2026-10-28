@@ -29,8 +29,9 @@ const factStatusNames: Record<FactStatus, string> = {
 };
 const moneyFactKeys = new Set(['income','expenses','debt','reserve','assets','budget']);
 
-function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
+function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'trash' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
   const paths: Record<string, React.ReactNode> = {
+    trash: <><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></>,
     search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>, plus: <><path d="M12 5v14M5 12h14"/></>,
     user: <><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></>, chat: <path d="M21 15a4 4 0 0 1-4 4H8l-5 3 1.7-5A8 8 0 1 1 21 15Z"/>,
     file: <><path d="M6 2h9l4 4v16H6z"/><path d="M15 2v5h5M9 12h6M9 16h6"/></>, review: <><path d="M5 3h14v18H5z"/><path d="m8 10 2 2 5-5M8 16h8"/></>,
@@ -46,6 +47,10 @@ function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | '
 async function getBootstrap(caseId?: string): Promise<Bootstrap> {
   const url = caseId ? `/api/bootstrap?caseId=${encodeURIComponent(caseId)}` : '/api/bootstrap';
   const response = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+  if(response.status===404&&caseId){
+    const problem=await response.json().catch(()=>null) as {code?:string}|null;
+    if(problem?.code==='CASE_NOT_FOUND')return getBootstrap();
+  }
   if (!response.ok) throw new Error('无法读取当前会话，请刷新重试。');
   return response.json() as Promise<Bootstrap>;
 }
@@ -57,13 +62,14 @@ export default function Home() {
   const [toast, setToast] = useState<Toast>(null);
   const [handback, setHandback] = useState(false);
   const selectedCaseIdRef = useRef<string | undefined>(undefined);
+  const sessionChannel = useRef<BroadcastChannel | null>(null);
   const sessionMode = data?.mode;
   const sessionUserId = data?.user?.id;
 
   const refresh = useCallback(async (caseId?: string) => {
     const next = await getBootstrap(caseId ?? selectedCaseIdRef.current);
     if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
-    else if (next.activeCase) selectedCaseIdRef.current = next.activeCase.id;
+    else selectedCaseIdRef.current = next.activeCase?.id;
     setData(next);
     return next;
   }, []);
@@ -85,9 +91,10 @@ export default function Home() {
   useEffect(() => {
     if (!sessionMode) return;
     const channel = new BroadcastChannel('aeconn-session-mode');
+    sessionChannel.current=channel;
     channel.postMessage({ mode: sessionMode, userId: sessionUserId ?? null, at: Date.now() });
     channel.onmessage = () => { setLoading(true); void refresh().catch(() => undefined).finally(() => setLoading(false)); };
-    return () => channel.close();
+    return () => { sessionChannel.current=null;channel.close(); };
   }, [sessionMode, sessionUserId, refresh]);
 
   useEffect(() => {
@@ -106,6 +113,7 @@ export default function Home() {
       });
       const result = await response.json() as ActionResult;
       if (!response.ok) throw new Error(result.error || '操作未完成，请重试。');
+      if(['deleteCase','restoreCase','purgeCase'].includes(body.action))sessionChannel.current?.postMessage({type:'cases-changed'});
       if (body.action === 'login' || body.action === 'logout') selectedCaseIdRef.current = undefined;
       if (!options?.noRefresh) await refresh(options?.caseId ?? result.caseId);
       return result;
@@ -155,13 +163,14 @@ function LoginScreen({ busy, onLogin, toast }: { busy:boolean; onLogin:(email:st
 }
 
 function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, setToast, toast, selectedCaseIdRef }: { data:Bootstrap; busy:string; act:ActionFn; refresh:(caseId?:string)=>Promise<Bootstrap>; handback:boolean; setHandback:(value:boolean)=>void; setToast:(v:Toast)=>void; toast:Toast; selectedCaseIdRef:React.MutableRefObject<string|undefined> }) {
-  const [nav, setNav] = useState<'workspace'|'review'|'settings'>(data.user?.role === 'admin' ? 'settings' : data.user?.role === 'reviewer' ? 'review' : 'workspace');
+  const [nav, setNav] = useState<'workspace'|'review'|'settings'|'trash'>(data.user?.role === 'admin' ? 'settings' : data.user?.role === 'reviewer' ? 'review' : 'workspace');
   const [search, setSearch] = useState('');
   const [newClient, setNewClient] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
   const [handoff, setHandoff] = useState(false);
   const [mobileDetail, setMobileDetail] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Case | null>(null);
+  const [purgeTarget, setPurgeTarget] = useState<Case | null>(null);
   const activeCase = data.activeCase;
   const activeCaseId = activeCase?.id;
   const reportJob = data.reportJob;
@@ -186,6 +195,26 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
     setToast({kind:'success',text:'案例已从列表移除，历史资料仍然保留。'});
   }
   async function logout() { await act({action:'logout'}); }
+  async function restoreCase(record:Case) {
+    try {
+      const result=await act({action:'restoreCase',caseId:record.id},{noRefresh:true});
+      if(!result)return;
+      selectedCaseIdRef.current=record.id;
+      await refresh(record.id);
+      setNav('workspace');setMobileDetail(true);setReportOpen(false);
+      setToast({kind:'success',text:'案例已还原，访谈记录与报告可以继续查看。'});
+    } catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'还原未完成，请重试。'}); }
+  }
+  async function purgeCase() {
+    if(!purgeTarget)return;
+    try {
+      const result=await act({action:'purgeCase',caseId:purgeTarget.id,confirmation:'永久删除'},{noRefresh:true});
+      if(!result)return;
+      setPurgeTarget(null);selectedCaseIdRef.current=undefined;
+      await refresh();
+      setToast({kind:'success',text:'案例及本应用中的历史资料已彻底删除，无法还原。'});
+    } catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'删除未完成，请重试。'}); }
+  }
   if (data.user?.role === 'admin') return <AdminScreen data={data} busy={busy} act={act} logout={logout} toast={toast}/>;
 
   return <main className="app-shell">
@@ -193,6 +222,7 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
       {data.user?.role === 'advisor' && <button className={nav==='workspace'?'active':''} onClick={()=>setNav('workspace')}><Icon name="chat"/><span>客户</span></button>}
       <button className={nav==='review'?'active':''} onClick={()=>setNav('review')}><Icon name="review"/><span>{data.user?.role === 'reviewer'?'审核':'复核'}</span></button>
       <button className={nav==='settings'?'active':''} onClick={()=>setNav('settings')}><Icon name="settings"/><span>设置</span></button>
+      {data.user?.role==='advisor'&&<button className={nav==='trash'?'active':''} onClick={()=>{setNav('trash');void refresh().catch((error:Error)=>setToast({kind:'error',text:error.message}));}}><Icon name="trash"/><span>已删除案例</span></button>}
     </nav><button className="rail-profile" onClick={()=>setNav('settings')}><span className="avatar">{data.user?.name.slice(0,1)}</span><span>{data.user?.name}</span></button></aside>
 
     {(nav === 'workspace' || nav === 'review') && <aside className={`case-sidebar ${mobileDetail ? 'mobile-hide' : ''}`}>
@@ -204,17 +234,32 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
       {filteredCases.length===0 && <EmptyState title="没有匹配的案例" body="换个关键词，或建立一位合成客户。"/>}
     </aside>}
 
-    <section className={`workspace ${nav==='settings'?'no-sidebar':''} ${mobileDetail||nav==='settings'?'mobile-show':''}`}>
-      <header className="workspace-header"><div>{nav!=='settings'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<h1>{nav==='settings'?'账户设置':activeCase?.clientName||'选择一个案例'}</h1>{activeCase && nav!=='settings' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">合成数据</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
-      {nav==='settings' ? <UserSettings user={data.user!}/> : activeCase ? <CaseWorkspace data={data} busy={busy} act={act} reportOpen={reportOpen} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)}/> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
+    <section className={`workspace ${nav==='settings'||nav==='trash'?'no-sidebar':''} ${mobileDetail||nav==='settings'||nav==='trash'?'mobile-show':''}`}>
+      <header className="workspace-header"><div>{nav!=='settings'&&nav!=='trash'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<h1>{nav==='settings'?'账户设置':nav==='trash'?'已删除案例':activeCase?.clientName||'选择一个案例'}</h1>{activeCase && nav!=='settings'&&nav!=='trash' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">合成数据</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
+      {nav==='settings' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace data={data} busy={busy} act={act} reportOpen={reportOpen} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)}/> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
     </section>
     {newClient && <NewClientModal busy={busy==='createClient'} onClose={()=>setNewClient(false)} onSubmit={async form=>{ const result=await act({action:'createClient',...form}); setNewClient(false); selectedCaseIdRef.current=result?.caseId; setToast({kind:'success',text:'客户档案与首个案例已建立。'}); }}/>}
     {deleteTarget && <DeleteCaseModal caseRecord={deleteTarget} busy={busy==='deleteCase'} onClose={()=>setDeleteTarget(null)} onConfirm={deleteCase}/>}
+    {purgeTarget&&<PurgeCaseModal key={purgeTarget.id} caseRecord={purgeTarget} busy={busy==='purgeCase'} onClose={()=>setPurgeTarget(null)} onConfirm={purgeCase}/>}
     {handoff && <HandoffBanner onClose={()=>setHandoff(false)}/>} {handback&&<HandbackBanner onClose={()=>setHandback(false)}/>}<ToastView toast={toast}/>
   </main>;
 }
 
 function EmptyState({ title, body }: {title:string;body:string}) { return <div className="empty-state"><span>○</span><b>{title}</b><p>{body}</p></div>; }
+
+function DeletedCases({cases,busy,onRestore,onPurge}:{cases:Case[];busy:boolean;onRestore:(record:Case)=>Promise<void>;onPurge:(record:Case)=>void}) {
+  const [search,setSearch]=useState('');
+  const filtered=cases.filter(record=>(record.clientName||'').toLowerCase().includes(search.trim().toLowerCase()));
+  return <div className="trash-view"><div className="section-heading"><div><h2>已删除案例</h2><p>还原后可继续查看访谈和报告；彻底删除后无法恢复。</p></div><span className="source-pill">{cases.length} 个案例</span></div><label className="search-field"><Icon name="search"/><input aria-label="搜索已删除案例" placeholder="搜索客户或案例" value={search} onChange={event=>setSearch(event.target.value)}/></label>
+    <div className="trash-list">{filtered.map(record=><article className="trash-card" key={record.id} aria-label={record.clientName||'已删除案例'}><div className="trash-case-info"><h3>{record.clientName||'未命名案例'}</h3><p>删除于 {record.deletedAt?new Date(record.deletedAt).toLocaleString('zh-CN'):'未记录时间'}</p><small>{statusNames[record.status]||record.status} · {record.reportVersion>0?`报告 v${record.reportVersion}`:'尚无报告'}</small></div><div className="trash-actions"><button className="button button-secondary" disabled={busy} onClick={()=>void onRestore(record)}><Icon name="retry"/>还原</button><button className="button button-danger" disabled={busy} onClick={()=>onPurge(record)}><Icon name="trash"/>彻底删除</button></div></article>)}</div>
+    {!filtered.length&&<EmptyState title={cases.length?'没有匹配的案例':'暂无已删除案例'} body={cases.length?'换个关键词试试。':'从客户列表删除的案例会显示在这里。'}/>}
+  </div>;
+}
+
+function PurgeCaseModal({caseRecord,busy,onClose,onConfirm}:{caseRecord:Case;busy:boolean;onClose:()=>void;onConfirm:()=>Promise<void>}) {
+  const [confirmation,setConfirmation]=useState('');
+  return <div className="modal-backdrop" role="presentation" onMouseDown={event=>{if(!busy&&event.target===event.currentTarget)onClose();}}><section className="modal delete-case-modal" role="dialog" aria-modal="true" aria-labelledby="purge-case-title" aria-describedby="purge-case-description" onKeyDown={event=>{if(event.key==='Escape'&&!busy)onClose();}}><header><div><span className="eyebrow">不可恢复</span><h2 id="purge-case-title">彻底删除案例？</h2></div><button className="icon-button" aria-label="关闭" disabled={busy} onClick={onClose}><Icon name="close"/></button></header><p id="purge-case-description">将永久清除“{caseRecord.clientName||'此案例'}”在本应用中的访谈、事实、全部报告与 PDF、邮件预览和复核历史。若客户已无其他案例，其档案也会删除。</p><p className="helper">已下载的文件和已有备份不在本次清除范围内。</p><form onSubmit={event=>{event.preventDefault();if(confirmation==='永久删除'&&!busy)void onConfirm();}}><label>请输入“永久删除”确认<input value={confirmation} onChange={event=>setConfirmation(event.target.value)} autoComplete="off" disabled={busy}/></label><div className="modal-actions"><button type="button" className="button button-secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button button-danger button-danger-solid" disabled={busy||confirmation!=='永久删除'}>{busy?'正在彻底删除…':'确认彻底删除'}</button></div></form></section></div>;
+}
 
 function WelcomeWorkspace({advisor,onNew,reviewer}:{advisor:string;onNew:()=>void;reviewer:boolean}) {
   return <div className="welcome-workspace"><div className="welcome-orb">A</div><span className="eyebrow">上午好，{advisor}</span><h2>{reviewer?'从待复核队列开始':'今天，从一段清楚的对话开始。'}</h2><p>{reviewer?'请选择左侧案例，核对来源、缺失信息与四类初步方向。':'先收齐六项基础资料，再将设备交给客户进入受限访谈模式。'}</p>{!reviewer&&<button className="button button-primary" onClick={onNew}><Icon name="plus"/>建立合成客户</button>}</div>;

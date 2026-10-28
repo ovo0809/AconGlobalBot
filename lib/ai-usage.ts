@@ -10,6 +10,7 @@ export class UsageDataError extends Error {readonly code='AI_USAGE_DATA';}
 type UsageStatus='reserved'|UsageOutcome;
 type UsageCallRow={id:string;org_id:string;case_id:string;session_id:string|null;model:string;transcription_model:TranscriptionModel;operation:UsageOperation;status:UsageStatus;reserved_micros:number;actual_micros:number;budget_day_utc:string;budget_month_utc:string;created_at:string;settled_at:string|null};
 type ScopeSummary={costMicros:number;heldMicros:number;remainingMicros:number};
+type DeletedUsageHoldRow={cost_micros:number;held_micros:number};
 export type UsageSummary={
   estimatedNotBilled:boolean;
   rateCardVersion:string;
@@ -65,6 +66,14 @@ function periodCosts(orgId:string,period:'day'|'month',value:string){
   const rows=db().prepare(`SELECT events.call_id,SUM(events.estimated_usd_micros) cost FROM ai_usage_events events JOIN ai_usage_calls calls ON calls.id=events.call_id WHERE calls.org_id=? AND substr(events.created_at,1,?)=? GROUP BY events.call_id`).all(orgId,length,value) as {call_id:string;cost:number}[];
   return new Map(rows.map(row=>[row.call_id,row.cost]));
 }
+function deletedPeriodCost(orgId:string,period:'day'|'month',value:string){
+  const predicate=period==='day'?'day_utc=?':'substr(day_utc,1,7)=?';
+  const row=db().prepare(`SELECT COALESCE(SUM(cost_micros),0) cost FROM ai_deleted_usage_daily WHERE org_id=? AND ${predicate}`).get(orgId,value) as {cost:number};
+  return Number(row.cost);
+}
+function deletedHolds(orgId:string):DeletedUsageHoldRow{
+  return db().prepare('SELECT cost_micros,held_micros FROM ai_deleted_usage_holds WHERE org_id=?').get(orgId) as DeletedUsageHoldRow|undefined??{cost_micros:0,held_micros:0};
+}
 function scope(rows:UsageCallRow[],limit:number,periodCost?:Map<string,number>){
   let costMicros=0,heldMicros=0;
   for(const row of rows){
@@ -74,6 +83,12 @@ function scope(rows:UsageCallRow[],limit:number,periodCost?:Map<string,number>){
     if(!periodCost||pending(row))costMicros+=cost(row);
     else if(row.status==='settled')costMicros+=periodCost.get(row.id)??0;
   }
+  return {costMicros,heldMicros,remainingMicros:Math.max(0,limit-costMicros-heldMicros)};
+}
+function organizationScope(rows:UsageCallRow[],limit:number,orgId:string,period:'day'|'month',value:string){
+  const current=scope(rows,limit,periodCosts(orgId,period,value)),anonymous=deletedHolds(orgId);
+  const costMicros=current.costMicros+deletedPeriodCost(orgId,period,value)+anonymous.cost_micros;
+  const heldMicros=current.heldMicros+anonymous.held_micros;
   return {costMicros,heldMicros,remainingMicros:Math.max(0,limit-costMicros-heldMicros)};
 }
 function usageCall(callId:string){
@@ -98,8 +113,8 @@ export function beginUsage(input:{context:UsageContext;operation:UsageOperation;
     if(typeof identity?.org_id!=='string')throw new UsageBudgetError('无法确认案例的费用归属，已停止调用。');
     const limits=configuredLimits(),buckets=utcBuckets(),all=rowsFor(identity.org_id);
     const caseScope=scope(all.filter(row=>row.case_id===input.context.caseId),limits.caseMicros);
-    const dayScope=scope(all,limits.dailyMicros,periodCosts(identity.org_id,'day',buckets.day));
-    const monthScope=scope(all,limits.monthlyMicros,periodCosts(identity.org_id,'month',buckets.month));
+    const dayScope=organizationScope(all,limits.dailyMicros,identity.org_id,'day',buckets.day);
+    const monthScope=organizationScope(all,limits.monthlyMicros,identity.org_id,'month',buckets.month);
     const available=Math.min(caseScope.remainingMicros,dayScope.remainingMicros,monthScope.remainingMicros);
     const reservation=requested??(input.operation==='realtime'?available:DEFAULT_TEXT_RESERVATION_MICROS);
     if(reservation<=0||reservation>available||(input.operation==='realtime'&&reservation<MIN_REALTIME_RESERVATION_MICROS))throw new UsageBudgetError('已达到 OpenAI 应用费用上限。');
@@ -185,6 +200,35 @@ export function getUsageProgress(callId:string){const row=usageCall(callId);retu
 
 export function recoverUsageReservations(){return db().prepare("UPDATE ai_usage_calls SET status='unknown',settled_at=? WHERE status='reserved'").run(now()).changes;}
 
+/** Remove case-linked usage details while retaining only anonymous organization guard totals. Must run inside the caller's transaction. */
+export function purgeCaseUsage(caseId:string):void{
+  const database=db();
+  if(!database.isTransaction)throw new UsageDataError('彻底删除费用资料必须在同一数据库事务中执行。');
+  const calls=database.prepare('SELECT * FROM ai_usage_calls WHERE case_id=?').all(caseId) as unknown as UsageCallRow[];
+  if(!calls.length)return;
+  if(calls.some(call=>call.status==='reserved'))throw new UsageDataError('仍有进行中的费用预留，不能彻底删除案例。');
+  const orgIds=[...new Set(calls.map(call=>call.org_id))];
+  if(orgIds.length!==1)throw new UsageDataError('案例费用归属不一致，不能彻底删除。');
+  const orgId=orgIds[0];
+  const daily=database.prepare(`SELECT substr(events.created_at,1,10) day_utc,SUM(events.estimated_usd_micros) cost_micros
+    FROM ai_usage_events events JOIN ai_usage_calls calls ON calls.id=events.call_id
+    WHERE calls.case_id=? AND calls.status='settled' GROUP BY substr(events.created_at,1,10)`).all(caseId) as {day_utc:string;cost_micros:number}[];
+  for(const row of daily){
+    database.prepare(`INSERT INTO ai_deleted_usage_daily(org_id,day_utc,cost_micros) VALUES(?,?,?)
+      ON CONFLICT(org_id,day_utc) DO UPDATE SET cost_micros=cost_micros+excluded.cost_micros`).run(orgId,row.day_utc,row.cost_micros);
+  }
+  const unknown=calls.filter(call=>call.status==='unknown').reduce((total,call)=>({
+    cost:total.cost+call.actual_micros,
+    held:total.held+Math.max(0,call.reserved_micros-call.actual_micros),
+  }),{cost:0,held:0});
+  if(unknown.cost||unknown.held){
+    database.prepare(`INSERT INTO ai_deleted_usage_holds(org_id,cost_micros,held_micros) VALUES(?,?,?)
+      ON CONFLICT(org_id) DO UPDATE SET cost_micros=cost_micros+excluded.cost_micros,held_micros=held_micros+excluded.held_micros`).run(orgId,unknown.cost,unknown.held);
+  }
+  database.prepare('DELETE FROM ai_usage_events WHERE call_id IN (SELECT id FROM ai_usage_calls WHERE case_id=?)').run(caseId);
+  database.prepare('DELETE FROM ai_usage_calls WHERE case_id=?').run(caseId);
+}
+
 export function getUsageSummary(orgId:string,caseId?:string,includeRecords=false):UsageSummary{
   const limits=configuredLimits(),buckets=utcBuckets(),all=rowsFor(orgId);
   let caseSummary:ScopeSummary|null=null;
@@ -196,5 +240,5 @@ export function getUsageSummary(orgId:string,caseId?:string,includeRecords=false
   const records=caseId&&includeRecords?(db().prepare(`SELECT calls.*,COALESCE(SUM(events.input_tokens),0) input_tokens,COALESCE(SUM(events.output_tokens),0) output_tokens,COALESCE(SUM(events.cached_input_tokens),0) cached_tokens,COALESCE(SUM(events.input_audio_tokens),0) input_audio_tokens,COALESCE(SUM(events.output_audio_tokens),0) output_audio_tokens,COALESCE(SUM(events.transcription_ms),0) transcription_ms FROM ai_usage_calls calls LEFT JOIN ai_usage_events events ON events.call_id=calls.id WHERE calls.org_id=? AND calls.case_id=? GROUP BY calls.id ORDER BY calls.created_at DESC LIMIT 50`).all(orgId,caseId) as Record<string,unknown>[]).map(row=>({
     id:String(row.id),operation:String(row.operation) as UsageOperation,model:String(row.model),status:String(row.status),createdAt:String(row.created_at),costMicros:Number(row.actual_micros),reservedMicros:Number(row.reserved_micros),inputTokens:Number(row.input_tokens),outputTokens:Number(row.output_tokens),cachedTokens:Number(row.cached_tokens),inputAudioTokens:Number(row.input_audio_tokens),outputAudioTokens:Number(row.output_audio_tokens),transcriptionSeconds:Number(row.transcription_ms)/1_000,
   })):[];
-  return {estimatedNotBilled:true,rateCardVersion:RATE_CARD_VERSION,limits,dayUtc:buckets.day,monthUtc:buckets.month,case:caseSummary,day:scope(all,limits.dailyMicros,periodCosts(orgId,'day',buckets.day)),month:scope(all,limits.monthlyMicros,periodCosts(orgId,'month',buckets.month)),records};
+  return {estimatedNotBilled:true,rateCardVersion:RATE_CARD_VERSION,limits,dayUtc:buckets.day,monthUtc:buckets.month,case:caseSummary,day:organizationScope(all,limits.dailyMicros,orgId,'day',buckets.day),month:organizationScope(all,limits.monthlyMicros,orgId,'month',buckets.month),records};
 }

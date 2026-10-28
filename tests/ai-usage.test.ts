@@ -166,3 +166,56 @@ test('Ledger stores only normalized numeric usage and rejects unknown models or 
   process.env.AI_CASE_BUDGET_USD='0';
   try{assert.throws(()=>usage.beginUsage({context:{caseId:'case-8'},operation:'interview',model:'gpt-6-luna',reserveMicros:1}),usage.UsageBudgetError);}finally{process.env.AI_CASE_BUDGET_USD=prior;}
 });
+
+test('permanent case purge anonymizes ledger details without resetting organization guards',async()=>{
+  const usage=await usagePromise,{db,pack,transaction}=await dbPromise;
+  const database=db();
+  const insertCase=(caseId:string)=>database.prepare('INSERT INTO cases VALUES(?,?,?,?,?)').run(caseId,'client-1','advisor-1',null,pack({id:caseId,clientId:'client-1',ownerAgentId:'advisor-1',status:'new',entry:null,createdAt:'2026-10-28T00:00:00.000Z',updatedAt:'2026-10-28T00:00:00.000Z',assignedReviewerId:null,reportVersion:0}));
+  insertCase('case-purge-ledger');insertCase('case-after-purge');insertCase('case-purge-reserved');
+
+  const oldSettled=usage.beginUsage({context:{caseId:'case-purge-ledger'},operation:'report',model:'gpt-6-luna',reserveMicros:50_000});
+  usage.recordUsage(oldSettled.id,'old-event','responses',{input_tokens:1_000,output_tokens:100,input_tokens_details:{cached_tokens:0}});
+  usage.completeUsage(oldSettled.id,'settled');
+  database.prepare("UPDATE ai_usage_events SET created_at='2000-01-15T12:00:00.000Z' WHERE call_id=?").run(oldSettled.id);
+  const currentSettled=usage.beginUsage({context:{caseId:'case-purge-ledger'},operation:'report',model:'gpt-6-luna',reserveMicros:50_000});
+  usage.recordUsage(currentSettled.id,'current-event','responses',{input_tokens:2_000,output_tokens:200,input_tokens_details:{cached_tokens:0}});
+  usage.completeUsage(currentSettled.id,'settled');
+  const unknown=usage.beginUsage({context:{caseId:'case-purge-ledger'},operation:'extraction',model:'gpt-6-luna',reserveMicros:50_000});
+  usage.recordUsage(unknown.id,'unknown-event','responses',{input_tokens:10,output_tokens:10,input_tokens_details:{cached_tokens:0}});
+  usage.completeUsage(unknown.id,'unknown');
+  database.prepare("UPDATE ai_usage_calls SET budget_day_utc='2000-01-01',budget_month_utc='2000-01' WHERE id=?").run(unknown.id);
+
+  const before=usage.getUsageSummary('org-demo','case-purge-ledger',true);
+  assert.equal(before.records.length,3);
+  transaction(()=>usage.purgeCaseUsage('case-purge-ledger'));
+  const after=usage.getUsageSummary('org-demo','case-purge-ledger',true);
+  assert.deepEqual(after.day,before.day,'current UTC daily protection is unchanged');
+  assert.deepEqual(after.month,before.month,'current UTC monthly protection is unchanged');
+  assert.deepEqual(after.case,{costMicros:0,heldMicros:0,remainingMicros:2_000_000});
+  assert.deepEqual(after.records,[]);
+  assert.equal((database.prepare('SELECT COUNT(*) count FROM ai_usage_calls WHERE case_id=?').get('case-purge-ledger') as {count:number}).count,0);
+  assert.equal((database.prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id IN (?,?,?)').get(oldSettled.id,currentSettled.id,unknown.id) as {count:number}).count,0);
+  assert.deepEqual(database.prepare('SELECT day_utc,cost_micros FROM ai_deleted_usage_daily WHERE org_id=? ORDER BY day_utc').all('org-demo').filter(row=>['2000-01-15',before.dayUtc].includes(String(row.day_utc))).map(row=>({day_utc:String(row.day_utc),cost_micros:Number(row.cost_micros)})),[
+    {day_utc:'2000-01-15',cost_micros:150},
+    {day_utc:before.dayUtc,cost_micros:300},
+  ]);
+  const anonymousHold=database.prepare('SELECT cost_micros,held_micros FROM ai_deleted_usage_holds WHERE org_id=?').get('org-demo') as {cost_micros:number;held_micros:number};
+  assert.equal(anonymousHold.cost_micros,6);assert.equal(anonymousHold.held_micros,49_994);
+  const anonymousJson=JSON.stringify({daily:database.prepare('SELECT * FROM ai_deleted_usage_daily WHERE org_id=?').all('org-demo'),holds:database.prepare('SELECT * FROM ai_deleted_usage_holds WHERE org_id=?').all('org-demo')});
+  for(const identifier of ['case-purge-ledger',oldSettled.id,currentSettled.id,unknown.id,'gpt-6-luna','old-event','current-event','unknown-event'])assert.equal(anonymousJson.includes(identifier),false);
+  const anonymousBefore=anonymousJson;transaction(()=>usage.purgeCaseUsage('case-purge-ledger'));assert.equal(JSON.stringify({daily:database.prepare('SELECT * FROM ai_deleted_usage_daily WHERE org_id=?').all('org-demo'),holds:database.prepare('SELECT * FROM ai_deleted_usage_holds WHERE org_id=?').all('org-demo')}),anonymousBefore,'repeated purge is a no-op');
+
+  const prior={case:process.env.AI_CASE_BUDGET_USD,day:process.env.AI_DAILY_BUDGET_USD,month:process.env.AI_MONTHLY_BUDGET_USD};
+  try{
+    process.env.AI_CASE_BUDGET_USD='2';process.env.AI_DAILY_BUDGET_USD=String((after.day.costMicros+after.day.heldMicros+49_999)/1_000_000);process.env.AI_MONTHLY_BUDGET_USD='20';
+    assert.throws(()=>usage.beginUsage({context:{caseId:'case-after-purge'},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000}),usage.UsageBudgetError,'a fresh case cannot bypass anonymized organization use');
+  }finally{process.env.AI_CASE_BUDGET_USD=prior.case;process.env.AI_DAILY_BUDGET_USD=prior.day;process.env.AI_MONTHLY_BUDGET_USD=prior.month;}
+
+  const reserved=usage.beginUsage({context:{caseId:'case-purge-reserved'},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000});
+  assert.throws(()=>usage.purgeCaseUsage('case-purge-reserved'),usage.UsageDataError,'the purge helper refuses non-atomic use');
+  const aggregateSnapshot=JSON.stringify({daily:database.prepare('SELECT * FROM ai_deleted_usage_daily WHERE org_id=?').all('org-demo'),holds:database.prepare('SELECT * FROM ai_deleted_usage_holds WHERE org_id=?').all('org-demo')});
+  assert.throws(()=>transaction(()=>usage.purgeCaseUsage('case-purge-reserved')),usage.UsageDataError);
+  assert.equal((database.prepare('SELECT status FROM ai_usage_calls WHERE id=?').get(reserved.id) as {status:string}).status,'reserved');
+  assert.equal(JSON.stringify({daily:database.prepare('SELECT * FROM ai_deleted_usage_daily WHERE org_id=?').all('org-demo'),holds:database.prepare('SELECT * FROM ai_deleted_usage_holds WHERE org_id=?').all('org-demo')}),aggregateSnapshot,'failed purge leaves anonymous totals unchanged');
+  usage.completeUsage(reserved.id,'released');
+});

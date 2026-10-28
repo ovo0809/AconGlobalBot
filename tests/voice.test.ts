@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { WebSocket, WebSocketServer } from 'ws';
-import { attachVoiceServer, closeVoiceSession, hasVoiceSession, type VoiceHooks } from '../lib/voice-server';
+import { attachVoiceServer, closeVoiceSession, forgetVoiceSession, hasVoiceSession, type VoiceHooks } from '../lib/voice-server';
 import { getUsageSummary } from '../lib/ai-usage';
 import { db, pack } from '../lib/db';
 
@@ -197,7 +197,7 @@ test('voice relay locks setup, persists final turns, forwards audio, and drains 
   if (oldProvider === undefined) delete process.env.VOICE_PROVIDER; else process.env.VOICE_PROVIDER = oldProvider;
 });
 
-test('voice relay resumes an upstream session without repeating its proactive opening', async (t) => {
+test('voice relay resumes an upstream session until its retained handle is explicitly forgotten', async (t) => {
   const keys=['VOICE_PROVIDER','GEMINI_API_KEY','GEMINI_LIVE_MODEL'] as const;
   const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
   t.after(()=>{for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}});
@@ -227,7 +227,22 @@ test('voice relay resumes an upstream session without repeating its proactive op
   assert.deepEqual(setups[1].sessionResumption,{handle:'resume-handle-1'});
   assert.equal(openings,1);
   assert(events.some(event=>event.includes('"type":"reconnecting"')));
+  forgetVoiceSession('resume-session');
+  assert.equal(hasVoiceSession('resume-session'),true,'forgetting retained state does not seize active connection ownership');
+  const reconnectEvents=events.filter(event=>event.includes('"type":"reconnecting"')).length;
+  const activeUpstream=[...upstream.clients].find(socket=>socket.readyState===WebSocket.OPEN);assert(activeUpstream);
+  activeUpstream.send(JSON.stringify({sessionResumptionUpdate:{resumable:true,newHandle:'late-handle-after-forget'}}));
+  activeUpstream.send(JSON.stringify({goAway:{timeLeft:'1s'}}));
+  await waitUntil(()=>events.filter(event=>event.includes('"type":"reconnecting"')).length>reconnectEvents);
   assert.deepEqual(await closeVoiceSession('resume-session',500),{timedOut:false});
+
+  const replacement=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=replacement-token`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const replacementEvents:string[]=[];replacement.on('message',data=>replacementEvents.push(data.toString()));
+  await waitUntil(()=>setups.length===3&&replacementEvents.some(event=>event.includes('"type":"ready"')),3_000);
+  assert.deepEqual(setups[2].sessionResumption,{},'forgotten handles are not sent to a later upstream connection');
+  assert.equal(openings,2,'a fresh connection sends its opening after retained state is forgotten');
+  assert.deepEqual(await closeVoiceSession('resume-session',500),{timedOut:false});
+  assert.doesNotThrow(()=>forgetVoiceSession('already-purged-session'));
 });
 
 test('OpenAI realtime relay uses 24k audio, source item IDs, VAD interruption, and bounded truncation',async(t)=>{
