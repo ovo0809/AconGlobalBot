@@ -4,6 +4,8 @@
 
 实现依据：[Notion「02｜可直接复制给 Codex 的开发 Prompt」V1.3](https://app.notion.com/p/406d9731c2408174a24dfa30ff68ee52)。这是合成数据演示程序，不是获准处理真实客户资料的生产系统。模型默认模拟，邮件始终默认 dry-run；真实连续语音需另外配置并在目标手机验收。
 
+项目文档：[产品需求 PRD](PRD.md) · [MVP 范围与交付状态](mvp.md) · [工程验证记录](docs/verification.md)
+
 ![顾问工作区，1440×900 合成数据演示](docs/screenshots/advisor-desktop-1440x900.png)
 
 [查看 390×844 客户助手截图](docs/screenshots/client-mobile-390x844.png)
