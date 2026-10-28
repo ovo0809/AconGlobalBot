@@ -102,7 +102,18 @@ test('ready timeout releases media, reports a network reason and does not reconn
 test('budget server errors show a safe case-level reason without amounts or tokens',async(t)=>{
   const fake=installConnectedBrowserFakes(t);const errors:string[]=[];const client=new BrowserVoiceClient({csrf:'test',onError:message=>errors.push(message)});
   await client.start();fake.instances[0].serverEvent({type:'error',code:'spending_limit',retryable:false,message:'Budget $99 token=secret-value'});await waitUntil(()=>client.state==='error'&&fake.stopped===1);
-  assert.equal(errors.at(-1),'当前案例暂不能继续调用，请由顾问核对后重试。');assert.doesNotMatch(errors.join(' '),/\$99|secret-value|token=/);await new Promise(resolve=>setTimeout(resolve,550));assert.equal(fake.instances.length,1);
+  assert.equal(errors.at(-1),'当前案例暂不能启动语音，请顾问核对调用限制后重试。');assert.doesNotMatch(errors.join(' '),/\$99|secret-value|token=/);await new Promise(resolve=>setTimeout(resolve,550));assert.equal(fake.instances.length,1);
+});
+
+test('voice stop reasons distinguish overlapping connections, limits, missing usage and provider account without exposing raw details',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);const errors:string[]=[];
+  const expected:Record<string,RegExp>={session_already_active:/另一个页面/,session_closing:/保存收尾/,spending_protection:/应用保护/,voice_usage_unverified:/完整的调用记录/,voice_duration_limit:/时长限制/,provider_quota:/服务账户/};
+  for(const [code,pattern] of Object.entries(expected)){
+    const client=new BrowserVoiceClient({csrf:'test',onError:message=>errors.push(message)});
+    await client.start();fake.instances.at(-1)!.serverEvent({type:'error',code,retryable:false,message:'$99 token=secret-value sk-sensitive'});
+    await waitUntil(()=>client.state==='error'&&fake.stopped===errors.length);assert.match(errors.at(-1)!,pattern);
+  }
+  assert.equal(new Set(errors).size,Object.keys(expected).length);assert.doesNotMatch(errors.join(' '),/\$99|secret-value|token=|sk-sensitive/);
 });
 
 test('ready handshakes do not reset the finite reconnect budget',async(t)=>{

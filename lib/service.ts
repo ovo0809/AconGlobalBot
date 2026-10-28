@@ -4,7 +4,7 @@ import { buildReport, renderPdf, validateAnalyses } from './report';
 import { analyzeWithProvider, interviewWithProvider, ProviderExtractionValidationError } from './providers';
 import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-config';
 import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
-import { closeVoiceSession } from './voice-server';
+import { closeVoiceSession, type VoiceDiagnosticEvent } from './voice-server';
 import { DryRunMailProvider } from './mail';
 import { getUsageSummary, recoverUsageReservations, UsageBudgetError } from './ai-usage';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
@@ -296,5 +296,11 @@ export const voiceHooks={
     const session=db().prepare('SELECT * FROM interviews WHERE id=?').get(sessionId) as Interview|undefined;if(!session||!(session.state==='active'||['finishing','paused'].includes(session.state)&&Number(session.deadline)>Date.now())||!event.text?.trim())return;
     addMessage(sessionId,session.case_id,event.role,event.text.slice(0,8000),event.eventId,event.turnId,event.interrupted,event.final??true);
   },
-  status(sessionId:string,state:string){if(state==='incomplete'||state==='transcript_incomplete'){db().prepare('UPDATE interviews SET incomplete=1 WHERE id=?').run(sessionId);return;}db().prepare("UPDATE interviews SET voice_state=? WHERE id=? AND state IN ('active','finishing','paused')").run(state,sessionId);}
+  status(sessionId:string,state:string){if(state==='incomplete'||state==='transcript_incomplete'){db().prepare('UPDATE interviews SET incomplete=1 WHERE id=?').run(sessionId);return;}db().prepare("UPDATE interviews SET voice_state=? WHERE id=? AND state IN ('active','finishing','paused')").run(state,sessionId);},
+  diagnostic(sessionId:string,event:VoiceDiagnosticEvent){
+    const session=db().prepare('SELECT case_id FROM interviews WHERE id=?').get(sessionId) as {case_id?:unknown}|undefined;
+    if(typeof session?.case_id!=='string')return;
+    const action=event.stage==='preflight'||event.stage==='context'?'voice.start_failed':'voice.stopped';
+    audit(null,session.case_id,action,{code:event.code,stage:event.stage,sessionId});
+  }
 };

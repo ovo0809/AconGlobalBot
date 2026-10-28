@@ -4,7 +4,7 @@ import type { Server } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { realtimeVoiceConfig, requireOpenAITranscriptionModel, type OpenAITranscriptionModel } from './provider-config';
-import { beginUsage, completeUsage, getUsageProgress, recordUsage } from './ai-usage';
+import { beginUsage, completeUsage, getUsageProgress, recordUsage, UsageBudgetError } from './ai-usage';
 
 export type VoiceStatus = 'connecting' | 'listening' | 'thinking' | 'speaking' | 'reconnecting' | 'ended' | 'error' | 'transcript_incomplete';
 
@@ -24,7 +24,12 @@ export interface VoiceHooks {
   getContext(sessionId: string): string | Promise<string>;
   persist(sessionId: string, event: VoicePersistEvent): void | Promise<void>;
   status(sessionId: string, state: VoiceStatus): void | Promise<void>;
+  diagnostic?(sessionId:string,event:VoiceDiagnosticEvent):void|Promise<void>;
 }
+
+export type VoiceDiagnosticCode='spending_limit'|'spending_protection'|'voice_usage_unverified'|'voice_duration_limit'|'provider_quota'|'provider_rate_limit'|'provider_configuration'|'provider_error'|'transcription_config'|'context_unavailable'|'voice_initialization_failed'|'session_closing'|'session_already_active'|'upstream_closed';
+export type VoiceDiagnosticStage='preflight'|'context'|'runtime'|'upstream';
+export interface VoiceDiagnosticEvent {code:VoiceDiagnosticCode;stage:VoiceDiagnosticStage}
 
 interface ActiveVoice {
   provider: 'gemini'|'openai';
@@ -97,6 +102,7 @@ const voiceGlobal = globalThis as typeof globalThis & {
 };
 const sessions = voiceGlobal.aeconnVoiceSessions ??= new Map<string, ActiveVoice>();
 const resumeStates = voiceGlobal.aeconnVoiceResume ??= new Map<string, ResumeState>();
+const setupLocks=new Set<string>();
 const LIVE_ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 const MAX_TEXT = 2_000;
 const MAX_CONTEXT = 16_000;
@@ -121,6 +127,27 @@ function mergeTranscript(current:string,next:string){
 function callStatus(active:ActiveVoice,state:VoiceStatus){
   try{return Promise.resolve(active.hooks.status(active.sessionId,state));}
   catch(cause){return Promise.reject(cause);}
+}
+
+function callDiagnostic(hooks:VoiceHooks,sessionId:string,event:VoiceDiagnosticEvent){
+  try{void Promise.resolve(hooks.diagnostic?.(sessionId,event)).catch(()=>undefined);}
+  catch{return;}
+}
+
+function waitBounded(promise:Promise<unknown>,timeoutMs:number){
+  return new Promise<boolean>(resolve=>{
+    const timer=setTimeout(()=>resolve(false),timeoutMs);
+    timer.unref();
+    void promise.then(()=>{clearTimeout(timer);resolve(true);},()=>{clearTimeout(timer);resolve(true);});
+  });
+}
+
+function withTimeout<T>(promise:Promise<T>,timeoutMs:number){
+  let timer:NodeJS.Timeout;
+  return Promise.race([
+    promise,
+    new Promise<T>((_,reject)=>{timer=setTimeout(()=>reject(new Error('voice setup timeout')),timeoutMs);timer.unref();}),
+  ]).finally(()=>clearTimeout(timer));
 }
 
 async function failActive(active:ActiveVoice,message='实时语音处理失败，可继续使用文字。',clientError?:{code:string;retryable:boolean}){
@@ -450,10 +477,11 @@ function openAISpendingReached(active:ActiveVoice){
   return progress.costMicros+openAIUnreportedMicros(active)+historyMicros+OPENAI_MAX_OUTPUT_RESERVE_MICROS>=progress.reservedMicros*OPENAI_SPENDING_STOP_RATIO;
 }
 
-function stopForOpenAISpending(active:ActiveVoice,message:string,usageUncertain=false){
+function stopForOpenAISpending(active:ActiveVoice,message:string,code:'spending_protection'|'voice_usage_unverified'|'voice_duration_limit',usageUncertain=false){
   if(active.closing||active.closePromise)return;
   if(usageUncertain)active.openAIUsageUncertain=true;
-  send(active.browser,{type:'error',code:'spending_protection',retryable:false,message});
+  void callDiagnostic(active.hooks,active.sessionId,{code,stage:'runtime'});
+  send(active.browser,{type:'error',code,retryable:false,message});
   if(active.upstream?.readyState===WebSocket.OPEN&&active.openAIResponseActive)active.upstream.send(JSON.stringify({type:'response.cancel'}));
   // A budget stop must never commit pending audio and create another paid reply.
   if(active.openAIAudioPending){
@@ -466,7 +494,7 @@ function stopForOpenAISpending(active:ActiveVoice,message:string,usageUncertain=
 
 function checkOpenAISpending(active:ActiveVoice){
   if(openAISpendingReached(active)){
-    stopForOpenAISpending(active,'已达到本应用的 OpenAI 费用保护阈值，本次语音已停止。最终金额以 OpenAI 账单为准。');
+    stopForOpenAISpending(active,'已达到本应用的 OpenAI 费用保护阈值，本次语音已停止。最终金额以 OpenAI 账单为准。','spending_protection');
     return true;
   }
   return false;
@@ -488,7 +516,7 @@ function classifyOpenAIError(code:string|null,type:string|null,param:string|null
   if(param||/invalid|unsupported|model_not_found|configuration|parameter/.test(signal))return 'configuration';
   return 'general';
 }
-function openAIClientError(category:OpenAIErrorCategory){
+function openAIClientError(category:OpenAIErrorCategory):{message:string;code:'provider_quota'|'provider_rate_limit'|'provider_configuration'|'provider_error';retryable:boolean}{
   if(category==='quota')return {message:'OpenAI API 额度或余额不可用，本次语音已停止。请补充额度后再试。',code:'provider_quota',retryable:false};
   if(category==='rate_limit')return {message:'OpenAI 实时语音请求过于频繁，本次语音已停止。请稍后再试。',code:'provider_rate_limit',retryable:true};
   if(category==='configuration')return {message:'OpenAI 实时语音配置被服务拒绝，本次语音已停止。请检查模型配置。',code:'provider_configuration',retryable:false};
@@ -609,7 +637,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
       if(inserted&&usage.type==='duration'&&typeof usage.seconds==='number'&&Number.isFinite(usage.seconds)&&usage.seconds>=0)active.openAIAccountedTranscriptionMs+=Math.round(usage.seconds*1_000);
     }catch{
       active.openAIUsageUncertain=true;
-      stopForOpenAISpending(active,'实时转写未返回可核对的用量，本次语音已停止并保留费用预留。',true);
+      stopForOpenAISpending(active,'实时转写未返回可核对的用量，本次语音已停止并保留费用预留。','voice_usage_unverified',true);
     }
     await flushOpenAICompletedOutputs(active);await flushOpenAITurnComplete(active);maybeFinishOpenAI(active);return;
   }
@@ -617,7 +645,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
     if(typeof event.item_id==='string')active.openAIPendingInputIds.delete(event.item_id);
     active.openAIUsageUncertain=true;
     await active.hooks.status(active.sessionId,'transcript_incomplete');await flushOpenAICompletedOutputs(active);await flushOpenAITurnComplete(active);
-    stopForOpenAISpending(active,'实时转写失败且用量无法完整核对，本次语音已停止并保留费用预留。',true);maybeFinishOpenAI(active);return;
+    stopForOpenAISpending(active,'实时转写失败且用量无法完整核对，本次语音已停止并保留费用预留。','voice_usage_unverified',true);maybeFinishOpenAI(active);return;
   }
   if(type==='response.created'){
     const response=event.response as {id?:unknown}|undefined;
@@ -692,7 +720,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
       }
     }catch{
       active.openAIUsageUncertain=true;
-      stopForOpenAISpending(active,'实时服务未返回可核对的用量，本次语音已停止并保留费用预留。',true);
+      stopForOpenAISpending(active,'实时服务未返回可核对的用量，本次语音已停止并保留费用预留。','voice_usage_unverified',true);
     }
     if(typeof response?.id==='string')active.openAIActiveResponseIds.delete(response.id);
     active.openAIResponseActive=active.openAIActiveResponseIds.size>0;
@@ -711,6 +739,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
     console.error('openai_realtime_error',{...diagnostic,category});
     active.openAIUsageUncertain=true;
     const client=openAIClientError(category);
+    void callDiagnostic(active.hooks,active.sessionId,{code:client.code,stage:'upstream'});
     await failActive(active,client.message,{code:client.code,retryable:client.retryable});
   }
 }
@@ -728,6 +757,7 @@ function openOpenAIUpstream(active:ActiveVoice,apiKey:string,model:string,option
   upstream.on('close',()=>{
     if(upstream!==active.upstream||active.closing)return;
     void callStatus(active,'transcript_incomplete').catch(()=>undefined);
+    void callDiagnostic(active.hooks,active.sessionId,{code:'upstream_closed',stage:'upstream'});
     send(active.browser,{type:'closed',retryable:active.hooks.isActive(active.sessionId)});
     void closeBoth(active,1011,'upstream closed');
   });
@@ -788,9 +818,37 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
   const identity = hooks.consumeToken(token);
   if (!identity || !hooks.isActive(identity.sessionId)) return browser.close(1008, 'invalid or expired token');
 
+  if(setupLocks.has(identity.sessionId)){
+    callDiagnostic(hooks,identity.sessionId,{code:'session_closing',stage:'preflight'});
+    send(browser,{type:'unavailable',code:'session_closing',retryable:true,message:'上一段语音仍在准备，请稍后重试。'});
+    return browser.close(1013,'session setup in progress');
+  }
+  setupLocks.add(identity.sessionId);
+  try{
+    if(!hooks.isActive(identity.sessionId)||browser.readyState!==WebSocket.OPEN)return browser.close(1008,'session unavailable');
+    const existing=sessions.get(identity.sessionId);
+    if(existing){
+      if(existing.closing||existing.closePromise){
+        const existingCompletion=existing.drainPromise?.then(()=>undefined)??existing.closePromise;
+        const completed=existingCompletion?await waitBounded(existingCompletion,2_000):false;
+        if(!completed){
+          callDiagnostic(hooks,identity.sessionId,{code:'session_closing',stage:'preflight'});
+          send(browser,{type:'unavailable',code:'session_closing',retryable:true,message:'上一段语音仍在保存，请稍后重试。'});
+          return browser.close(1013,'session closing');
+        }
+        if(sessions.has(identity.sessionId))return browser.close(1008,'session unavailable');
+      }else{
+        callDiagnostic(hooks,identity.sessionId,{code:'session_already_active',stage:'preflight'});
+        send(browser,{type:'unavailable',code:'session_already_active',retryable:false,message:'当前访谈已有语音连接，请先返回原页面。'});
+        return browser.close(1013,'session already active');
+      }
+    }
+    if(!hooks.isActive(identity.sessionId)||browser.readyState!==WebSocket.OPEN)return browser.close(1008,'session unavailable');
+
   let config:{provider:'gemini'|'openai';apiKey:string;model:string;transcriptionModel?:OpenAITranscriptionModel}|null;
   try{config=options.configOverride||realtimeVoiceConfig();}
   catch{
+    callDiagnostic(hooks,identity.sessionId,{code:'transcription_config',stage:'preflight'});
     send(browser,{type:'unavailable',code:'transcription_config',retryable:false,message:'OpenAI 转写模型配置无效，未建立付费语音连接。'});
     return browser.close(1013,'invalid transcription config');
   }
@@ -806,19 +864,28 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
       openAIMaxSeconds=openAIVoiceMaxSeconds();
       openAITranscriptionModel=requireOpenAITranscriptionModel(config.transcriptionModel);
       openAIUsage=beginUsage({context:{caseId:identity.caseId,sessionId:identity.sessionId},operation:'realtime',model,transcriptionModel:openAITranscriptionModel});
-    }catch{
-      send(browser,{type:'unavailable',code:'spending_limit',retryable:false,message:'OpenAI 费用保护额度不足或计费配置不可用，未建立付费语音连接。'});
+    }catch(error){
+      const budget=error instanceof UsageBudgetError;
+      const code=budget?'spending_limit':'voice_initialization_failed';
+      callDiagnostic(hooks,identity.sessionId,{code,stage:'preflight'});
+      send(browser,{type:'unavailable',code,retryable:false,message:budget?'OpenAI 费用保护额度不足，未建立付费语音连接。':'实时语音初始化失败，可继续使用文字。'});
       return browser.close(1013,'spending protection');
     }
   }
   let context:string;
   try {
-    context=boundedContext(await hooks.getContext(identity.sessionId)).replace(/<\/?case_context>/gi,'[case-context-tag-removed]');
+    const rawContext=await withTimeout(Promise.resolve().then(()=>hooks.getContext(identity.sessionId)),2_000);
+    context=boundedContext(rawContext).replace(/<\/?case_context>/gi,'[case-context-tag-removed]');
   }
   catch {
     if(openAIUsage)completeUsage(openAIUsage.id,'released');
+    callDiagnostic(hooks,identity.sessionId,{code:'context_unavailable',stage:'context'});
     send(browser,{type:'error',message:'无法读取当前案例资料，可继续使用文字。'});
     return browser.close(1011,'context unavailable');
+  }
+  if(!hooks.isActive(identity.sessionId)||browser.readyState!==WebSocket.OPEN){
+    if(openAIUsage)completeUsage(openAIUsage.id,'released');
+    return browser.close(1008,'session unavailable');
   }
   const priorResume=resumeStates.get(identity.sessionId);
   if(priorResume&&priorResume.expiresAt<=Date.now()) resumeStates.delete(identity.sessionId);
@@ -884,7 +951,7 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
   };
   if(config.provider==='openai'){
     active.spendingTimer=setTimeout(()=>{
-      stopForOpenAISpending(active,'已达到本应用的单次连续语音时长上限，本次语音已停止。最终金额以 OpenAI 账单为准。',active.openAIResponseActive);
+      stopForOpenAISpending(active,'已达到本应用的单次连续语音时长上限，本次语音已停止。最终金额以 OpenAI 账单为准。','voice_duration_limit',active.openAIResponseActive);
     },openAIMaxSeconds*1_000);
     active.spendingTimer.unref();
   }
@@ -900,8 +967,15 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
   sessions.set(identity.sessionId, active);
   void callStatus(active,'connecting').catch(()=>failActive(active));
 
-  if(config.provider==='openai')openOpenAIUpstream(active,apiKey,model,options);
-  else openUpstream(active,apiKey,model,options);
+  try{
+    if(config.provider==='openai')openOpenAIUpstream(active,apiKey,model,options);
+    else openUpstream(active,apiKey,model,options);
+  }catch{
+    callDiagnostic(hooks,identity.sessionId,{code:'voice_initialization_failed',stage:'preflight'});
+    send(browser,{type:'error',code:'voice_initialization_failed',retryable:true,message:'实时语音初始化失败，可继续使用文字。'});
+    await closeBoth(active,1011,'voice initialization failed');
+    return;
+  }
   browser.on('message', (data) => handleBrowser(active, data));
   browser.on('close', () => {
     if (!active.closing) void closeVoiceSession(active.sessionId);
@@ -909,6 +983,9 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
   browser.on('error', () => {
     if (!active.closing) void closeVoiceSession(active.sessionId);
   });
+  }finally{
+    setupLocks.delete(identity.sessionId);
+  }
 }
 
 export function attachVoiceServer(server: Server, hooks: VoiceHooks, options: VoiceServerOptions = {}) {

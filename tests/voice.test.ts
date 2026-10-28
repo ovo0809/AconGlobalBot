@@ -7,6 +7,7 @@ import test from 'node:test';
 import { WebSocket, WebSocketServer } from 'ws';
 import { attachVoiceServer, closeVoiceSession, hasVoiceSession, type VoiceHooks } from '../lib/voice-server';
 import { getUsageSummary } from '../lib/ai-usage';
+import { db, pack } from '../lib/db';
 
 process.env.DATABASE_PATH=join(mkdtempSync(join(tmpdir(),'aeconn-voice-usage-')),'voice.sqlite');
 
@@ -14,12 +15,18 @@ function realtimeUsage(inputAudio=20,outputAudio=20){
   return {input_tokens:inputAudio,output_tokens:outputAudio,input_token_details:{text_tokens:0,audio_tokens:inputAudio,cached_tokens:0,cached_tokens_details:{text_tokens:0,audio_tokens:0}},output_token_details:{text_tokens:0,audio_tokens:outputAudio}};
 }
 
-function waitForClose(socket: WebSocket) {
+function waitForClose(socket: WebSocket,timeoutMs=2_000) {
   return new Promise<{ code: number; reason: string }>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('WebSocket did not close')), 2_000);
+    const timer = setTimeout(() => reject(new Error('WebSocket did not close')), timeoutMs);
     socket.on('close', (code, reason) => { clearTimeout(timer); resolve({ code, reason: reason.toString() }); });
     socket.on('error', () => undefined);
   });
+}
+
+function addUsageTestCase(caseId:string){
+  const clientId=`client-${caseId}`;
+  db().prepare('INSERT OR IGNORE INTO clients VALUES(?,?,?)').run(clientId,'advisor-1',pack({id:clientId}));
+  db().prepare('INSERT OR IGNORE INTO cases VALUES(?,?,?,?,?)').run(caseId,clientId,'advisor-1',null,pack({id:caseId,clientId,ownerAgentId:'advisor-1'}));
 }
 
 function waitUntil(check: () => boolean, timeoutMs = 2_000) {
@@ -381,7 +388,7 @@ test('OpenAI spending stop clears pending audio without committing another respo
   const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
   const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');const received:Record<string,unknown>[]=[];
   upstream.on('connection',socket=>{socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{const event=JSON.parse(data.toString()) as Record<string,unknown>;received.push(event);if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));});});
-  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'pending-audio-budget-session',caseId:'case-6'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined};
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'pending-audio-budget-session',caseId:'case-6'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
   const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
@@ -391,6 +398,7 @@ test('OpenAI spending stop clears pending audio without committing another respo
   await waitForClose(browser);await waitUntil(()=>received.some(event=>event.type==='input_audio_buffer.clear'));
   assert(received.some(event=>event.type==='input_audio_buffer.append'));assert.equal(received.some(event=>event.type==='input_audio_buffer.commit'),false);
   assert.equal(received.filter(event=>event.type==='response.create').length,1);assert(events.some(event=>event.includes('费用保护阈值')));
+  assert.deepEqual(diagnostics,[{code:'spending_protection',stage:'runtime'}]);
 });
 
 test('OpenAI end clears trailing silence after VAD auto-commit without creating another response',async(t)=>{
@@ -482,13 +490,14 @@ test('OpenAI voice applies schema before input and stops at the configured durat
     if(event.type==='session.update')setTimeout(()=>{schemaApplied=true;socket.send(JSON.stringify({type:'session.updated'}));},25);
     if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'duration-response'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'duration-response',usage:realtimeUsage()}}));}
   });});
-  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'duration-session',caseId:'case-7'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined};
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'duration-session',caseId:'case-7'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
   const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
   const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitForClose(browser);
   const update=received.find(event=>event.type==='session.update')?.session as {max_output_tokens?:number}|undefined;
   assert.equal(inputBeforeSchema,false);assert.equal(update?.max_output_tokens,512);assert(events.some(event=>event.includes('连续语音时长上限')));
+  assert.deepEqual(diagnostics,[{code:'voice_duration_limit',stage:'runtime'}]);
 });
 
 test('OpenAI closes the chargeable transport before waiting for a stuck persist',async(t)=>{
@@ -516,24 +525,99 @@ test('OpenAI voice refuses upstream before spend when the application budget is 
   t.after(()=>{if(prior===undefined)delete process.env.AI_CASE_BUDGET_USD;else process.env.AI_CASE_BUDGET_USD=prior;});
   const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
   const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let connections=0;upstream.on('connection',()=>{connections+=1;});
-  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'budget-session',caseId:'case-3'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined};
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'budget-session',caseId:'case-3'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
   const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
   const events:string[]=[];browser.on('message',data=>events.push(data.toString()));const closed=await waitForClose(browser);
-  assert.equal(closed.code,1013);assert.equal(connections,0);assert(events.some(event=>event.includes('费用保护')));
+  assert.equal(closed.code,1013);assert.equal(connections,0);assert(events.some(event=>event.includes('费用保护')));assert.deepEqual(diagnostics,[{code:'spending_limit',stage:'preflight'}]);
+});
+
+test('OpenAI context setup times out without opening upstream and releases the setup lock',async(t)=>{
+  addUsageTestCase('case-context-timeout');
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let connections=0,contextCalls=0;
+  upstream.on('connection',socket=>{connections+=1;socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{const event=JSON.parse(data.toString()) as Record<string,unknown>;if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'context-retry-response'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'context-retry-response',usage:realtimeUsage()}}));}});});
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'context-timeout-session',caseId:'case-context-timeout'}),isActive:()=>true,getContext:()=>{contextCalls+=1;return contextCalls===1?new Promise<string>(()=>undefined):'{}';},persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);return new Promise<void>(()=>undefined);}};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const url=`ws://127.0.0.1:${address.port}/voice?token=x`;const origin={headers:{Origin:`http://127.0.0.1:${address.port}`}};
+  const first=new WebSocket(url,origin);first.on('error',()=>undefined);const firstEvents:string[]=[];first.on('message',data=>firstEvents.push(data.toString()));await waitForClose(first,3_000);
+  assert.equal(connections,0);assert.deepEqual(diagnostics,[{code:'context_unavailable',stage:'context'}]);
+  assert.equal(getUsageSummary('org-demo','case-context-timeout',true).records[0]?.status,'released');
+  const retry=new WebSocket(url,origin);retry.on('error',()=>undefined);const retryEvents:string[]=[];retry.on('message',data=>retryEvents.push(data.toString()));await waitUntil(()=>retryEvents.some(event=>event.includes('"type":"ready"')));
+  assert.equal(connections,1);assert.equal(contextCalls,2);assert.deepEqual(await closeVoiceSession('context-timeout-session',500),{timedOut:false});
+});
+
+test('OpenAI setup and active duplicates use dedicated codes without a second reservation',async(t)=>{
+  addUsageTestCase('case-duplicate');
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let connections=0,releaseContext!:()=>void;
+  const contextReady=new Promise<void>(resolve=>{releaseContext=resolve;});let markContextStarted!:()=>void;const contextStarted=new Promise<void>(resolve=>{markContextStarted=resolve;});
+  upstream.on('connection',socket=>{connections+=1;socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{const event=JSON.parse(data.toString()) as Record<string,unknown>;if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'duplicate-response'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'duplicate-response',usage:realtimeUsage()}}));}});});
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'duplicate-session',caseId:'case-duplicate'}),isActive:()=>true,getContext:async()=>{markContextStarted();await contextReady;return '{}';},persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
+  const before=getUsageSummary('org-demo','case-duplicate',true).records.length;const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const url=`ws://127.0.0.1:${address.port}/voice?token=x`;const origin={headers:{Origin:`http://127.0.0.1:${address.port}`}};
+  const first=new WebSocket(url,origin);first.on('error',()=>undefined);const firstEvents:string[]=[];first.on('message',data=>firstEvents.push(data.toString()));await contextStarted;
+  const duringSetup=new WebSocket(url,origin);duringSetup.on('error',()=>undefined);const setupEvents:string[]=[];duringSetup.on('message',data=>setupEvents.push(data.toString()));await waitForClose(duringSetup);
+  assert(setupEvents.some(event=>event.includes('session_closing')));assert.equal(connections,0);assert.equal(getUsageSummary('org-demo','case-duplicate',true).records.length,before+1);
+  releaseContext();await waitUntil(()=>firstEvents.some(event=>event.includes('"type":"ready"')));
+  const whileActive=new WebSocket(url,origin);whileActive.on('error',()=>undefined);const activeEvents:string[]=[];whileActive.on('message',data=>activeEvents.push(data.toString()));await waitForClose(whileActive);
+  assert(activeEvents.some(event=>event.includes('session_already_active')));assert.equal(connections,1);assert.equal(getUsageSummary('org-demo','case-duplicate',true).records.length,before+1);
+  assert.deepEqual(diagnostics,[{code:'session_closing',stage:'preflight'},{code:'session_already_active',stage:'preflight'}]);assert.deepEqual(await closeVoiceSession('duplicate-session',500),{timedOut:false});
+});
+
+test('OpenAI releases a reservation when the interview pauses while context is loading',async(t)=>{
+  addUsageTestCase('case-paused-context');
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let connections=0,active=true,resolveContext!:()=>void,markStarted!:()=>void;
+  const contextStarted=new Promise<void>(resolve=>{markStarted=resolve;});const pendingContext=new Promise<void>(resolve=>{resolveContext=resolve;});upstream.on('connection',()=>{connections+=1;});
+  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'paused-context-session',caseId:'case-paused-context'}),isActive:()=>active,getContext:async()=>{markStarted();await pendingContext;return '{}';},persist:()=>undefined,status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});const address=server.address();assert(address&&typeof address!=='string');
+  const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});browser.on('error',()=>undefined);await contextStarted;active=false;resolveContext();await waitForClose(browser);
+  assert.equal(connections,0);assert.equal(getUsageSummary('org-demo','case-paused-context',true).records[0]?.status,'released');
+});
+
+test('OpenAI reconnect waits for the prior drain before reserving the same session again',async(t)=>{
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let connections=0,responseCreates=0,markFirstCreated!:()=>void;
+  const firstCreated=new Promise<void>(resolve=>{markFirstCreated=resolve;});
+  upstream.on('connection',socket=>{connections+=1;socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{
+    const event=JSON.parse(data.toString()) as Record<string,unknown>;
+    if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
+    if(event.type==='response.create'){
+      responseCreates+=1;const responseId=`reconnect-response-${responseCreates}`;socket.send(JSON.stringify({type:'response.created',response:{id:responseId}}));
+      if(responseCreates===1){markFirstCreated();setTimeout(()=>socket.send(JSON.stringify({type:'response.done',response:{id:responseId,usage:realtimeUsage()}})),300);}
+      else socket.send(JSON.stringify({type:'response.done',response:{id:responseId,usage:realtimeUsage()}}));
+    }
+  });});
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'reconnect-drain-session',caseId:'case-9'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
+  const recordsBefore=getUsageSummary('org-demo','case-9',true).records.length;
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');
+  const first=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=first`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});first.on('error',()=>undefined);
+  await firstCreated;const draining=closeVoiceSession('reconnect-drain-session',1_500);
+  await new Promise(resolve=>setTimeout(resolve,50));
+  const second=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=second`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});const secondEvents:string[]=[];second.on('message',data=>secondEvents.push(data.toString()));second.on('error',()=>undefined);
+  await waitUntil(()=>secondEvents.some(event=>event.includes('"type":"ready"')),2_000);await draining;
+  assert.equal(connections,2);assert.equal(secondEvents.some(event=>event.includes('spending_limit')),false);assert.equal(diagnostics.length,0);
+  assert.deepEqual(await closeVoiceSession('reconnect-drain-session',500),{timedOut:false});
+  const newRecords=getUsageSummary('org-demo','case-9',true).records.slice(0,2);assert.equal(getUsageSummary('org-demo','case-9',true).records.length,recordsBefore+2);assert(newRecords.every(record=>record.status==='settled'));
 });
 
 test('OpenAI voice keeps its reservation unknown when provider usage is missing',async(t)=>{
   const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
   const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');
   upstream.on('connection',socket=>{socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{const event=JSON.parse(data.toString()) as Record<string,unknown>;if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'missing-usage-response'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'missing-usage-response'}}));}});});
-  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'missing-usage-session',caseId:'case-2'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined};
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'missing-usage-session',caseId:'case-2'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
   const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
   const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitForClose(browser);await waitUntil(()=>!hasVoiceSession('missing-usage-session'));
-  assert(events.some(event=>event.includes('未返回可核对的用量')));
+  assert(events.some(event=>event.includes('未返回可核对的用量')));assert.deepEqual(diagnostics,[{code:'voice_usage_unverified',stage:'runtime'}]);
   const latest=getUsageSummary('org-demo','case-2',true).records[0];assert.equal(latest.status,'unknown');assert.equal(latest.reservedMicros,2_000_000);
 });
 
@@ -545,12 +629,13 @@ test('OpenAI upstream errors log only safe diagnostics and expose a classified c
     socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));
     socket.send(JSON.stringify({type:'error',api_key:'raw-key-must-not-log',case_context:'private-case-context',error:{type:'invalid_request_error',code:'insufficient_quota',param:'session.audio.input.transcription.model',message:'SECRET provider message with customer and credential data'}}));
   });
-  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'safe-error-session',caseId:'case-12'}),isActive:()=>true,getContext:()=>'private context must not log',persist:()=>undefined,status:()=>undefined};
+  const diagnostics:unknown[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'safe-error-session',caseId:'case-12'}),isActive:()=>true,getContext:()=>'private context must not log',persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);}};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'raw-key-must-not-log',model:'gpt-realtime-2.1',transcriptionModel:'whisper-1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
   const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
   const events:Record<string,unknown>[]=[];browser.on('message',data=>events.push(JSON.parse(data.toString()) as Record<string,unknown>));await waitForClose(browser);
   const clientError=events.find(event=>event.type==='error');assert.equal(clientError?.code,'provider_quota');assert.equal(clientError?.retryable,false);assert.match(String(clientError?.message),/额度|余额/);
+  assert.deepEqual(diagnostics,[{code:'provider_quota',stage:'upstream'}]);
   const safeLog=JSON.stringify(logged);assert.match(safeLog,/insufficient_quota/);assert.match(safeLog,/invalid_request_error/);assert.match(safeLog,/session\.audio\.input\.transcription\.model/);
   assert.doesNotMatch(safeLog,/SECRET|raw-key-must-not-log|private-case-context|private context must not log|provider message/);
   const latest=getUsageSummary('org-demo','case-12',true).records[0];assert.equal(latest.status,'unknown');assert(latest.reservedMicros>0);

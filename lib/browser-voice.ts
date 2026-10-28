@@ -92,7 +92,15 @@ export class BrowserVoiceClient {
     return message.trim().slice(0,240).replace(/sk[-_][A-Za-z0-9_-]+/gi,'[已隐藏]').replace(/token=[^\s&]+/gi,'token=[已隐藏]');
   }
   private serverReason(event:Extract<ServerEvent,{type:'unavailable'|'error'}>){
-    if(['spending_limit','spending_protection','provider_quota'].includes(event.code??''))return '当前案例暂不能继续调用，请由顾问核对后重试。';
+    switch(event.code){
+      case 'session_already_active':return '此访谈已在另一个页面进行，请回到该页面继续，或先结束那里的语音。';
+      case 'session_closing':return '上一条语音连接正在保存收尾，请稍后再点击麦克风重试。';
+      case 'spending_limit':return '当前案例暂不能启动语音，请顾问核对调用限制后重试。';
+      case 'spending_protection':return '本次语音已触发应用保护并停止，已保存的回答会保留，请顾问核对后重试。';
+      case 'voice_usage_unverified':return '语音服务未返回完整的调用记录，本次语音已停止。已保存的回答会保留，请顾问核对后重试。';
+      case 'voice_duration_limit':return '本次连续语音已达到时长限制，已保存的回答会保留。请结束本次访谈。';
+      case 'provider_quota':return '云端语音服务账户当前不可用，请顾问检查账户状态后重试。';
+    }
     return this.safeReason(event.message);
   }
   private terminalError(message:string){this.intentionallyClosed=true;this.error(message);void this.closeResources(false);}

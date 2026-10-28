@@ -176,6 +176,25 @@ test('client creation requires all six fields and ownership is server-derived', 
   assert.equal(data.clients.find((client) => client.id === data.activeCase?.clientId)?.ownerAgentId, 'advisor-1');
 });
 
+test('voice diagnostics persist only fixed reason metadata and retain separate attempts',async()=>{
+  const advisor=new BrowserSession();await advisor.login('advisor1@aeconn.example');const caseId=await createCase(advisor,'语音诊断');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  const sessionId=((await advisor.bootstrap()).data as Bootstrap).clientSession!.id;
+  const service=await servicePromise;
+  service.voiceHooks.diagnostic(sessionId,{code:'spending_limit',stage:'preflight'});
+  service.voiceHooks.diagnostic(sessionId,{code:'spending_limit',stage:'preflight'});
+  service.voiceHooks.diagnostic(sessionId,{code:'voice_usage_unverified',stage:'runtime'});
+  const {db,unpack}=await import('../lib/db');
+  const rows=db().prepare("SELECT action,metadata FROM audit_events WHERE case_id=? AND action IN ('voice.start_failed','voice.stopped') ORDER BY rowid").all(caseId) as {action:string;metadata:string}[];
+  assert.deepEqual(rows.map(row=>({action:row.action,metadata:unpack(row.metadata)})),[
+    {action:'voice.start_failed',metadata:{code:'spending_limit',stage:'preflight',sessionId}},
+    {action:'voice.start_failed',metadata:{code:'spending_limit',stage:'preflight',sessionId}},
+    {action:'voice.stopped',metadata:{code:'voice_usage_unverified',stage:'runtime',sessionId}},
+  ]);
+  assert.doesNotMatch(JSON.stringify(rows),/语音诊断|OPENAI|sk-|客户/);
+  await advisor.action({action:'end',caseId});
+});
+
 test('owner can soft-delete and restore stable numbered cases without deleting usage or history',async()=>{
   await drainReportJobs();
   const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');
