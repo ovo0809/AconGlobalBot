@@ -16,6 +16,12 @@ export interface ProviderAnalysisResult {
   provider: string;
 }
 
+export type ExtractionValidationCategory='source_evidence'|'amount_grounding'|'status_grounding'|'reply_safety'|'fact_grounding'|'output_shape';
+export class ProviderExtractionValidationError extends Error {
+  readonly code='AI_EXTRACTION_VALIDATION';
+  constructor(readonly category:ExtractionValidationCategory){super('提取结果重复未通过严格安全校验。');this.name='ProviderExtractionValidationError';}
+}
+
 /** Providers propose facts and analyses; permissions, state and approval stay in the service. */
 export interface LLMProvider {
   analyze(input:ProviderAnalysisInput):Promise<ProviderAnalysisResult>;
@@ -284,14 +290,33 @@ async function analyzeWithCloud(input:ProviderAnalysisInput,config:CloudModelCon
   return {analyses:validateProviderAnalyses(parsed,evidenceInput),provider:`${config.provider}:${config.model}`};
 }
 
+function extractionValidationCategory(error:unknown):ExtractionValidationCategory {
+  const message=error instanceof Error?error.message:'';
+  if(/reply|question|leaks internal|product or execution/i.test(message))return 'reply_safety';
+  if(/amount|number|numeric|currency|period|unit|verbatim/i.test(message))return 'amount_grounding';
+  if(/status|unknown|declined|confirmed|conflict/i.test(message))return 'status_grounding';
+  if(/source|cited|evidence|final user|out-of-case|non-final/i.test(message))return 'source_evidence';
+  if(/fact/i.test(message))return 'fact_grounding';
+  return 'output_shape';
+}
+
 /** The same interview agent handles text turns and final transcript extraction. No second conversational agent. */
 export async function interviewWithProvider(input:InterviewInput,finalize=false):Promise<InterviewTurn|null>{
   const config=requireAnalysisConfig();
   if(!config) return null;
   const purpose=finalize?'The conversation is ended. Extract only newly supported facts from the final transcript. Do not ask another question. Set reply to "访谈已保存。". Do not change existing facts except a sourced contradiction or its new explicit clarification.':'Respond to the latest customer turn. Extract only new explicitly supported facts and choose the next single relevant question, considering all known facts and conversation context.';
   const prompt=`${interviewSystemPrompt(input)}\n\n${purpose}\nFor numeric facts, the cited statement must contain exactly one plain Arabic numeric value, plus an unambiguous currency and period for money. Do not convert Chinese number words, magnitude abbreviations, or statements with several numbers; omit an unsupported numeric fact and preserve its original transcript for clarification. Copy string values verbatim, including the original simplified/traditional characters; do not paraphrase. unknown/declined require an explicit matching statement, not merely an omitted amount or undecided budget. If a strict validation fails, do not guess or add facts.`;
-  const parsed=await structuredRequest(config,prompt,INTERVIEW_SCHEMA,finalize?'aeconn_extraction':'aeconn_interview',input.usageContext);
-  return validateInterviewTurn(parsed,input);
+  const requestName=finalize?'aeconn_extraction':'aeconn_interview';
+  const parsed=await structuredRequest(config,prompt,INTERVIEW_SCHEMA,requestName,input.usageContext);
+  try{return validateInterviewTurn(parsed,input);}
+  catch(error){
+    if(!finalize)throw error;
+    const category=extractionValidationCategory(error);
+    const retryPrompt=`${prompt}\n\nSTRICT_VALIDATION_RETRY: ${category}. The previous structured output was rejected. Produce a fresh complete response using only the original transcript and rules. Do not reuse unsupported facts. This feedback contains no customer text or field name.`;
+    const retried=await structuredRequest(config,retryPrompt,INTERVIEW_SCHEMA,requestName,input.usageContext);
+    try{return validateInterviewTurn(retried,input);}
+    catch(retryError){throw new ProviderExtractionValidationError(extractionValidationCategory(retryError));}
+  }
 }
 
 export function providerCapabilities() {

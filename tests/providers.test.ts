@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Message, ProfileField } from '../lib/domain';
-import { analyzeWithProvider, interviewWithProvider, buildCloudSafeInput, providerCapabilities, validateProviderAnalyses, validateProviderFacts } from '../lib/providers';
+import { analyzeWithProvider, interviewWithProvider, buildCloudSafeInput, providerCapabilities, ProviderExtractionValidationError, validateProviderAnalyses, validateProviderFacts } from '../lib/providers';
 import { getUsageSummary, beginUsage } from '../lib/ai-usage';
 
 process.env.DATABASE_PATH=join(mkdtempSync(join(tmpdir(),'aeconn-provider-usage-')),'test.sqlite');
@@ -124,6 +124,61 @@ test('OpenAI structured interview uses server credentials, saved context and val
   delete process.env.OPENAI_API_KEY;
   await assert.rejects(()=>interviewWithProvider(input),/requires/);
   assert.equal(network.mock.callCount(),2,'incomplete cloud setup must fail, not call a model or fall back to mock');
+});
+
+test('final extraction retries one strict validation failure without exposing rejected output',async t=>{
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
+  const source={...messages[0],caseId:'case-4',text:'年收入 80000 美元。'};
+  const interviewInput={usageContext:{caseId:'case-4'},entry:'life' as const,messages:[source],facts:[]};
+  const outputs=[
+    {reply:'访谈已保存。',facts:[{key:'income',value:99999,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['m1']}]},
+    {reply:'访谈已保存。',facts:[{key:'income',value:80000,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['m1']}]},
+  ];
+  const network=t.mock.method(globalThis,'fetch',async (_url:unknown,options:RequestInit)=>{
+    const request=JSON.parse(String(options.body));
+    if(network.mock.callCount()===1){
+      const correction=String(request.input[0].content).split('STRICT_VALIDATION_RETRY:')[1];
+      assert.match(correction,/amount_grounding/);
+      assert.doesNotMatch(correction,/99999|income|m1/);
+    }
+    const output=outputs.shift();
+    return new Response(JSON.stringify({id:`retry-${network.mock.callCount()}`,usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(output)}]}]}));
+  });
+  const result=await interviewWithProvider(interviewInput,true);
+  assert.equal(result?.facts[0].value,80000);
+  assert.equal(network.mock.callCount(),2);
+  assert.equal(getUsageSummary('org-demo','case-4',true).records.length,2);
+});
+
+test('final extraction retries at most once and charges both invalid responses',async t=>{
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
+  const interviewInput={usageContext:{caseId:'case-5'},entry:'life' as const,messages:[{...messages[0],caseId:'case-5',text:'年收入 80000 美元。'}],facts:[]};
+  const network=t.mock.method(globalThis,'fetch',async ()=>new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'访谈已保存。',facts:[{key:'income',value:99999,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['m1']}]})}]}]})));
+  await assert.rejects(()=>interviewWithProvider(interviewInput,true),(error:unknown)=>error instanceof ProviderExtractionValidationError&&error.code==='AI_EXTRACTION_VALIDATION'&&error.category==='amount_grounding');
+  assert.equal(network.mock.callCount(),2);
+  const records=getUsageSummary('org-demo','case-5',true).records;
+  assert.equal(records.length,2);
+  assert(records.every(record=>record.costMicros>0));
+});
+
+test('final extraction budget refusal blocks retry before network, while normal turns never retry',async t=>{
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL','AI_CASE_BUDGET_USD'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';process.env.AI_CASE_BUDGET_USD='0.05';
+  const invalid={reply:'访谈已保存。',facts:[{key:'income',value:99999,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['m1']}]};
+  const network=t.mock.method(globalThis,'fetch',async ()=>new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(invalid)}]}]})));
+  const finalizeInput={usageContext:{caseId:'case-6'},entry:'life' as const,messages:[{...messages[0],caseId:'case-6',text:'年收入 80000 美元。'}],facts:[]};
+  await assert.rejects(()=>interviewWithProvider(finalizeInput,true),/费用上限/);
+  assert.equal(network.mock.callCount(),1,'the second reservation is rejected before fetch');
+
+  process.env.AI_CASE_BUDGET_USD='2';
+  const normalInput={usageContext:{caseId:'case-7'},entry:'life' as const,messages:[{...messages[0],caseId:'case-7',text:'年收入 80000 美元。'}],facts:[]};
+  await assert.rejects(()=>interviewWithProvider(normalInput,false),/not present/);
+  assert.equal(network.mock.callCount(),2,'a normal interview turn makes only one request');
 });
 
 test('OpenAI report cannot use unsaved transcript evidence or mutate saved facts', async (t) => {

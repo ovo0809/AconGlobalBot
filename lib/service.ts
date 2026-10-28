@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { audit, checkPassword, db, docs, id, now, pack, transaction, unpack } from './db';
 import { buildReport, renderPdf, validateAnalyses } from './report';
-import { analyzeWithProvider, interviewWithProvider } from './providers';
+import { analyzeWithProvider, interviewWithProvider, ProviderExtractionValidationError } from './providers';
 import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-config';
 import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
 import { closeVoiceSession } from './voice-server';
@@ -38,12 +38,13 @@ function newAuth(request:Request,userId:string|null=null):{auth:Auth;cookie:stri
 }
 function userFor(auth:Auth):User {requireThat(auth.user_id,401,'请先登录。');const user=docs<User>('SELECT doc FROM users WHERE id=?',auth.user_id)[0];requireThat(user,401,'会话已失效。');return user;}
 function requireAdvisorMode(auth:Auth):User {requireThat(auth.mode==='advisor',403,'客户模式期间无法访问内部资料，请先结束访谈并交还手机。');return userFor(auth);}
-function caseFor(user:User,caseId:string,ownerOnly=false):Case {
+function caseFor(user:User,caseId:string,ownerOnly=false,includeDeleted=false):Case {
   const record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];requireThat(record,404,'案例不存在。');
   const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];
-  requireThat(owner?.orgId===user.orgId && (record.ownerAgentId===user.id && user.role==='advisor' || !ownerOnly && user.role==='reviewer' && record.assignedReviewerId===user.id),403,'您无权查看此案例。');return record;
+  requireThat(owner?.orgId===user.orgId && (record.ownerAgentId===user.id && user.role==='advisor' || !ownerOnly && user.role==='reviewer' && record.assignedReviewerId===user.id),403,'您无权查看此案例。');requireThat(includeDeleted||!record.deletedAt,404,'案例不存在。');return record;
 }
 function saveCase(record:Case){record.updatedAt=now();db().prepare('UPDATE cases SET reviewer_id=?,doc=? WHERE id=?').run(record.assignedReviewerId,pack(record),record.id);}
+function caseDisplayName(record:Case,clientName:string|undefined){if(!clientName)return undefined;const rows=db().prepare('SELECT id FROM cases WHERE client_id=? ORDER BY rowid').all(record.clientId) as {id:string}[];const index=rows.findIndex(row=>row.id===record.id);return index>0?`${clientName}（${index}）`:clientName;}
 function currentInterview(auth:Auth):Interview {
   requireThat(auth.mode==='client'&&auth.active_interview&&auth.active_case,403,'当前不在客户访谈模式。');
   const session=db().prepare('SELECT * FROM interviews WHERE id=? AND auth_id=? AND case_id=?').get(auth.active_interview,auth.id,auth.active_case) as Interview|undefined;
@@ -116,6 +117,9 @@ async function finalizeInterviewFacts(caseId:string){
 function reportJobFor(caseId:string):ReportJob|undefined{return docs<ReportJob>('SELECT doc FROM report_jobs WHERE case_id=?',caseId)[0];}
 function saveReportJob(job:ReportJob){db().prepare('INSERT INTO report_jobs VALUES(?,?,?) ON CONFLICT(case_id) DO UPDATE SET status=excluded.status,doc=excluded.doc').run(job.caseId,job.status,pack(job));}
 function enqueueReport(caseId:string){const old=reportJobFor(caseId);if(old&&['queued','generating'].includes(old.status))return;saveReportJob({caseId,status:'queued',attempts:old?.attempts??0,error:null,updatedAt:now()});}
+const EXTRACTION_VALIDATION_MESSAGE='事实提取未通过来源校验，原对话已保存；请核对后重试。';
+function reportFailureMessage(error:unknown){return error instanceof ProviderExtractionValidationError?EXTRACTION_VALIDATION_MESSAGE:error instanceof UsageBudgetError?`${error.message} 原对话已保存，额度不足时不会继续生成报告。`:'事实提取或报告未完成，原对话已保存。请检查云端配置或待核对用量后重试。';}
+function reportFailureAudit(error:unknown){return error instanceof ProviderExtractionValidationError?{failureCode:error.code,category:error.category}:error instanceof UsageBudgetError?{failureCode:error.code,category:'budget'}:{failureCode:'REPORT_GENERATION_FAILED',category:'provider_or_generation'};}
 
 /** Persistent single-process queue. Work runs independently of any browser request. */
 export async function processReportJobs(){
@@ -125,7 +129,7 @@ export async function processReportJobs(){
     const job=transaction(()=>{const next=docs<ReportJob>("SELECT doc FROM report_jobs WHERE status='queued' ORDER BY rowid LIMIT 1")[0];if(next)saveReportJob({...next,status:'generating',attempts:next.attempts+1,error:null,updatedAt:now()});return next;});
     if(job){
       try{await generateReport(job.caseId);saveReportJob({...job,status:'ready',attempts:job.attempts+1,error:null,updatedAt:now()});}
-      catch(error){saveReportJob({...job,status:'failed',attempts:job.attempts+1,error:error instanceof UsageBudgetError?`${error.message} 原对话已保存，额度不足时不会继续生成报告。`:'事实提取或报告未完成，原对话已保存。请检查云端配置或待核对用量后重试。',updatedAt:now()});audit(null,job.caseId,'report.background_failed');}
+      catch(error){saveReportJob({...job,status:'failed',attempts:job.attempts+1,error:reportFailureMessage(error),updatedAt:now()});audit(null,job.caseId,'report.background_failed',reportFailureAudit(error));}
     }
   }finally{shared.aeconnReportWorkerBusy=false;}
 }
@@ -154,18 +158,18 @@ export function bootstrap(request:Request):Response {
       data.usage=getUsageSummary(user.orgId);
       if(user.role==='admin'){data.settings=settingsFor(user);data.users=docs<User>('SELECT doc FROM users WHERE org_id=?',user.orgId);}
       else {
-        data.cases=user.role==='advisor'?docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id):docs<Case>('SELECT doc FROM cases WHERE reviewer_id=? ORDER BY rowid DESC',user.id);
+        data.cases=(user.role==='advisor'?docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id):docs<Case>('SELECT doc FROM cases WHERE reviewer_id=? ORDER BY rowid DESC',user.id)).filter(record=>!record.deletedAt);
         const clientIds=new Set(data.cases.map(record=>record.clientId));data.clients=docs<Client>('SELECT doc FROM clients').filter(client=>clientIds.has(client.id));
-        data.cases=data.cases.map(record=>({...record,clientName:data.clients.find(client=>client.id===record.clientId)?.name}));
-        const selected=new URL(request.url).searchParams.get('caseId')||auth.last_ended_case||data.cases[0]?.id;
-        if(selected){data.activeCase=caseFor(user,selected);data.usage=getUsageSummary(user.orgId,selected,true);data.activeCase.clientName=data.clients.find(client=>client.id===data.activeCase?.clientId)?.name;data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.reportJob=reportJobFor(selected);data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
+        data.cases=data.cases.map(record=>({...record,clientName:caseDisplayName(record,data.clients.find(client=>client.id===record.clientId)?.name)}));
+        const requested=new URL(request.url).searchParams.get('caseId');const selected=requested||(auth.last_ended_case&&data.cases.some(record=>record.id===auth.last_ended_case)?auth.last_ended_case:data.cases[0]?.id);
+        if(selected){data.activeCase=caseFor(user,selected);data.usage=getUsageSummary(user.orgId,selected,true);data.activeCase.clientName=caseDisplayName(data.activeCase,data.clients.find(client=>client.id===data.activeCase?.clientId)?.name);data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.reportJob=reportJobFor(selected);data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
       }
     }
   }
   return json(data,200,setCookie);
 }
 export function json(value:unknown,status=200,setCookie?:string):Response {const headers:Record<string,string>={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, private','Vary':'Cookie'};if(setCookie)headers['Set-Cookie']=setCookie;return new Response(JSON.stringify(value),{status,headers});}
-export function errorResponse(error:unknown){return json({error:error instanceof AppError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。'},error instanceof AppError?error.status:error instanceof UsageBudgetError?429:500);}
+export function errorResponse(error:unknown){if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。'},error instanceof AppError?error.status:error instanceof UsageBudgetError?429:500);}
 
 async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:string):Promise<ReportRecord>{
   const existing=locks.get(caseId);if(existing){requireThat(!reviewNote,409,'另一份报告正在生成，请完成后再提交复核。');return existing;}
@@ -236,11 +240,18 @@ export async function action(request:Request):Promise<Response>{
     const caseRecord=transaction(()=>{db().prepare('INSERT INTO clients VALUES(?,?,?)').run(client.id,user.id,pack(client));return createCase(client.id,user.id);});audit(user.id,caseRecord.id,'client.created');return json({ok:true,clientId:client.id,caseId:caseRecord.id});
   }
   if(name==='createCase'){const client=docs<Client>('SELECT doc FROM clients WHERE id=?',str(input,'clientId'))[0];requireThat(user.role==='advisor'&&client?.ownerAgentId===user.id,403,'无权为此客户创建访谈。');return json({ok:true,caseId:createCase(client.id,user.id).id});}
+  if(name==='deleteCase'||name==='restoreCase'){
+    requireThat(user.role==='advisor',403,'仅归属顾问可以管理案例。');const record=caseFor(user,str(input,'caseId'),true,name==='restoreCase');
+    if(name==='restoreCase'){requireThat(record.deletedAt,409,'案例未被删除。');record.deletedAt=null;record.deletedBy=null;saveCase(record);audit(user.id,record.id,'case.restored');return json({ok:true,nextCaseId:record.id});}
+    requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'进行中的访谈不能删除，请先结束访谈。');requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能删除案例。');
+    record.deletedAt=now();record.deletedBy=user.id;saveCase(record);db().prepare('UPDATE auth_sessions SET last_ended_case=NULL WHERE id=? AND last_ended_case=?').run(auth.id,record.id);audit(user.id,record.id,'case.soft_deleted');
+    const next=docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id).find(item=>!item.deletedAt);return json({ok:true,nextCaseId:next?.id??null});
+  }
   if(name==='enterClient'){
     const record=caseFor(user,str(input,'caseId'),true);requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，请等待完成或新建访谈。');requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'此案例已有进行中的访谈。请回到原设备结束，或新建一次访谈。');requireThat(record.reportVersion===0,409,'已有报告的案例请新建访谈，以保留历史。');
     const sessionId=id();transaction(()=>{db().prepare("INSERT INTO interviews(id,case_id,auth_id,state,created_at) VALUES(?,?,?,'active',?)").run(sessionId,record.id,auth.id,now());db().prepare("UPDATE auth_sessions SET mode='client',active_case=?,active_interview=?,last_ended_case=NULL WHERE id=?").run(record.id,sessionId,auth.id);record.status='interviewing';saveCase(record);});audit(user.id,record.id,'client_mode.entered');return json({ok:true,caseId:record.id});
   }
-  if(name==='generateReport'){const record=caseFor(user,str(input,'caseId'),true);const old=reportJobFor(record.id);try{const report=await generateReport(record.id);saveReportJob({caseId:record.id,status:'ready',attempts:(old?.attempts??0)+1,error:null,updatedAt:now()});return json({ok:true,version:report.version});}catch(error){saveReportJob({caseId:record.id,status:'failed',attempts:(old?.attempts??0)+1,error:'报告未完成，原对话已保存，请重试。',updatedAt:now()});throw error;}}
+  if(name==='generateReport'){const record=caseFor(user,str(input,'caseId'),true);const old=reportJobFor(record.id);try{const report=await generateReport(record.id);saveReportJob({caseId:record.id,status:'ready',attempts:(old?.attempts??0)+1,error:null,updatedAt:now()});return json({ok:true,version:report.version});}catch(error){saveReportJob({caseId:record.id,status:'failed',attempts:(old?.attempts??0)+1,error:reportFailureMessage(error),updatedAt:now()});throw error;}}
   if(name==='updateFact'){
     const record=caseFor(user,str(input,'caseId'));requireThat(!locks.has(record.id),409,'报告正在生成，请稍后修改。');requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'请先结束访谈再更正事实。');const key=str(input,'key',60),reason=str(input,'reason',2000),factStatus=str(input,'factStatus') as FactStatus;requireThat(reason,400,'请填写更正理由。');
     const empty=['unknown','declined','conflicting'].includes(factStatus);const value=empty?null:input.value;requireThat(value===null||typeof value==='string'||typeof value==='number',400,'事实值格式无效。');requireThat(empty||value!==null,400,'已有事实需要值；未知请选择未知状态。');

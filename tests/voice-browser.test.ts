@@ -27,14 +27,23 @@ function installConnectedBrowserFakes(t:{after(fn:()=>void):void}){
   }
   const instances:FakeWebSocket[]=[];
   let tokens=0;
-  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>stream}}});
+  const getUserMedia=async()=>stream;
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia}}});
   Object.defineProperty(globalThis,'window',{configurable:true,value:{addEventListener(){},removeEventListener(){}}});
   Object.defineProperty(globalThis,'location',{configurable:true,value:{protocol:'http:',host:'127.0.0.1'}});
   Object.defineProperty(globalThis,'AudioContext',{configurable:true,value:FakeAudioContext});
   Object.defineProperty(globalThis,'WebSocket',{configurable:true,value:FakeWebSocket});
   Object.defineProperty(globalThis,'fetch',{configurable:true,value:async()=>new Response(JSON.stringify({token:`token-${++tokens}`}),{status:200,headers:{'content-type':'application/json'}})});
-  return {instances,get stopped(){return stopped;},get closedContexts(){return closedContexts;},get tokens(){return tokens;}};
+  return {instances,getUserMedia,get stopped(){return stopped;},get closedContexts(){return closedContexts;},get tokens(){return tokens;}};
 }
+
+test('unsupported microphone capability reports a reason, releases state and allows retry',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);Object.defineProperty(globalThis,'navigator',{configurable:true,value:{}});
+  const errors:string[]=[];const client=new BrowserVoiceClient({csrf:'test',onError:message=>errors.push(message)});
+  await assert.rejects(()=>client.start(),/不支持麦克风/);assert.equal(client.state,'error');assert.match(errors.at(-1)??'',/不支持麦克风/);assert.equal(fake.instances.length,0);
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:fake.getUserMedia}}});
+  await client.start();assert.equal(fake.instances.length,1);fake.instances[0].serverEvent({type:'ready'});assert.equal(client.state,'listening');await client.pause();
+});
 
 test('browser voice releases microphone and audio context when token acquisition fails', async (t) => {
   let trackStopped=false,contextClosed=false;
@@ -82,6 +91,18 @@ test('terminal server error closes media and socket without leaving a reconnect 
   await waitUntil(()=>fake.stopped===1&&fake.instances[0].readyState===3);
   await new Promise(resolve=>setTimeout(resolve,550));
   assert.equal(fake.instances.length,1);assert.equal(client.state,'error');assert.deepEqual(errors,['terminal provider error']);assert.equal(fake.closedContexts,1);
+});
+
+test('ready timeout releases media, reports a network reason and does not reconnect',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);const errors:string[]=[];const client=new BrowserVoiceClient({csrf:'test',readyTimeoutMs:20,onError:message=>errors.push(message)});
+  await client.start();assert.equal(fake.instances.length,1);await waitUntil(()=>client.state==='error'&&fake.stopped===1);
+  await new Promise(resolve=>setTimeout(resolve,550));assert.equal(fake.instances.length,1);assert.equal(fake.tokens,1);assert.match(errors.at(-1)??'',/连接超时/);assert.equal(fake.closedContexts,1);
+});
+
+test('budget server errors show a safe case-level reason without amounts or tokens',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);const errors:string[]=[];const client=new BrowserVoiceClient({csrf:'test',onError:message=>errors.push(message)});
+  await client.start();fake.instances[0].serverEvent({type:'error',code:'spending_limit',retryable:false,message:'Budget $99 token=secret-value'});await waitUntil(()=>client.state==='error'&&fake.stopped===1);
+  assert.equal(errors.at(-1),'当前案例暂不能继续调用，请由顾问核对后重试。');assert.doesNotMatch(errors.join(' '),/\$99|secret-value|token=/);await new Promise(resolve=>setTimeout(resolve,550));assert.equal(fake.instances.length,1);
 });
 
 test('ready handshakes do not reset the finite reconnect budget',async(t)=>{

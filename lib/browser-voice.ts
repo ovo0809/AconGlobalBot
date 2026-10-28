@@ -10,6 +10,7 @@ export interface BrowserVoiceOptions {
   onError?: (message: string) => void;
   onInterrupted?: () => void;
   onMicPermission?: (granted: boolean) => void;
+  readyTimeoutMs?: number;
 }
 
 type ServerEvent =
@@ -19,9 +20,7 @@ type ServerEvent =
   | { type: 'interrupted'; itemId?: string }
   | { type: 'turnComplete' | 'ending' | 'reconnecting' }
   | { type: 'closed'; retryable?: boolean }
-  | { type: 'unavailable' | 'error'; message: string };
-
-const WORKLET_SOURCE = `class AeconnCapture extends AudioWorkletProcessor { process(inputs) { const channel = inputs[0] && inputs[0][0]; if (channel) this.port.postMessage(channel.slice()); return true; } } registerProcessor('aeconn-capture', AeconnCapture);`;
+  | { type: 'unavailable' | 'error'; message: string; code?: string; retryable?: boolean };
 
 function bytesToBase64(bytes: Uint8Array) {
   let binary = '';
@@ -73,6 +72,7 @@ export class BrowserVoiceClient {
   private captureChunks: Float32Array[] = [];
   private captureFrames = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private drainCloseTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
   private paused = false;
@@ -86,6 +86,16 @@ export class BrowserVoiceClient {
 
   private setState(state: BrowserVoiceState) { this.voiceState = state; this.options.onState?.(state); }
   private error(message: string) { this.setState('error'); this.options.onError?.(message); }
+  private safeReason(message:unknown,fallback='实时语音暂时不可用，您仍可用文字继续。'){
+    if(typeof message!=='string'||!message.trim())return fallback;
+    if(/费用|额度|上限|预算|spending/i.test(message))return '当前案例暂不能继续调用，请由顾问核对后重试。';
+    return message.trim().slice(0,240).replace(/sk[-_][A-Za-z0-9_-]+/gi,'[已隐藏]').replace(/token=[^\s&]+/gi,'token=[已隐藏]');
+  }
+  private serverReason(event:Extract<ServerEvent,{type:'unavailable'|'error'}>){
+    if(['spending_limit','spending_protection','provider_quota'].includes(event.code??''))return '当前案例暂不能继续调用，请由顾问核对后重试。';
+    return this.safeReason(event.message);
+  }
+  private terminalError(message:string){this.intentionallyClosed=true;this.error(message);void this.closeResources(false);}
 
   async start() {
     if (!['idle', 'paused', 'error'].includes(this.voiceState)) return;
@@ -105,14 +115,19 @@ export class BrowserVoiceClient {
 
   private async ensureMicrophone() {
     if (this.stream?.active) return;
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('此浏览器不支持麦克风访问，请使用文字输入。');
     try {
+      const hostname=typeof location==='undefined'?'localhost':location.hostname||location.host.split(':')[0];
+      if (!globalThis.isSecureContext && hostname !== 'localhost' && hostname !== '127.0.0.1') throw new Error('当前页面不是安全连接，手机麦克风需要通过 HTTPS 访问。');
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风访问，请使用受支持的浏览器或文字输入。');
+      if(typeof AudioContext==='undefined')throw new Error('当前浏览器不支持连续语音所需的音频能力，请使用受支持的浏览器。');
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
       this.options.onMicPermission?.(true);
       await this.startCapture();
     } catch (cause) {
       this.options.onMicPermission?.(false);
-      this.error(cause instanceof DOMException && cause.name === 'NotAllowedError' ? '麦克风权限被拒绝，可继续使用文字。' : '无法启动麦克风，可继续使用文字。');
+      const knownCapabilityMessage=cause instanceof Error&&cause.message.startsWith('当前')?cause.message:null;
+      const message=cause instanceof DOMException&&cause.name==='NotAllowedError'?'麦克风权限被拒绝，请在浏览器设置中允许后重试。':cause instanceof DOMException&&cause.name==='NotFoundError'?'未检测到可用麦克风，您仍可用文字继续。':knownCapabilityMessage??'无法启动浏览器音频，您仍可用文字继续。';
+      this.error(message);
       throw cause;
     }
   }
@@ -139,8 +154,7 @@ export class BrowserVoiceClient {
     this.silentGain = this.captureContext.createGain();
     this.silentGain.gain.value = 0;
     if (this.captureContext.audioWorklet) {
-      const sourceUrl = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: 'text/javascript' }));
-      try { await this.captureContext.audioWorklet.addModule(sourceUrl); } finally { URL.revokeObjectURL(sourceUrl); }
+      await this.captureContext.audioWorklet.addModule('/audio/aeconn-capture.js');
       const node = new AudioWorkletNode(this.captureContext, 'aeconn-capture');
       node.port.onmessage = (event: MessageEvent<Float32Array>) => emit(event.data);
       source.connect(node).connect(this.silentGain).connect(this.captureContext.destination);
@@ -154,28 +168,37 @@ export class BrowserVoiceClient {
   }
 
   private async requestToken() {
-    const response = await fetch('/api/action', { method: 'POST', cache: 'no-store', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': this.options.csrf }, body: JSON.stringify({ action: 'voiceToken' }) });
-    const body = await response.json() as { token?: string; error?: string };
-    if (!response.ok || !body.token) throw new Error(body.error || '无法获取语音会话凭证。');
+    let response:Response;
+    try{response=await fetch('/api/action', { method: 'POST', cache: 'no-store', credentials: 'same-origin', headers: { 'content-type': 'application/json', 'x-csrf-token': this.options.csrf }, body: JSON.stringify({ action: 'voiceToken' }) });}
+    catch{throw new Error('无法连接语音服务，请检查网络后重试。');}
+    let body:{token?:string;error?:string};
+    try{body=await response.json() as {token?:string;error?:string};}catch{throw new Error('语音服务返回异常，请稍后重试。');}
+    if (!response.ok || !body.token) throw new Error(this.safeReason(body.error,'无法获取语音会话凭证。'));
     return body.token;
   }
 
   private async connectSocket() {
     let token: string;
     try { token = await this.requestToken(); } catch (cause) { this.error(cause instanceof Error ? cause.message : '无法连接实时语音。'); throw cause; }
+    if(typeof WebSocket==='undefined'){const cause=new Error('当前浏览器不支持实时语音网络连接，请使用受支持的浏览器。');this.error(cause.message);throw cause;}
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${location.host}/voice?token=${encodeURIComponent(token)}`);
+    let socket:WebSocket;
+    try{socket=new WebSocket(`${protocol}//${location.host}/voice?token=${encodeURIComponent(token)}`);}
+    catch{const cause=new Error('无法建立实时语音连接，请检查网络和浏览器设置后重试。');this.error(cause.message);throw cause;}
     this.socket = socket;
+    if(this.readyTimer)clearTimeout(this.readyTimer);
+    this.readyTimer=setTimeout(()=>{if(this.socket===socket&&['connecting','reconnecting'].includes(this.voiceState))this.terminalError('实时语音连接超时，请检查网络后重试。');},this.options.readyTimeoutMs??10_000);
     socket.onmessage = (event) => this.handleServerEvent(event.data);
-    socket.onerror = () => this.options.onError?.('实时语音连接发生错误。');
+    socket.onerror = () => { if(this.socket===socket&&this.voiceState!=='error')this.options.onError?.('实时语音网络连接发生错误，正在等待连接结果。'); };
     socket.onclose = (event) => {
+      if(this.readyTimer)clearTimeout(this.readyTimer);this.readyTimer=null;
       if (this.drainCloseTimer) clearTimeout(this.drainCloseTimer);
       this.drainCloseTimer = null;
       if (this.socket === socket) this.socket = null;
       if (!this.intentionallyClosed && !this.paused && event.code !== 1000 && this.reconnectAttempts < 2) {
         this.reconnectAttempts += 1;
         this.setState('reconnecting');
-        this.reconnectTimer = setTimeout(() => { void this.connectSocket(); }, 500 * this.reconnectAttempts);
+        this.reconnectTimer = setTimeout(() => { void this.connectSocket().catch(()=>undefined); }, 500 * this.reconnectAttempts);
       } else if (!this.intentionallyClosed && !this.paused && this.voiceState !== 'error') this.error('实时语音已断开，可继续使用文字或重新开始。');
     };
   }
@@ -186,6 +209,7 @@ export class BrowserVoiceClient {
     try { event = JSON.parse(raw) as ServerEvent; } catch { return; }
     if (this.intentionallyClosed && event.type !== 'ending') return;
     if (event.type === 'ready') {
+      if(this.readyTimer)clearTimeout(this.readyTimer);this.readyTimer=null;
       if(event.inputSampleRate===16_000||event.inputSampleRate===24_000)this.inputSampleRate=event.inputSampleRate;
       if(event.outputSampleRate===24_000)this.outputSampleRate=event.outputSampleRate;
       this.setState('listening');
@@ -215,8 +239,7 @@ export class BrowserVoiceClient {
     else if (event.type === 'reconnecting') { this.stopPlayback(); this.setState('reconnecting'); }
     else if (event.type === 'ending' && !this.intentionallyClosed) void this.stopAll();
     else if (event.type === 'unavailable' || event.type === 'error') {
-      this.error(event.message);
-      void this.closeResources(false);
+      this.terminalError(this.serverReason(event));
     }
   }
 
@@ -277,6 +300,8 @@ export class BrowserVoiceClient {
   private async closeResources(final: boolean, keepSocket = false) {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    if(this.readyTimer)clearTimeout(this.readyTimer);
+    this.readyTimer=null;
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ audioStreamEnd: true }));
       if (!keepSocket) this.socket.close(1000, final ? 'ended' : 'paused');
