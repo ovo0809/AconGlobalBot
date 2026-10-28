@@ -26,3 +26,5 @@ label,input,select,textarea,.button,.tabs button,.case-item,.end-button,.message
 .interview-source{margin-top:10px}
 .pending-message{align-items:center;background:#fff7e8;border:1px solid #ecd6ad;border-radius:14px;display:flex;gap:12px;margin-bottom:12px;padding:12px}.pending-message>.icon{color:#95691c;flex:0 0 auto}.pending-message>div{min-width:0}.pending-message b{display:block}.pending-message p{margin:3px 0 0;overflow-wrap:anywhere}.pending-message .button{flex:0 0 auto;margin-left:auto}
 @media(max-width:520px){.pending-message{align-items:flex-start;flex-wrap:wrap}.pending-message .button{margin-left:36px}}
+
+.report-sections details p{overflow-wrap:anywhere}

@@ -3,6 +3,8 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Case, Category, FactStatus, ProfileField, ReportRecord } from '../lib/domain';
 import { BrowserVoiceClient, type BrowserVoiceState } from '../lib/browser-voice';
+import { factLabels, demandStatusLabels, formatFactValue } from '../lib/report-labels';
+import { presentReport } from '../lib/report-presentation';
 
 type ActionBody = Record<string, unknown> & { action: string };
 type ActionResult = Record<string, unknown> & { error?: string; caseId?: string; nextCaseId?: string | null };
@@ -18,13 +20,9 @@ const categories: { id: Category; title: string; caption: string; icon: string }
 
 const roleNames = { advisor: '顾问', reviewer: 'Charles 审核人', admin: '管理员' } as const;
 const statusNames: Record<string, string> = {
+  ...demandStatusLabels,
   new: '尚未访谈', draft: '报告草稿', needs_report: '待生成报告', interviewing: '访谈进行中', ended: '访谈已结束', report_ready: '报告已生成', reviewed: '已复核',
   pending_review: '待复核', approved: '已复核', returned: '退回补问', quote_handoff: '已转现有报价流程',
-};
-const factLabels: Record<string, string> = {
-  goal: '主要目标', horizon: '目标时间', dependents: '家庭责任', state: '居住州', employment: '工作情况', income: '收入',
-  expenses: '家庭开支', debt: '债务', reserve: '应急储备', assets: '资产与资金', existing_life: '现有人寿保障', existing_di: '现有伤残保障', existing_ltc: '现有照护安排',
-  budget: '预算', liquidity: '流动性偏好', retirement: '退休计划', care: '照护考虑',
 };
 const factStatusNames: Record<FactStatus, string> = {
   confirmed: '已确认', reported_unverified: '客户自述·待核验', unknown: '不知道', declined: '不愿提供', conflicting: '存在冲突',
@@ -254,7 +252,7 @@ function ProfileView({data,act,busy,setToast}:{data:Bootstrap;act:ActionFn;busy:
   const facts=data.facts;
   const missingKeys=Object.keys(factLabels).filter(key=>!facts.some(fact=>fact.key===key));
   return <section><div className="section-heading"><div><h3>画像与来源</h3><p>客户自述不等于顾问核验；修正事实会创建新的报告版本。</p></div><div className="section-actions"><span className="source-pill">{facts.length} 项事实</span>{missingKeys.length>0&&<select aria-label="添加事实" value="" onChange={event=>{const key=event.target.value;if(key)setEditing({key,value:null,currency:null,period:null,factStatus:'unknown',sourceMessageIds:[],confirmedBy:null,confirmedAt:null})}}><option value="">＋ 添加事实</option>{missingKeys.map(key=><option key={key} value={key}>{factLabels[key]}</option>)}</select>}</div></div>
-    <div className="fact-grid">{facts.map(fact=><button className={`fact-card fact-${fact.factStatus}`} key={fact.key} onClick={()=>setEditing(fact)}><span>{factLabels[fact.key]||fact.key}</span><b>{fact.value===null?'未提供':String(fact.value)} {fact.currency||''} {fact.period?`/ ${fact.period}`:''}</b><small>{factStatusNames[fact.factStatus]}</small><footer>{fact.sourceMessageIds.length?`${fact.sourceMessageIds.length} 个来源`:'无消息来源'}</footer></button>)}</div>
+    <div className="fact-grid">{facts.map(fact=><button className={`fact-card fact-${fact.factStatus}`} key={fact.key} onClick={()=>setEditing(fact)}><span>{factLabels[fact.key]||fact.key}</span><b>{formatFactValue(fact)}</b><small>{factStatusNames[fact.factStatus]}</small><footer>{fact.sourceMessageIds.length?`${fact.sourceMessageIds.length} 个来源`:'无消息来源'}</footer></button>)}</div>
     {!facts.length&&<EmptyState title="画像尚未形成" body="完成访谈后，系统会将有来源的事实整理在这里。"/>}
     {editing&&<FactModal fact={editing} busy={busy==='updateFact'} onClose={()=>setEditing(null)} onSave={async value=>{await act({action:'updateFact',caseId:data.activeCase!.id,...value});setEditing(null);setToast({kind:'success',text:'事实已更新，旧报告已标记过时。'});}}/>}
   </section>;
@@ -269,8 +267,9 @@ function ReportView({data,report,act,busy,setHandoff}:{data:Bootstrap;report?:Re
     {reportJob?.status==='failed'&&<div className="disclosure warning"><Icon name="alert"/><p><b>新版本生成未完成</b><br/>事实与旧报告均已保存，可安全重试。</p><button className="button button-secondary" disabled={busy==='generateReport'} onClick={()=>void act({action:'generateReport',caseId:data.activeCase!.id})}>重试</button></div>}
     <div className="disclosure"><Icon name="alert"/><p><b>{report.provider.includes('mock')?'演示规则，待业务审核':'已配置云端分析'}</b><br/>{report.provider.includes('mock')?'本报告由确定性演示规则生成，不代表保险建议或业务准确率。':`分析来源：${report.provider}`}</p></div>
     {report.stale&&<div className="disclosure warning"><Icon name="alert"/><p><b>这不是最新事实版本</b><br/>事实已修改，请重新生成后再确认发送。</p></div>}
-    <div className="report-sections">{report.sections.map((section,index)=><details open={index===0} key={section.title}><summary><span>{String(index+1).padStart(2,'0')}</span>{section.title}</summary><p>{section.body}</p></details>)}</div>
-    <div className="analysis-grid">{report.analyses.map(item=><article key={item.category}><span>{categories.find(c=>c.id===item.category)?.title}</span><b>{statusNames[item.status]||item.status.replaceAll('_',' ')}</b><p>{item.reasonSummary}</p><small>缺失：{item.missingFields.join('、')||'无'}</small></article>)}</div>
+    <div className="disclosure"><Icon name="file"/><p><b>报告依据 {report.facts.length} 项已保存事实</b><br/>“资料不足”表示本次未采集到足够信息，不代表客户没有需求。语音可能识别有误，未进入事实表的内容请到访谈记录核对。</p></div>
+    <div className="report-sections">{presentReport(report).sections.map((section,index)=><details open={index===0} key={section.title}><summary><span>{String(index+1).padStart(2,'0')}</span>{section.title}</summary><p>{section.body}</p></details>)}<details><summary>来源编号与版本信息</summary><p>页面使用中文字段和简短来源编号便于阅读；下载的 PDF 与邮件预览保留生成时的版本。</p>{presentReport(report).references.map(ref=><p key={ref.id}>{ref.label}：{ref.id}</p>)}<p>案例编号：{report.caseId}<br/>客户编号：{report.clientId}<br/>报告版本：{report.version}<br/>快照编号：{report.snapshotId}</p></details></div>
+    <div className="analysis-grid">{report.analyses.map(item=><article key={item.category}><span>{categories.find(c=>c.id===item.category)?.title}</span><b>{statusNames[item.status]||item.status.replaceAll('_',' ')}</b><p>{item.reasonSummary}</p><small>待补充：{[...new Set(item.missingFields.map(key=>factLabels[key]||key))].join('、')||'无列出项'}</small></article>)}</div>
     <div className="report-footer-actions">{data.user?.role==='advisor'&&<button className="button button-primary" disabled={busy==='submitReview'} onClick={()=>void act({action:'submitReview',caseId:report.caseId})}>提交 Charles 复核</button>}{data.user?.role==='reviewer'&&<ReviewActions report={report} act={act} busy={busy} setHandoff={setHandoff}/>}</div>
   </section>;
 }
