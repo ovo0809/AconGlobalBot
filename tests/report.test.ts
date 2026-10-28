@@ -1,0 +1,142 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import type { Client, Message, ProfileField, ReportInput, User } from '../lib/domain';
+import { analyzeDemo, buildReport, renderPdf, validateAnalyses, validateFacts } from '../lib/report';
+import { scenarios } from '../lib/scenarios';
+
+function messagesFor(facts: ProfileField[], caseId = 'case-1'): Message[] {
+  return [...new Set(facts.flatMap((fact) => fact.sourceMessageIds))].map((id, index) => ({
+    id,
+    caseId,
+    sessionId: 'session-1',
+    turnId: `turn-${index + 1}`,
+    eventId: `event-${index + 1}`,
+    role: 'user' as const,
+    text: `合成测试陈述 ${index + 1}`,
+    final: true,
+    interrupted: false,
+    createdAt: '2026-10-01T12:00:00.000Z',
+  }));
+}
+
+function reportInput(facts: ProfileField[]): ReportInput {
+  const owner: User = { id: 'advisor-1', name: '合成顾问 林', email: 'advisor1@aeconn.example', role: 'advisor', orgId: 'org-1', emailVerified: true };
+  const client: Client = {
+    id: 'client-1', name: '合成客户 王', birthday: '1985-05-16', gender: '未说明', phone: '+1-555-0100',
+    email: 'client@example.invalid', maritalStatus: '已婚', state: 'CA', language: 'zh-CN', ownerAgentId: owner.id,
+    consentStatus: 'demo_synthetic', createdAt: '2026-10-01T12:00:00.000Z',
+  };
+  const messages = messagesFor(facts);
+  return {
+    client,
+    owner,
+    caseRecord: { id: 'case-1', clientId: client.id, ownerAgentId: owner.id, status: 'report_ready', entry: 'life', createdAt: '2026-10-01T12:00:00.000Z', updatedAt: '2026-10-01T13:00:00.000Z', assignedReviewerId: 'charles-1', reportVersion: 1 },
+    version: 1,
+    snapshotId: 'snapshot-immutable-1',
+    reviewStatus: 'draft',
+    createdAt: '2026-10-01T13:00:00.000Z',
+    facts,
+    messages,
+    analyses: analyzeDemo(facts),
+    incompleteTranscript: false,
+    provider: 'mock:demo-rules',
+    reviewNote: 'approved：已核对合成案例引用与缺失项',
+  };
+}
+
+test('provides at least ten distinct synthetic edge scenarios', () => {
+  assert.ok(scenarios.length >= 10);
+  assert.equal(new Set(scenarios.map((scenario) => scenario.name)).size, scenarios.length);
+  assert.ok(scenarios.some((scenario) => scenario.facts.some((fact) => fact.factStatus === 'conflicting' && fact.sourceMessageIds.length >= 2)));
+  assert.ok(scenarios.some((scenario) => scenario.name.includes('injection')));
+});
+
+test('demo analysis returns exactly four unique categories and valid case-local evidence', () => {
+  for (const scenario of scenarios) {
+    const results = analyzeDemo(scenario.facts);
+    assert.equal(results.length, 4, scenario.name);
+    assert.equal(new Set(results.map((entry) => entry.category)).size, 4, scenario.name);
+    validateAnalyses(results, scenario.facts, messagesFor(scenario.facts));
+  }
+});
+
+test('unknown and declined money stay null rather than becoming zero', () => {
+  const scenario = scenarios.find((entry) => entry.name === 'declined-financial-details');
+  assert.ok(scenario);
+  validateFacts(scenario.facts);
+  assert.equal(scenario.facts.find((fact) => fact.key === 'income')?.value, null);
+  assert.throws(() => validateFacts([{ ...scenario.facts[1], value: 0 }]), /必须保留为 null/);
+});
+
+test('conflicting income cannot become a direction until clarified', () => {
+  const scenario = scenarios.find((entry) => entry.name === 'conflicting-income-period');
+  assert.ok(scenario);
+  const result = analyzeDemo(scenario.facts).find((entry) => entry.category === 'disability_income');
+  assert.equal(result?.status, 'insufficient_information');
+  assert.match(result?.constraints.join(' ') ?? '', /确认金额币种/);
+});
+
+test('existing arrangements are reviewed rather than treated as an automatic new recommendation', () => {
+  const scenario = scenarios.find((entry) => entry.name === 'review-existing-coverage');
+  assert.ok(scenario);
+  const results = analyzeDemo(scenario.facts);
+  assert.equal(results.find((entry) => entry.category === 'life')?.status, 'review_existing');
+  assert.equal(results.find((entry) => entry.category === 'disability_income')?.status, 'review_existing');
+});
+
+test('instruction-like client text cannot alter recipients or produce a product recommendation', () => {
+  const scenario = scenarios.find((entry) => entry.name === 'instruction-injection-text');
+  assert.ok(scenario);
+  const results = analyzeDemo(scenario.facts);
+  assert.equal(JSON.stringify(results).includes('attacker@example.com'), false);
+  assert.equal(JSON.stringify(results).includes('最高收益产品'), false);
+});
+
+test('validation rejects non-final and cross-case evidence', () => {
+  const scenario = scenarios.find((entry) => entry.name === 'disability-income-gap');
+  assert.ok(scenario);
+  const results = analyzeDemo(scenario.facts);
+  const messages = messagesFor(scenario.facts);
+  assert.throws(() => validateAnalyses(results, scenario.facts, messages.map((message, index) => index === 0 ? { ...message, final: false } : message)), /不是最终转写/);
+  assert.throws(() => validateAnalyses(results, scenario.facts, messages.map((message, index) => index === 0 ? { ...message, caseId: 'other-case' } : message)), /不同案例/);
+});
+
+test('report has immutable identifiers, programmatic contact data and six required sections', () => {
+  const scenario = scenarios.find((entry) => entry.name === 'combined-family-needs');
+  assert.ok(scenario);
+  const report = buildReport(reportInput(scenario.facts));
+  assert.equal(report.sections.length, 6);
+  assert.match(report.fullText, /client_id：client-1/);
+  assert.match(report.fullText, /case_id：case-1/);
+  assert.match(report.fullText, /顾问联系邮箱（程序字段）：advisor1@aeconn\.example/);
+  assert.match(report.fullText, /demo_unapproved/);
+  assert.match(report.fullText, /演示规则，待业务审核/);
+  assert.match(report.fullText, /六、给 Charles 的交接摘要与专项审核项/);
+  assert.match(report.fullText, /本版本人工复核意见：approved：已核对合成案例引用与缺失项/);
+  assert.ok(report.headerLines?.some((line) => line.includes('归属顾问：合成顾问 林 / advisor-1')));
+});
+
+test('renders a real, embedded-font PDF with enough content to span pages', async () => {
+  const base = scenarios.find((entry) => entry.name === 'combined-family-needs');
+  assert.ok(base);
+  const input = reportInput(base.facts);
+  const report = buildReport(input);
+  const pdf = await renderPdf(report);
+  assert.equal(pdf.subarray(0, 4).toString(), '%PDF');
+  assert.ok(pdf.length > 50_000, `PDF unexpectedly small: ${pdf.length}`);
+  assert.ok(pdf.includes(Buffer.from('NotoSansCJKsc')) || pdf.includes(Buffer.from('NotoSansCJK')));
+  if (process.env.REPORT_VALIDATION_OUTPUT) {
+    const output = path.resolve(process.env.REPORT_VALIDATION_OUTPUT);
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    fs.writeFileSync(output, pdf);
+  }
+  const longReport = {
+    ...report,
+    sections: report.sections.map((section) => ({ ...section, body: `${section.body}\n${'用于分页验证的合成说明。'.repeat(120)}` })),
+  };
+  const longPdf = await renderPdf(longReport);
+  assert.ok(longPdf.length > pdf.length);
+  assert.match(longPdf.toString('latin1'), /\/Count [2-9][0-9]*/);
+});
