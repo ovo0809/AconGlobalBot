@@ -149,3 +149,7 @@ MVP 用于验证流程、权限和交接质量，不直接选择保险产品，�
 6. **后续候选：本地 Provider 评估。** 只有出现离线或成本需求时再评估 Ollama，不作为当前 MVP 依赖。
 
 相关文档：[产品需求](PRD.md) · [实施决策](decisions.md) · [模型与语音](docs/providers.md) · [PDF 验证](docs/report-validation.md) · [运维说明](docs/operations.md)
+
+## OpenAI 费用保护增量
+
+第一版加入每案例 $2／组织每天 $5／每月 $20 的费用保护、请求前额度预留、持久用量记录、未知费用保留占用及语音时长保护。费用和 token 只在内部工作区展示，客户界面不暴露账本。本机继续 mock，不以真实请求验证本次功能；实际工程测试与限制见 [verification.md](docs/verification.md)，真实语音与手机仍待验收。阈值不等于供应商账单硬上限，详见 [usage.md](docs/usage.md)。

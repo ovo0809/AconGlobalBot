@@ -465,14 +465,14 @@ test('real-provider interview and background voice extraction save sourced facts
   await drainReportJobs();
   const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
-  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
   const {db,docs}=await import('../lib/db');
   let phase='text';let caseId='';
   t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
     const request=JSON.parse(String(options.body));const prompt=request.input[0].content as string;
     let output:unknown;
     const customer=docs<Message>("SELECT doc FROM messages WHERE case_id=? AND role='user' ORDER BY rowid",caseId);
-    if(request.text.format.name==='aeconn_interview'){
+    if(['aeconn_interview','aeconn_extraction'].includes(request.text.format.name)){
       if(phase==='text')output={reply:'哪些家人依赖您的收入？',facts:[{key:'goal',value:'家庭保障',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:[customer[0].id]}]};
       else{assert.match(prompt,/conversation is ended/);const voice=customer.find(m=>m.text==='每月收入 5000 美元。')!;output={reply:'访谈已保存。',facts:[{key:'income',value:5000,currency:'USD',period:'month',factStatus:'reported_unverified',sourceMessageIds:[voice.id]}]};}
     }else{
@@ -480,7 +480,7 @@ test('real-provider interview and background voice extraction save sourced facts
       const saved=db().prepare("SELECT doc FROM profile_fields WHERE case_id=? AND field_key='income'").get(caseId);assert.ok(saved,'facts must be durable before report call');
       output={analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'待补充资料。',missingFields:['budget'],constraints:[],nextQuestions:[]}))};
     }
-    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(output)}]}]}));
+    return new Response(JSON.stringify({usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(output)}]}]}));
   });
   const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');caseId=await createCase(advisor,'云端事实链');
   await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
@@ -504,12 +504,12 @@ test('cloud failure keeps conversation, fails background job without a mock repo
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
   const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'失败重试');
   await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
-  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
   let fail=true;
   t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
     if(fail)return new Response('{}',{status:503});
-    const request=JSON.parse(String(options.body));const result=request.text.format.name==='aeconn_interview'?{reply:'访谈已保存。',facts:[]}:{analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}))};
-    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(result)}]}]}));
+    const request=JSON.parse(String(options.body));const result=['aeconn_interview','aeconn_extraction'].includes(request.text.format.name)?{reply:'访谈已保存。',facts:[]}:{analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}))};
+    return new Response(JSON.stringify({usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(result)}]}]}));
   });
   assert.equal((await advisor.action({action:'message',caseId,text:'需要更多保障',eventId:'failed-message'})).response.status,503);
   assert.equal(((await advisor.bootstrap()).data as Bootstrap).messages.some(m=>m.eventId==='failed-message'),true);
@@ -524,13 +524,13 @@ test('pause and resume invalidate an in-flight cloud turn instead of resurrectin
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
   const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'暂停代次');
   await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
-  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
   let resolveRequest!:(value:Response)=>void;let markStarted!:()=>void;const started=new Promise<void>(resolve=>{markStarted=resolve;});
   t.mock.method(globalThis,'fetch',async()=>{markStarted();return await new Promise<Response>(resolve=>{resolveRequest=resolve;});});
   const pending=advisor.action({action:'message',caseId,text:'家庭保障',eventId:'delayed-turn'});await started;
   assert.equal((await advisor.action({action:'pause',caseId})).response.status,200);
   assert.equal((await advisor.action({action:'resume',caseId})).response.status,200);
-  resolveRequest(new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'这条迟到的问题不应出现。',facts:[]})}]}]})));
+  resolveRequest(new Response(JSON.stringify({usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'这条迟到的问题不应出现。',facts:[]})}]}]})));
   assert.equal((await pending).response.status,409);
   const state=(await advisor.bootstrap()).data as Bootstrap;assert.equal(state.messages.some(m=>m.eventId==='delayed-turn:reply'),false);assert.equal(state.messages.filter(m=>m.eventId==='delayed-turn').length,1);
   process.env.LLM_PROVIDER='mock';await advisor.action({action:'end',caseId});await drainReportJobs();
@@ -547,4 +547,39 @@ test('mock money parsing never changes CAD into CNY or truncates ambiguous magni
   const correction=await advisor.action({action:'updateFact',caseId,key:'goal',value:'保护家庭',factStatus:'confirmed',reason:'顾问核对后的更正'});assert.equal(correction.response.status,200);
   state=(await advisor.bootstrap(caseId)).data as Bootstrap;const corrected=state.facts.find(f=>f.key==='goal')!;const message=state.messages.find(m=>m.id===corrected.sourceMessageIds[0])!;
   assert.equal(message.source,'advisor');assert.equal(message.actorId,'advisor-1');assert.match(state.reports[0].fullText,/顾问更正/);
+});
+
+test('usage is scoped to authorized internal cases and budget refusal preserves the conversation',async t=>{
+  await drainReportJobs();
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');
+  const caseId=await createCase(advisor,'预算保护');
+  const usage=await import('../lib/ai-usage');
+  const held=usage.beginUsage({context:{caseId},model:'gpt-realtime-2.1',operation:'realtime'});
+  usage.completeUsage(held.id,'unknown');
+  const internal=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(internal.usage?.case?.remainingMicros,0);
+  assert.equal(internal.usage?.records.length,1);
+  assert.equal(internal.usage?.records[0].status,'unknown');
+  const another=new BrowserSession();await another.login('advisor2@aeconn.example');
+  assert.equal((await another.bootstrap(caseId)).response.status,403);
+  const other=(await another.bootstrap()).data as Bootstrap;
+  assert.equal(other.usage?.records.some(record=>record.id===held.id),false);
+  const admin=new BrowserSession();await admin.login('admin@aeconn.example');
+  const administrative=(await admin.bootstrap()).data as Bootstrap;
+  assert.equal(administrative.usage?.case,null);assert.deepEqual(administrative.usage?.records,[]);
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  assert.equal(((await advisor.bootstrap()).data as Bootstrap).usage,undefined);
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-test';process.env.OPENAI_MODEL='gpt-6-luna';
+  const network=t.mock.method(globalThis,'fetch',async()=>{throw new Error('Budget test must not call network');});
+  const response=await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'budget-protected-answer'});
+  assert.equal(response.response.status,429);
+  assert(((await advisor.bootstrap()).data as Bootstrap).messages.some(message=>message.eventId==='budget-protected-answer'));
+  await advisor.action({action:'end',caseId});await drainReportJobs();
+  const ended=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(ended.mode,'advisor');assert.equal(ended.reportJob?.status,'failed');assert.equal(ended.reports.length,0);
+  assert.match(ended.reportJob?.error??'',/额度|预算/);
+  assert.equal(network.mock.callCount(),0);
+  const anonymous=new BrowserSession();assert.equal(((await anonymous.bootstrap()).data as Bootstrap).usage,undefined);
 });

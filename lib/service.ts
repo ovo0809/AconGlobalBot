@@ -6,6 +6,7 @@ import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-c
 import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
 import { closeVoiceSession } from './voice-server';
 import { DryRunMailProvider } from './mail';
+import { getUsageSummary, recoverUsageReservations, UsageBudgetError } from './ai-usage';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
 
 type Input=Record<string,unknown>;
@@ -60,7 +61,7 @@ function addMessage(sessionId:string,caseId:string,role:'user'|'assistant',text:
   db().prepare('INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)').run(message.id,caseId,sessionId,eventId,turnId,role,pack(message));
   return docs<Message>('SELECT doc FROM messages WHERE session_id=? AND (event_id=? OR turn_id=?) AND role=?',sessionId,eventId,turnId,role)[0];
 }
-function interviewInput(session:Interview):InterviewInput{const record=docs<Case>('SELECT doc FROM cases WHERE id=?',session.case_id)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];return {caseRecord:{id:session.case_id},entry:session.entry??'life',knownClient:{state:client.state,language:client.language},facts:factsFor(session.case_id),messages:messagesFor(session.case_id)};}
+function interviewInput(session:Interview):InterviewInput{const record=docs<Case>('SELECT doc FROM cases WHERE id=?',session.case_id)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];return {usageContext:{caseId:session.case_id,sessionId:session.id},caseRecord:{id:session.case_id},entry:session.entry??'life',knownClient:{state:client.state,language:client.language},facts:factsFor(session.case_id),messages:messagesFor(session.case_id)};}
 function askNext(session:Interview,eventId?:string){const next=nextInterviewTurn(interviewInput(session));db().prepare('UPDATE interviews SET current_question=? WHERE id=?').run(next.targetKey,session.id);addMessage(session.id,session.case_id,'assistant',next.reply,eventId);}
 function validateFact(fact:ProfileField,messages:Message[]){
   requireThat(Object.hasOwn(questions,fact.key),400,'未知事实字段。');requireThat(factStatuses.includes(fact.factStatus),400,'事实状态无效。');
@@ -85,7 +86,7 @@ async function respondToText(session:Interview,text:string,eventId:string){
     const message=addMessage(session.id,session.case_id,'user',text,eventId);
     let turn;
     try{turn=await interviewWithProvider(interviewInput(session));}
-    catch{throw new AppError(503,'您的回答已保存。云端访谈暂时未完成，请稍后重试或交还顾问；不会使用模拟回复冒充 AI。');}
+    catch(error){if(error instanceof UsageBudgetError)throw new AppError(429,`${error.message} 您的回答已保存，可结束访谈交还顾问。`);throw new AppError(503,'您的回答已保存。云端访谈暂时未完成，请稍后重试或交还顾问；不会使用模拟回复冒充 AI。');}
     requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     transaction(()=>{
       if(turn){for(const fact of turn.facts)saveFact(session.case_id,fact);addMessage(session.id,session.case_id,'assistant',turn.reply,replyId);}
@@ -124,7 +125,7 @@ export async function processReportJobs(){
     const job=transaction(()=>{const next=docs<ReportJob>("SELECT doc FROM report_jobs WHERE status='queued' ORDER BY rowid LIMIT 1")[0];if(next)saveReportJob({...next,status:'generating',attempts:next.attempts+1,error:null,updatedAt:now()});return next;});
     if(job){
       try{await generateReport(job.caseId);saveReportJob({...job,status:'ready',attempts:job.attempts+1,error:null,updatedAt:now()});}
-      catch{saveReportJob({...job,status:'failed',attempts:job.attempts+1,error:'事实提取或报告未完成，原对话已保存。请检查云端配置后重试。',updatedAt:now()});audit(null,job.caseId,'report.background_failed');}
+      catch(error){saveReportJob({...job,status:'failed',attempts:job.attempts+1,error:error instanceof UsageBudgetError?`${error.message} 原对话已保存，额度不足时不会继续生成报告。`:'事实提取或报告未完成，原对话已保存。请检查云端配置或待核对用量后重试。',updatedAt:now()});audit(null,job.caseId,'report.background_failed');}
     }
   }finally{shared.aeconnReportWorkerBusy=false;}
 }
@@ -136,7 +137,7 @@ export function recoverReportJobs(){
     for(const job of docs<ReportJob>("SELECT doc FROM report_jobs WHERE status='generating'"))saveReportJob({...job,status:'queued',error:null,updatedAt:now()});
   });
 }
-export function startReportWorker(){if(shared.aeconnReportWorker)return;recoverReportJobs();shared.aeconnReportWorker=setInterval(()=>{void processReportJobs();},500);shared.aeconnReportWorker.unref();}
+export function startReportWorker(){if(shared.aeconnReportWorker)return;recoverUsageReservations();recoverReportJobs();shared.aeconnReportWorker=setInterval(()=>{void processReportJobs();},500);shared.aeconnReportWorker.unref();}
 
 export function bootstrap(request:Request):Response {
   let auth=readAuth(request);let setCookie:string|undefined;if(!auth){const created=newAuth(request);auth=created.auth;setCookie=created.cookie;}
@@ -149,20 +150,22 @@ export function bootstrap(request:Request):Response {
       data.messages=messagesFor(session.case_id).filter(message=>message.sessionId===session.id);
     }else{
       data.mode='advisor';data.user=user;
+      // Only internal roles receive totals; case-level entries follow caseFor authorization.
+      data.usage=getUsageSummary(user.orgId);
       if(user.role==='admin'){data.settings=settingsFor(user);data.users=docs<User>('SELECT doc FROM users WHERE org_id=?',user.orgId);}
       else {
         data.cases=user.role==='advisor'?docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id):docs<Case>('SELECT doc FROM cases WHERE reviewer_id=? ORDER BY rowid DESC',user.id);
         const clientIds=new Set(data.cases.map(record=>record.clientId));data.clients=docs<Client>('SELECT doc FROM clients').filter(client=>clientIds.has(client.id));
         data.cases=data.cases.map(record=>({...record,clientName:data.clients.find(client=>client.id===record.clientId)?.name}));
         const selected=new URL(request.url).searchParams.get('caseId')||auth.last_ended_case||data.cases[0]?.id;
-        if(selected){data.activeCase=caseFor(user,selected);data.activeCase.clientName=data.clients.find(client=>client.id===data.activeCase?.clientId)?.name;data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.reportJob=reportJobFor(selected);data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
+        if(selected){data.activeCase=caseFor(user,selected);data.usage=getUsageSummary(user.orgId,selected,true);data.activeCase.clientName=data.clients.find(client=>client.id===data.activeCase?.clientId)?.name;data.messages=messagesFor(selected);data.facts=factsFor(selected);data.reports=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version DESC',selected).map(content=>reportRecord(content,data.activeCase!));data.reportJob=reportJobFor(selected);data.notifications=docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=? ORDER BY rowid',selected);data.reviews=docs<Review>('SELECT doc FROM reviews WHERE case_id=? ORDER BY rowid',selected);}
       }
     }
   }
   return json(data,200,setCookie);
 }
 export function json(value:unknown,status=200,setCookie?:string):Response {const headers:Record<string,string>={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, private','Vary':'Cookie'};if(setCookie)headers['Set-Cookie']=setCookie;return new Response(JSON.stringify(value),{status,headers});}
-export function errorResponse(error:unknown){return json({error:error instanceof AppError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。'},error instanceof AppError?error.status:500);}
+export function errorResponse(error:unknown){return json({error:error instanceof AppError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。'},error instanceof AppError?error.status:error instanceof UsageBudgetError?429:500);}
 
 async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:string):Promise<ReportRecord>{
   const existing=locks.get(caseId);if(existing){requireThat(!reviewNote,409,'另一份报告正在生成，请完成后再提交复核。');return existing;}
@@ -175,7 +178,7 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
     const before=digest(pack({messages,facts}));
     const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
     const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];if(prior)return reportRecord(prior,record);
-    const output=await analyzeWithProvider({messages,facts});const {analyses,provider}=output;
+    const output=await analyzeWithProvider({messages,facts,usageContext:{caseId}});const {analyses,provider}=output;
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
     validateAnalyses(analyses,facts,messages);
     const snapshotId=digest(pack({before:digest(pack({messages,facts})),reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));

@@ -1,3 +1,5 @@
+import type { UsageSummary } from './ai-usage';
+
 export type Role = 'advisor' | 'reviewer' | 'admin';
 export type Category = 'life' | 'annuity' | 'ltc' | 'disability_income';
 export type FactStatus = 'confirmed' | 'reported_unverified' | 'unknown' | 'declined' | 'conflicting';
@@ -16,4 +18,4 @@ export interface NotificationJob { id:string; caseId:string; reportVersion:numbe
 export interface Review { id:string; caseId:string; reportVersion:number; reviewerId:string; decision:string; reason:string; createdAt:string }
 export interface ReportJob { caseId:string; status:'queued'|'generating'|'ready'|'failed'; error:string|null; attempts:number; updatedAt:string }
 export interface Settings { companyEmail:string; companyVerified:boolean; unreviewedSendPolicy:'pending'|'allow'|'reviewed_only'; mailMode:string }
-export interface Bootstrap { csrf:string; mode:'anonymous'|'advisor'|'client'; user:User|null; clients:Client[]; cases:Case[]; activeCase:Case|null; messages:Message[]; facts:ProfileField[]; reports:ReportRecord[]; reportJob?:ReportJob; notifications:NotificationJob[]; reviews:Review[]; settings?:Settings; users?:User[]; clientSession?:{id:string;state:string;entry:Category|null}; capabilities:{analysis:string;interview?:string;voice:string;voiceConfigured:boolean;mail:string}; demo:boolean }
+export interface Bootstrap { usage?:UsageSummary; csrf:string; mode:'anonymous'|'advisor'|'client'; user:User|null; clients:Client[]; cases:Case[]; activeCase:Case|null; messages:Message[]; facts:ProfileField[]; reports:ReportRecord[]; reportJob?:ReportJob; notifications:NotificationJob[]; reviews:Review[]; settings?:Settings; users?:User[]; clientSession?:{id:string;state:string;entry:Category|null}; capabilities:{analysis:string;interview?:string;voice:string;voiceConfigured:boolean;mail:string}; demo:boolean }

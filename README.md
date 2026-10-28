@@ -136,3 +136,7 @@ npm run restore -- ./data/backups/manual.sqlite ./data/restored.sqlite
 - `scripts/`、`tests/`、`.github/workflows/`：备份恢复、自动验证、CI。
 
 中文 PDF 字体为 Noto Sans CJK SC，遵循随附 SIL Open Font License；见 `public/fonts/OFL.txt`。
+
+### OpenAI 费用与用量
+
+当前默认继续模拟模式。本地试用保护阈值为每案例 **$2**、组织每日 **$5**、每月 **$20**（UTC）。内部工作区可查看费用和用量；预留／待核对金额不会被当作零费用。没有对应费率或额度不足时阻止新的 OpenAI 调用。阈值属于应用级保护，不是 OpenAI 最终账单硬封顶；见 [配置与限制](docs/usage.md)。

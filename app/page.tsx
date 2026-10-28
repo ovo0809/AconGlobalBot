@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Case, Category, FactStatus, ProfileField, ReportRecord } from '../lib/domain';
 import { BrowserVoiceClient, type BrowserVoiceState } from '../lib/browser-voice';
+import { UsagePanel } from './components/usage-panel';
 
 type ActionBody = Record<string, unknown> & { action: string };
 type ActionResult = Record<string, unknown> & { error?: string; caseId?: string };
@@ -214,7 +215,10 @@ function CaseWorkspace({data,busy,act,reportOpen,setReportOpen,setToast,setHando
   const caseRecord=data.activeCase!;
   const client=data.clients.find(item=>item.id===caseRecord.clientId);
   const latest=data.reports[0];
-  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'>('conversation');
+  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'|'usage'>('conversation');
+  const usage=data.usage;
+  const analysisProvider=data.capabilities.analysis.toLowerCase();
+  const usageProvider=analysisProvider.includes('mock')?'mock':analysisProvider.includes('openai')?'openai':'other';
   useEffect(()=>{ if(reportOpen)setTab('report'); },[reportOpen]);
   const enterClient=async()=>{ await act({action:'enterClient',caseId:caseRecord.id}); };
   return <>
@@ -222,10 +226,10 @@ function CaseWorkspace({data,busy,act,reportOpen,setReportOpen,setToast,setHando
       {data.user?.role==='advisor' && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'}><Icon name="plus"/>新案例</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
     </div>
     <nav className="tabs" aria-label="案例详情">
-      <button className={tab==='conversation'?'active':''} onClick={()=>setTab('conversation')}>访谈记录</button><button className={tab==='profile'?'active':''} onClick={()=>setTab('profile')}>画像与来源</button><button className={tab==='report'?'active':''} onClick={()=>{setTab('report');setReportOpen(true)}}>内部报告 {latest&&<i>v{latest.version}</i>}</button><button className={tab==='mail'?'active':''} onClick={()=>setTab('mail')}>通知预览</button>
+      <button className={tab==='conversation'?'active':''} onClick={()=>setTab('conversation')}>访谈记录</button><button className={tab==='profile'?'active':''} onClick={()=>setTab('profile')}>画像与来源</button><button className={tab==='report'?'active':''} onClick={()=>{setTab('report');setReportOpen(true)}}>内部报告 {latest&&<i>v{latest.version}</i>}</button><button className={tab==='mail'?'active':''} onClick={()=>setTab('mail')}>通知预览</button><button className={tab==='usage'?'active':''} onClick={()=>setTab('usage')}>费用与用量</button>
     </nav>
     <div className="workspace-body">
-      {tab==='conversation'&&<ConversationView data={data}/>} {tab==='profile'&&<ProfileView data={data} act={act} busy={busy} setToast={setToast}/>} {tab==='report'&&<ReportView data={data} report={latest} act={act} busy={busy} setHandoff={setHandoff}/>} {tab==='mail'&&<MailView data={data} report={latest} act={act} busy={busy}/>}
+      {tab==='conversation'&&<ConversationView data={data}/>} {tab==='profile'&&<ProfileView data={data} act={act} busy={busy} setToast={setToast}/>} {tab==='report'&&<ReportView data={data} report={latest} act={act} busy={busy} setHandoff={setHandoff}/>} {tab==='mail'&&<MailView data={data} report={latest} act={act} busy={busy}/>} {tab==='usage'&&<UsagePanel usage={usage} provider={usageProvider}/>}
     </div>
   </>;
 }

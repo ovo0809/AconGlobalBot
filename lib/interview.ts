@@ -1,4 +1,5 @@
 import { messageSource, type Case, type Category, type Message, type ProfileField } from './domain';
+import type { UsageContext } from './ai-usage';
 
 export const INTERVIEW_QUESTIONS = {
   goal: '您最希望解决什么问题？大约计划什么时候开始？',
@@ -23,6 +24,7 @@ export const INTERVIEW_QUESTIONS = {
 export type InterviewFactKey = keyof typeof INTERVIEW_QUESTIONS;
 
 export interface InterviewInput {
+  usageContext?: UsageContext;
   facts: ProfileField[];
   messages: Message[];
   entry: Category;

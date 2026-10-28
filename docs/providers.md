@@ -84,3 +84,7 @@ Provider 边界允许未来按需增加本地实现，但当前仓库没有 Olla
 - OpenAI Realtime 客户端事件与音频截断：https://developers.openai.com/api/reference/resources/realtime/client-events
 - OpenAI Structured Outputs：https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses
 - Next.js Custom Server：https://nextjs.org/docs/app/guides/custom-server
+
+## OpenAI 费用与用量
+
+OpenAI 调用现在必须带服务端确定的案例身份，经 SQLite 原子预留后才可连接上游。每案例 2 USD、每日 5 USD、每月 20 USD；完整 usage、缓存和音频分项入账，未知费用保留预留。没有费率的模型会拒绝调用。当前 selectors 继续为 mock，真实余额和设备验收未改变。详细配置、账本状态、语音保护与计费限制见 [usage.md](usage.md)。
