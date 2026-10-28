@@ -289,7 +289,7 @@ export async function interviewWithProvider(input:InterviewInput,finalize=false)
   const config=requireAnalysisConfig();
   if(!config) return null;
   const purpose=finalize?'The conversation is ended. Extract only newly supported facts from the final transcript. Do not ask another question. Set reply to "访谈已保存。". Do not change existing facts except a sourced contradiction or its new explicit clarification.':'Respond to the latest customer turn. Extract only new explicitly supported facts and choose the next single relevant question, considering all known facts and conversation context.';
-  const prompt=`${interviewSystemPrompt(input)}\n\n${purpose}\nFor numeric facts, require a complete unambiguous amount/currency/period in a cited user statement; if missing, omit that fact and naturally request a complete clarification. If a strict validation fails, do not guess or add facts.`;
+  const prompt=`${interviewSystemPrompt(input)}\n\n${purpose}\nFor numeric facts, the cited statement must contain exactly one plain Arabic numeric value, plus an unambiguous currency and period for money. Do not convert Chinese number words, magnitude abbreviations, or statements with several numbers; omit an unsupported numeric fact and preserve its original transcript for clarification. Copy string values verbatim, including the original simplified/traditional characters; do not paraphrase. unknown/declined require an explicit matching statement, not merely an omitted amount or undecided budget. If a strict validation fails, do not guess or add facts.`;
   const parsed=await structuredRequest(config,prompt,INTERVIEW_SCHEMA,finalize?'aeconn_extraction':'aeconn_interview',input.usageContext);
   return validateInterviewTurn(parsed,input);
 }

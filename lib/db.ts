@@ -35,14 +35,15 @@ export function db():DatabaseSync {
     CREATE TABLE IF NOT EXISTS voice_tokens (token_hash TEXT PRIMARY KEY, interview_id TEXT NOT NULL REFERENCES interviews(id), auth_id TEXT NOT NULL REFERENCES auth_sessions(id), expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS report_jobs (case_id TEXT PRIMARY KEY REFERENCES cases(id), status TEXT NOT NULL, doc TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS interview_extractions (session_id TEXT PRIMARY KEY REFERENCES interviews(id), transcript_hash TEXT NOT NULL, updated_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS ai_usage_calls (id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id), case_id TEXT NOT NULL REFERENCES cases(id), session_id TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, operation TEXT NOT NULL, status TEXT NOT NULL, reserved_micros INTEGER NOT NULL, actual_micros INTEGER NOT NULL DEFAULT 0, budget_day_utc TEXT NOT NULL, budget_month_utc TEXT NOT NULL, rate_card_version TEXT NOT NULL, created_at TEXT NOT NULL, settled_at TEXT);
+    CREATE TABLE IF NOT EXISTS ai_usage_calls (id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES organizations(id), case_id TEXT NOT NULL REFERENCES cases(id), session_id TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, transcription_model TEXT NOT NULL DEFAULT 'gpt-4o-mini-transcribe', operation TEXT NOT NULL, status TEXT NOT NULL, reserved_micros INTEGER NOT NULL, actual_micros INTEGER NOT NULL DEFAULT 0, budget_day_utc TEXT NOT NULL, budget_month_utc TEXT NOT NULL, rate_card_version TEXT NOT NULL, created_at TEXT NOT NULL, settled_at TEXT);
     CREATE TABLE IF NOT EXISTS ai_usage_events (id TEXT PRIMARY KEY, call_id TEXT NOT NULL REFERENCES ai_usage_calls(id), event_key TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, input_text_tokens INTEGER NOT NULL DEFAULT 0, input_audio_tokens INTEGER NOT NULL DEFAULT 0, cached_text_tokens INTEGER NOT NULL DEFAULT 0, cached_audio_tokens INTEGER NOT NULL DEFAULT 0, output_text_tokens INTEGER NOT NULL DEFAULT 0, output_audio_tokens INTEGER NOT NULL DEFAULT 0, transcription_ms INTEGER NOT NULL DEFAULT 0, estimated_usd_micros INTEGER NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(call_id,event_key));
     CREATE INDEX IF NOT EXISTS ai_usage_calls_org_day ON ai_usage_calls(org_id,budget_day_utc,status);
     CREATE INDEX IF NOT EXISTS ai_usage_calls_org_month ON ai_usage_calls(org_id,budget_month_utc,status);
     CREATE INDEX IF NOT EXISTS ai_usage_calls_case ON ai_usage_calls(case_id,status);
-    PRAGMA user_version=3;
+    PRAGMA user_version=4;
   `);
   if(!database.prepare('PRAGMA table_info(interviews)').all().some(row=>row.name==='epoch'))database.exec('ALTER TABLE interviews ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0');
+  if(!database.prepare('PRAGMA table_info(ai_usage_calls)').all().some(row=>row.name==='transcription_model'))database.exec("ALTER TABLE ai_usage_calls ADD COLUMN transcription_model TEXT NOT NULL DEFAULT 'gpt-4o-mini-transcribe'");
   seed(database); return database;
 }
 export function transaction<T>(fn:()=>T):T { const database=db(); database.exec('BEGIN IMMEDIATE'); try {const value=fn(); database.exec('COMMIT'); return value;} catch(error){database.exec('ROLLBACK');throw error;} }

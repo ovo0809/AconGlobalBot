@@ -60,6 +60,24 @@ test('Transcription token usage and malformed provider usage are handled fail-cl
   usage.completeUsage(call.id,'settled');
 });
 
+test('Whisper duration uses its approved rate while the default transcription model remains mini',async()=>{
+  const usage=await usagePromise,{db}=await dbPromise;
+  const whisper=usage.beginUsage({context:{caseId:'case-3'},operation:'realtime',model:'gpt-realtime-2.1',transcriptionModel:'whisper-1',reserveMicros:100_000});
+  assert.equal((db().prepare('SELECT transcription_model FROM ai_usage_calls WHERE id=?').get(whisper.id) as {transcription_model:string}).transcription_model,'whisper-1');
+  assert.equal(usage.recordUsage(whisper.id,'whisper-minute','transcription',{type:'duration',seconds:60}),true);
+  assert.equal(usage.getUsageProgress(whisper.id).costMicros,6_000);
+  assert.throws(()=>usage.recordUsage(whisper.id,'whisper-tokens','transcription',{type:'tokens',input_tokens:1,output_tokens:0,input_token_details:{text_tokens:0,audio_tokens:1}}),usage.UsageDataError);
+  usage.completeUsage(whisper.id,'settled');
+
+  const mini=usage.beginUsage({context:{caseId:'case-3'},operation:'realtime',model:'gpt-realtime-2.1',reserveMicros:100_000});
+  assert.equal((db().prepare('SELECT transcription_model FROM ai_usage_calls WHERE id=?').get(mini.id) as {transcription_model:string}).transcription_model,'gpt-4o-mini-transcribe');
+  usage.recordUsage(mini.id,'mini-minute','transcription',{type:'duration',seconds:60});
+  assert.equal(usage.getUsageProgress(mini.id).costMicros,3_000);
+  usage.completeUsage(mini.id,'settled');
+
+  assert.throws(()=>usage.beginUsage({context:{caseId:'case-3'},operation:'realtime',model:'gpt-realtime-2.1',transcriptionModel:'unknown-transcriber' as never}),usage.UsageBudgetError);
+});
+
 test('Atomic reservations enforce case, day and month limits without double-spend',async()=>{
   const usage=await usagePromise;
   const previous={case:process.env.AI_CASE_BUDGET_USD,day:process.env.AI_DAILY_BUDGET_USD,month:process.env.AI_MONTHLY_BUDGET_USD};

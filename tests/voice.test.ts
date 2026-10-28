@@ -323,15 +323,37 @@ test('two OpenAI outputs retain distinct triggering turn IDs while ASR finals ar
   emit({type:'conversation.item.input_audio_transcription.completed',item_id:'user-2',transcript:'用户二',usage:{type:'duration',seconds:.05}});emit({type:'conversation.item.input_audio_transcription.completed',item_id:'user-1',transcript:'用户一',usage:{type:'duration',seconds:.05}});
   await waitUntil(()=>persisted.length===4);
   const bySource=new Map(persisted.map(event=>[event.sourceItemId,event]));
-  assert.equal(bySource.get('assistant-1')?.turnId,bySource.get('user-1')?.turnId);assert.equal(bySource.get('assistant-2')?.turnId,bySource.get('user-2')?.turnId);assert.notEqual(bySource.get('assistant-1')?.turnId,bySource.get('assistant-2')?.turnId);
+  assert.match(bySource.get('assistant-1')?.turnId??'',new RegExp(`^${bySource.get('user-1')?.turnId}:assistant:`));assert.match(bySource.get('assistant-2')?.turnId??'',new RegExp(`^${bySource.get('user-2')?.turnId}:assistant:`));assert.notEqual(bySource.get('assistant-1')?.turnId,bySource.get('assistant-2')?.turnId);
   assert.deepEqual(await closeVoiceSession('two-turn-session',500),{timedOut:false});
+});
+
+test('one OpenAI response persists every assistant item with a unique input-linked turn ID',async(t)=>{
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let providerSocket:WebSocket|null=null;
+  upstream.on('connection',socket=>{providerSocket=socket;socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{const event=JSON.parse(data.toString()) as Record<string,unknown>;if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'multi-opening'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'multi-opening',usage:realtimeUsage()}}));}});});
+  const persisted:Array<{role:string;text:string;sourceItemId?:string;turnId:string}>=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'multi-item-session',caseId:'case-5'}),isActive:()=>true,getContext:()=>'{}',persist:(_session,event)=>{persisted.push(event);},status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitUntil(()=>events.some(event=>event.includes('"type":"ready"'))&&providerSocket!==null);assert(providerSocket);
+  const emit=(value:object)=>providerSocket!.send(JSON.stringify(value));
+  emit({type:'input_audio_buffer.speech_started',item_id:'multi-user'});emit({type:'input_audio_buffer.speech_stopped',item_id:'multi-user'});emit({type:'input_audio_buffer.committed',item_id:'multi-user'});
+  emit({type:'response.created',response:{id:'multi-response'}});
+  emit({type:'response.output_item.added',response_id:'multi-response',item:{id:'planning-item'}});emit({type:'response.output_audio_transcript.done',item_id:'planning-item',transcript:'先确认时间范围。'});
+  emit({type:'response.output_item.added',response_id:'multi-response',item:{id:'horizon-question'}});emit({type:'response.output_audio_transcript.done',item_id:'horizon-question',transcript:'您希望在多久内完成？'});
+  emit({type:'response.done',response:{id:'multi-response',usage:realtimeUsage()}});
+  await new Promise(resolve=>setTimeout(resolve,20));assert.equal(persisted.length,0,'assistant items wait for the delayed final ASR source');
+  emit({type:'conversation.item.input_audio_transcription.completed',item_id:'multi-user',transcript:'大约五年。',usage:{type:'duration',seconds:.2}});await waitUntil(()=>persisted.length===3);
+  const user=persisted.find(event=>event.sourceItemId==='multi-user');const assistants=persisted.filter(event=>event.role==='assistant');assert(user);assert.deepEqual(assistants.map(event=>event.sourceItemId),['planning-item','horizon-question']);assert.notEqual(assistants[0].turnId,assistants[1].turnId);assert(assistants.every(event=>event.turnId.startsWith(`${user.turnId}:assistant:`)));
+  assert.deepEqual(await closeVoiceSession('multi-item-session',500),{timedOut:false});
 });
 
 test('duplicate OpenAI response.done cannot double count or poison the next turn',async(t)=>{
   const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
-  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let responseCreates=0;
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let responseCreates=0;const clientItemIds:string[]=[];
   upstream.on('connection',socket=>{socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{
     const event=JSON.parse(data.toString()) as Record<string,unknown>;
+    if(event.type==='conversation.item.create'){const item=event.item as {id?:unknown}|undefined;if(typeof item?.id==='string')clientItemIds.push(item.id);}
     if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
     if(event.type==='response.create'){
       responseCreates+=1;const responseId=`dedupe-response-${responseCreates}`;
@@ -348,6 +370,7 @@ test('duplicate OpenAI response.done cannot double count or poison the next turn
   browser.send(JSON.stringify({text:'这是第二轮，不应被重复完成事件污染。'}));await waitUntil(()=>responseCreates===2);
   await new Promise(resolve=>setTimeout(resolve,30));
   assert.equal(browser.readyState,WebSocket.OPEN);assert.equal(events.some(event=>event.includes('未返回可核对的用量')),false);
+  assert.equal(clientItemIds.length,2);assert(clientItemIds.every(itemId=>itemId.length<=32&&/^[A-Za-z0-9_-]+$/.test(itemId)));
   assert.deepEqual(await closeVoiceSession('dedupe-session',500),{timedOut:false});
   const latest=getUsageSummary('org-demo','case-5',true).records[0];assert.equal(latest.status,'settled');assert.equal(latest.costMicros,3_840);
 });
@@ -368,6 +391,56 @@ test('OpenAI spending stop clears pending audio without committing another respo
   await waitForClose(browser);await waitUntil(()=>received.some(event=>event.type==='input_audio_buffer.clear'));
   assert(received.some(event=>event.type==='input_audio_buffer.append'));assert.equal(received.some(event=>event.type==='input_audio_buffer.commit'),false);
   assert.equal(received.filter(event=>event.type==='response.create').length,1);assert(events.some(event=>event.includes('费用保护阈值')));
+});
+
+test('OpenAI end clears trailing silence after VAD auto-commit without creating another response',async(t)=>{
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');const received:Record<string,unknown>[]=[];let handledSpeech=false;
+  upstream.on('connection',socket=>{socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{
+    const event=JSON.parse(data.toString()) as Record<string,unknown>;received.push(event);
+    if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
+    if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'tail-opening'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'tail-opening',usage:realtimeUsage()}}));}
+    if(event.type==='input_audio_buffer.append'&&!handledSpeech){handledSpeech=true;
+      socket.send(JSON.stringify({type:'input_audio_buffer.speech_started',item_id:'tail-user'}));socket.send(JSON.stringify({type:'input_audio_buffer.speech_stopped',item_id:'tail-user'}));socket.send(JSON.stringify({type:'input_audio_buffer.committed',item_id:'tail-user'}));
+      socket.send(JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'tail-user',transcript:'这是已由 VAD 提交的回答。',usage:{type:'duration',seconds:.2}}));
+      socket.send(JSON.stringify({type:'response.created',response:{id:'tail-vad-response'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'tail-vad-response',usage:realtimeUsage()}}));
+    }
+  });});
+  const persisted:string[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'tail-silence-session',caseId:'case-11'}),isActive:()=>true,getContext:()=>'{}',persist:(_session,event)=>{persisted.push(event.text);},status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1',transcriptionModel:'whisper-1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitUntil(()=>events.some(event=>event.includes('"type":"ready"')));
+  const audio=Buffer.alloc(4_800).toString('base64');browser.send(JSON.stringify({audio}));await waitUntil(()=>persisted.includes('这是已由 VAD 提交的回答。'));
+  browser.send(JSON.stringify({audio}));await waitUntil(()=>received.filter(event=>event.type==='input_audio_buffer.append').length===2);
+  assert.deepEqual(await closeVoiceSession('tail-silence-session',500),{timedOut:false});
+  assert.equal(received.some(event=>event.type==='input_audio_buffer.commit'),false);assert.equal(received.filter(event=>event.type==='input_audio_buffer.clear').length,1);assert.equal(received.filter(event=>event.type==='response.create').length,1);
+});
+
+test('OpenAI end tolerates an empty manual commit that loses a race with server VAD',async(t)=>{
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');const received:Record<string,unknown>[]=[];
+  upstream.on('connection',socket=>{socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{
+    const event=JSON.parse(data.toString()) as Record<string,unknown>;received.push(event);
+    if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
+    if(event.type==='response.create'){socket.send(JSON.stringify({type:'response.created',response:{id:'race-opening'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'race-opening',usage:realtimeUsage()}}));}
+    if(event.type==='input_audio_buffer.append')socket.send(JSON.stringify({type:'input_audio_buffer.speech_started',item_id:'race-user'}));
+    if(event.type==='input_audio_buffer.commit'){
+      socket.send(JSON.stringify({type:'input_audio_buffer.speech_stopped',item_id:'race-user'}));socket.send(JSON.stringify({type:'input_audio_buffer.committed',item_id:'race-user'}));
+      socket.send(JSON.stringify({type:'error',error:{type:'invalid_request_error',code:'input_audio_buffer_commit_empty',param:null,message:'raw message must not reach client'}}));
+      socket.send(JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'race-user',transcript:'竞争情况下仍保留的回答。',usage:{type:'duration',seconds:.2}}));
+      socket.send(JSON.stringify({type:'response.created',response:{id:'race-vad-response'}}));socket.send(JSON.stringify({type:'response.done',response:{id:'race-vad-response',usage:realtimeUsage()}}));
+    }
+  });});
+  const persisted:string[]=[];const hooks:VoiceHooks={consumeToken:()=>({sessionId:'vad-race-session',caseId:'case-3'}),isActive:()=>true,getContext:()=>'{}',persist:(_session,event)=>{persisted.push(event.text);},status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1',transcriptionModel:'whisper-1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitUntil(()=>events.some(event=>event.includes('"type":"ready"')));
+  browser.send(JSON.stringify({audio:Buffer.alloc(4_800).toString('base64')}));await waitUntil(()=>received.some(event=>event.type==='input_audio_buffer.append'));await new Promise(resolve=>setTimeout(resolve,20));
+  assert.deepEqual(await closeVoiceSession('vad-race-session',500),{timedOut:false});
+  assert.equal(received.filter(event=>event.type==='input_audio_buffer.commit').length,1);assert(persisted.includes('竞争情况下仍保留的回答。'));assert.equal(events.some(event=>event.includes('provider_configuration')||event.includes('raw message')),false);
+  const latest=getUsageSummary('org-demo','case-3',true).records[0];assert.equal(latest.status,'settled');
 });
 
 test('late completion of an older OpenAI response keeps the newer response active and unaccounted',async(t)=>{
@@ -462,6 +535,62 @@ test('OpenAI voice keeps its reservation unknown when provider usage is missing'
   const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitForClose(browser);await waitUntil(()=>!hasVoiceSession('missing-usage-session'));
   assert(events.some(event=>event.includes('未返回可核对的用量')));
   const latest=getUsageSummary('org-demo','case-2',true).records[0];assert.equal(latest.status,'unknown');assert.equal(latest.reservedMicros,2_000_000);
+});
+
+test('OpenAI upstream errors log only safe diagnostics and expose a classified client error',async(t)=>{
+  const logged:unknown[][]=[];t.mock.method(console,'error',(...args:unknown[])=>{logged.push(args);});
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');
+  upstream.on('connection',socket=>{
+    socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));
+    socket.send(JSON.stringify({type:'error',api_key:'raw-key-must-not-log',case_context:'private-case-context',error:{type:'invalid_request_error',code:'insufficient_quota',param:'session.audio.input.transcription.model',message:'SECRET provider message with customer and credential data'}}));
+  });
+  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'safe-error-session',caseId:'case-12'}),isActive:()=>true,getContext:()=>'private context must not log',persist:()=>undefined,status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'raw-key-must-not-log',model:'gpt-realtime-2.1',transcriptionModel:'whisper-1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:Record<string,unknown>[]=[];browser.on('message',data=>events.push(JSON.parse(data.toString()) as Record<string,unknown>));await waitForClose(browser);
+  const clientError=events.find(event=>event.type==='error');assert.equal(clientError?.code,'provider_quota');assert.equal(clientError?.retryable,false);assert.match(String(clientError?.message),/额度|余额/);
+  const safeLog=JSON.stringify(logged);assert.match(safeLog,/insufficient_quota/);assert.match(safeLog,/invalid_request_error/);assert.match(safeLog,/session\.audio\.input\.transcription\.model/);
+  assert.doesNotMatch(safeLog,/SECRET|raw-key-must-not-log|private-case-context|private context must not log|provider message/);
+  const latest=getUsageSummary('org-demo','case-12',true).records[0];assert.equal(latest.status,'unknown');assert(latest.reservedMicros>0);
+});
+
+test('OpenAI voice fixes Whisper for the session and meters duration usage at its configured rate',async(t)=>{
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');const received:Record<string,unknown>[]=[];
+  upstream.on('connection',socket=>{socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));socket.on('message',data=>{
+    const event=JSON.parse(data.toString()) as Record<string,unknown>;received.push(event);
+    if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
+    if(event.type==='response.create'){
+      socket.send(JSON.stringify({type:'response.created',response:{id:'whisper-response'}}));
+      socket.send(JSON.stringify({type:'response.done',response:{id:'whisper-response',usage:realtimeUsage(0,0)}}));
+      socket.send(JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'whisper-input',transcript:'Whisper 测试转写。',usage:{type:'duration',seconds:60}}));
+    }
+  });});
+  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'whisper-session',caseId:'case-10'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'key',model:'gpt-realtime-2.1',transcriptionModel:'whisper-1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:string[]=[];browser.on('message',data=>events.push(data.toString()));await waitUntil(()=>events.some(event=>event.includes('Whisper 测试转写')));
+  const session=received.find(event=>event.type==='session.update')?.session as {audio?:{input?:{transcription?:{model?:string}}}}|undefined;
+  assert.equal(session?.audio?.input?.transcription?.model,'whisper-1');assert.deepEqual(await closeVoiceSession('whisper-session',500),{timedOut:false});
+  const latest=getUsageSummary('org-demo','case-10',true).records[0];assert.equal(latest.status,'settled');assert.equal(latest.costMicros,6_000);assert.equal(latest.transcriptionSeconds,60);
+});
+
+test('unknown OpenAI transcription model is rejected before opening an upstream connection',async(t)=>{
+  const keys=['VOICE_PROVIDER','OPENAI_API_KEY','OPENAI_REALTIME_MODEL','OPENAI_TRANSCRIPTION_MODEL'] as const;const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}});
+  process.env.VOICE_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-unused';process.env.OPENAI_REALTIME_MODEL='gpt-realtime-2.1';process.env.OPENAI_TRANSCRIPTION_MODEL='unknown-transcriber';
+  const recordsBefore=getUsageSummary('org-demo','case-11',true).records.length;
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');let connections=0;upstream.on('connection',()=>{connections+=1;});
+  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'invalid-transcriber-session',caseId:'case-11'}),isActive:()=>true,getContext:()=>'{}',persist:()=>undefined,status:()=>undefined};
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=x`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const events:string[]=[];browser.on('message',data=>events.push(data.toString()));assert.equal((await waitForClose(browser)).code,1013);
+  assert.equal(connections,0);assert(events.some(event=>event.includes('转写模型配置无效')));assert.equal(getUsageSummary('org-demo','case-11',true).records.length,recordsBefore);
 });
 
 test('OpenAI voice stops after settled usage reaches the application protection threshold',async(t)=>{

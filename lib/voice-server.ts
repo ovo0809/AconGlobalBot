@@ -3,7 +3,7 @@ import type { Duplex } from 'node:stream';
 import type { Server } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
-import { realtimeVoiceConfig } from './provider-config';
+import { realtimeVoiceConfig, requireOpenAITranscriptionModel, type OpenAITranscriptionModel } from './provider-config';
 import { beginUsage, completeUsage, getUsageProgress, recordUsage } from './ai-usage';
 
 export type VoiceStatus = 'connecting' | 'listening' | 'thinking' | 'speaking' | 'reconnecting' | 'ended' | 'error' | 'transcript_incomplete';
@@ -60,6 +60,9 @@ interface ActiveVoice {
   openAIOutputTurnIds:Map<string,string>;
   openAIAudioPending: boolean;
   openAICommitPending: boolean;
+  openAISpeechActive:boolean;
+  openAIUncommittedSpeech:boolean;
+  openAIVadCommitPending:boolean;
   openAIResponseActive: boolean;
   openAITurnCompletePending:number;
   openAIReady: boolean;
@@ -69,6 +72,8 @@ interface ActiveVoice {
   openAIResponsesStarted:number;
   openAIResponsesAccounted:number;
   openAIInputAudioMs:number;
+  openAITranscriptionModel:OpenAITranscriptionModel;
+  openAIAccountedTranscriptionMs:number;
   openAIOutputAudioMs:number;
   openAITextChars:number;
   openAIAccountedInputMs:number;
@@ -118,9 +123,9 @@ function callStatus(active:ActiveVoice,state:VoiceStatus){
   catch(cause){return Promise.reject(cause);}
 }
 
-async function failActive(active:ActiveVoice,message='实时语音处理失败，可继续使用文字。'){
+async function failActive(active:ActiveVoice,message='实时语音处理失败，可继续使用文字。',clientError?:{code:string;retryable:boolean}){
   if(active.closePromise)return;
-  send(active.browser,{type:'error',message});
+  send(active.browser,{type:'error',message,...clientError});
   await Promise.allSettled([
     callStatus(active,'transcript_incomplete'),
     callStatus(active,'error'),
@@ -196,7 +201,7 @@ function closeBoth(active: ActiveVoice, code = 1000, reason = 'ended', timedOut 
     if(active.spendingTimer)clearTimeout(active.spendingTimer);
     if(active.provider==='openai'&&active.openAIUsageId&&!active.openAIUsageFinalized){
       active.openAIUsageFinalized=true;
-      const fullyAccounted=!active.openAIUsageUncertain&&!active.openAIResponseActive&&!active.openAIPendingInputIds.size&&!active.openAIAudioPending&&!active.openAICommitPending&&active.openAIResponsesStarted>0&&active.openAIResponsesStarted===active.openAIResponsesAccounted;
+      const fullyAccounted=!active.openAIUsageUncertain&&!active.openAIResponseActive&&!active.openAIPendingInputIds.size&&!active.openAIAudioPending&&!active.openAICommitPending&&!active.openAISpeechActive&&!active.openAIUncommittedSpeech&&!active.openAIVadCommitPending&&active.openAIResponsesStarted>0&&active.openAIResponsesStarted===active.openAIResponsesAccounted;
       try{completeUsage(active.openAIUsageId,fullyAccounted?'settled':'unknown');}catch{/* the relay still has to close */}
     }
     await Promise.allSettled([...active.pendingPersists]);
@@ -245,7 +250,7 @@ async function handleUpstream(active: ActiveVoice, source: WebSocket, raw: WebSo
     if (!active.resumeHandle) {
       source.send(JSON.stringify({
         clientContent: {
-          turns: [{ role: 'user', parts: [{ text: '请根据系统提供的当前案例资料，现在用简体中文自然地提出一个最重要、尚未得到答案的问题。只问一个问题。' }] }],
+          turns: [{ role: 'user', parts: [{ text: '请根据系统提供的当前案例资料，现在用简体中文自然地提出一个最重要、尚未得到答案的独立问题。只问一个问题，不要追加“另外”或第二问。' }] }],
           turnComplete: true,
         },
       }));
@@ -329,7 +334,7 @@ function handleBrowser(active: ActiveVoice, raw: WebSocket.RawData) {
     if (typeof message.text !== 'string' || !message.text.trim() || message.text.length > MAX_TEXT) return;
     const text = message.text.trim();
     if(active.provider==='openai'){
-      const itemId=`msg_${randomUUID().replace(/-/g,'')}`;
+      const itemId=openAIItemId();
       const turnId=`${active.sessionId}:voice:${active.connectionId}:item:${itemId}`;
       active.openAITextChars+=Buffer.byteLength(text,'utf8');
       if(checkOpenAISpending(active))return;
@@ -345,7 +350,7 @@ function handleBrowser(active: ActiveVoice, raw: WebSocket.RawData) {
   }
   if (keys[0] === 'audioStreamEnd') {
     if(active.provider==='openai'){
-      if(active.openAIAudioPending){active.upstream.send(JSON.stringify({type:'input_audio_buffer.commit'}));active.openAIAudioPending=false;active.openAICommitPending=true;}
+      finishOpenAIInput(active);
     }else active.upstream.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
     return;
   }
@@ -353,6 +358,7 @@ function handleBrowser(active: ActiveVoice, raw: WebSocket.RawData) {
   if(active.provider==='openai'){
     active.openAIInputAudioMs+=base64PcmDurationMs(message.audio);
     if(checkOpenAISpending(active))return;
+    if(base64PcmHasSpeech(message.audio))active.openAIUncommittedSpeech=true;
     active.openAIAudioPending=true;
     active.upstream.send(JSON.stringify({type:'input_audio_buffer.append',audio:message.audio}));
   }else active.upstream.send(JSON.stringify({ realtimeInput: { audio: { data: message.audio, mimeType: 'audio/pcm;rate=16000' } } }));
@@ -363,7 +369,7 @@ export interface VoiceServerOptions {
   livenessIntervalMs?: number;
   transcriptionGraceMs?: number;
   /** Test-only injection; production resolves the selected provider from provider-config. */
-  configOverride?: {provider:'gemini'|'openai';apiKey:string;model:string};
+  configOverride?: {provider:'gemini'|'openai';apiKey:string;model:string;transcriptionModel?:OpenAITranscriptionModel};
 }
 
 function boundedContext(value:unknown){
@@ -399,7 +405,7 @@ function boundedContext(value:unknown){
 function systemInstruction(context:string) {
   return [
     '你是 Aeconn 的客户访谈助手，不是保险顾问。目标是依据当前案例已知资料，主动提出下一条最有价值的澄清问题，并把回答交给系统保存为待核验事实。',
-    '每次只问一个主要问题，回答简短、自然，使用简体中文。优先处理案例上下文中的 clarificationNeeds 与 questionPriority；不要重复询问已有明确答案。',
+    '每轮只问一个独立问题，回答简短、自然，使用简体中文。不要在同一轮用“另外”“还有”或类似说法追加第二问。优先处理案例上下文中的 clarificationNeeds 与 questionPriority；不要重复询问已有明确答案。',
     '客户说“不知道”时记录为未知并换到下一主题；客户说“不愿提供”时尊重并记录为拒绝，不施压，也不在本次访谈再次追问。',
     '金额必须补清数值、币种和周期；日期需分清准确日期或大致时间。发现新回答与既有资料矛盾时，先中性复述两种说法并只问一个确认问题，不自行覆盖旧值。',
     '不得给出内部分析、产品选择、报价、收益保证、核保结论、申请、退保、rollover 或资金转移指令。不得声称口头回答已经完成顾问确认。',
@@ -414,6 +420,12 @@ function base64PcmDurationMs(value:string,rate=24_000){
   return Math.max(0,Math.floor(value.length*3/4)-padding)/2/rate*1_000;
 }
 
+function base64PcmHasSpeech(value:string){
+  const pcm=Buffer.from(value,'base64');
+  for(let offset=0;offset+1<pcm.length;offset+=2)if(Math.abs(pcm.readInt16LE(offset))>=768)return true;
+  return false;
+}
+
 function openAIVoiceMaxSeconds(){
   const raw=process.env.OPENAI_VOICE_MAX_SECONDS?.trim();
   if(!raw)return 1_200;
@@ -425,7 +437,8 @@ function openAIVoiceMaxSeconds(){
 function openAIUnreportedMicros(active:ActiveVoice){
   // Counters are cumulative. A late/duplicate done event cannot erase input for
   // the next turn. UTF-8 bytes conservatively cover text tokens, including Chinese.
-  return Math.ceil(Math.max(0,active.openAIInputAudioMs-active.openAIAccountedInputMs)*.32+Math.max(0,active.openAIOutputAudioMs-active.openAIAccountedOutputMs)*1.28+Math.max(0,active.openAITextChars-active.openAIAccountedTextBytes)*4+active.openAIInputAudioMs*.05);
+  const transcriptionMicrosPerMs=active.openAITranscriptionModel==='whisper-1'?.1:.05;
+  return Math.ceil(Math.max(0,active.openAIInputAudioMs-active.openAIAccountedInputMs)*.32+Math.max(0,active.openAIOutputAudioMs-active.openAIAccountedOutputMs)*1.28+Math.max(0,active.openAITextChars-active.openAIAccountedTextBytes)*4+Math.max(0,active.openAIInputAudioMs-active.openAIAccountedTranscriptionMs)*transcriptionMicrosPerMs);
 }
 
 function openAISpendingReached(active:ActiveVoice){
@@ -446,7 +459,7 @@ function stopForOpenAISpending(active:ActiveVoice,message:string,usageUncertain=
   if(active.openAIAudioPending){
     active.openAIUsageUncertain=true;
     if(active.upstream?.readyState===WebSocket.OPEN)active.upstream.send(JSON.stringify({type:'input_audio_buffer.clear'}));
-    active.openAIAudioPending=false;
+    active.openAIAudioPending=false;active.openAIUncommittedSpeech=false;
   }
   void closeVoiceSession(active.sessionId,500).catch(()=>closeBoth(active,1011,'spending protection'));
 }
@@ -463,8 +476,38 @@ function openAITurnId(active:ActiveVoice,itemId:string){
   return `${active.sessionId}:voice:${active.connectionId}:item:${itemId.replace(/[^A-Za-z0-9_.:-]/g,'_').slice(0,256)}`;
 }
 
+function openAIAssistantTurnId(baseTurnId:string,itemId:string){return `${baseTurnId}:assistant:${itemId.replace(/[^A-Za-z0-9_.:-]/g,'_').slice(0,128)}`;}
+
+function openAIItemId(){return `msg_${randomUUID().replace(/-/g,'').slice(0,28)}`;}
+type OpenAIErrorCategory='quota'|'rate_limit'|'configuration'|'general';
+function safeOpenAIErrorField(value:unknown){return typeof value==='string'&&!/^sk[-_]/i.test(value)&&/^[A-Za-z0-9_.:/-]{1,80}$/.test(value)?value:null;}
+function classifyOpenAIError(code:string|null,type:string|null,param:string|null):OpenAIErrorCategory {
+  const signal=`${code??''} ${type??''}`.toLowerCase();
+  if(/quota|billing|credit|balance/.test(signal))return 'quota';
+  if(/rate[_-]?limit|too_many_requests/.test(signal))return 'rate_limit';
+  if(param||/invalid|unsupported|model_not_found|configuration|parameter/.test(signal))return 'configuration';
+  return 'general';
+}
+function openAIClientError(category:OpenAIErrorCategory){
+  if(category==='quota')return {message:'OpenAI API 额度或余额不可用，本次语音已停止。请补充额度后再试。',code:'provider_quota',retryable:false};
+  if(category==='rate_limit')return {message:'OpenAI 实时语音请求过于频繁，本次语音已停止。请稍后再试。',code:'provider_rate_limit',retryable:true};
+  if(category==='configuration')return {message:'OpenAI 实时语音配置被服务拒绝，本次语音已停止。请检查模型配置。',code:'provider_configuration',retryable:false};
+  return {message:'OpenAI 实时语音服务发生错误，本次语音已停止。请稍后再试。',code:'provider_error',retryable:true};
+}
+
+function finishOpenAIInput(active:ActiveVoice){
+  if(!active.upstream||active.upstream.readyState!==WebSocket.OPEN||active.openAICommitPending||active.openAIVadCommitPending)return;
+  if((active.openAISpeechActive||active.openAIUncommittedSpeech)&&active.openAIAudioPending){
+    active.upstream.send(JSON.stringify({type:'input_audio_buffer.commit'}));
+    active.openAIAudioPending=false;active.openAICommitPending=true;
+  }else if(active.openAIAudioPending){
+    active.upstream.send(JSON.stringify({type:'input_audio_buffer.clear'}));
+    active.openAIAudioPending=false;active.openAIUncommittedSpeech=false;
+  }
+}
+
 function maybeFinishOpenAI(active:ActiveVoice){
-  if(!active.closing||active.openAIAudioPending||active.openAICommitPending||active.openAIResponseActive||active.openAIPendingInputIds.size)return;
+  if(!active.closing||active.openAIAudioPending||active.openAICommitPending||active.openAISpeechActive||active.openAIUncommittedSpeech||active.openAIVadCommitPending||active.openAIResponseActive||active.openAIPendingInputIds.size)return;
   if(active.finalizeTimer)clearTimeout(active.finalizeTimer);
   active.finalizeTimer=setTimeout(()=>{void closeBoth(active).catch(()=>finishActive(active,true));},100);
 }
@@ -497,7 +540,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
         type:'realtime',
         output_modalities:['audio'],instructions:systemInstruction(active.context),max_output_tokens:OPENAI_MAX_OUTPUT_TOKENS,
         audio:{
-          input:{format:{type:'audio/pcm',rate:24_000},transcription:{model:'gpt-4o-mini-transcribe',language:'zh'},turn_detection:{type:'server_vad',create_response:true,interrupt_response:true,prefix_padding_ms:300,silence_duration_ms:500}},
+          input:{format:{type:'audio/pcm',rate:24_000},transcription:{model:active.openAITranscriptionModel,language:'zh'},turn_detection:{type:'server_vad',create_response:true,interrupt_response:true,prefix_padding_ms:300,silence_duration_ms:1000}},
           output:{format:{type:'audio/pcm',rate:24_000},voice:'marin'},
         },
       },
@@ -509,8 +552,8 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
     active.openAIReady=true;
     await active.hooks.status(active.sessionId,'listening');
     send(active.browser,{type:'ready',inputSampleRate:24_000,outputSampleRate:24_000});
-    const itemId=`msg_${randomUUID().replace(/-/g,'')}`;
-    const opening='请根据系统提供的当前案例资料，现在用简体中文自然地提出一个最重要、尚未得到答案的问题。只问一个问题。';
+    const itemId=openAIItemId();
+    const opening='请根据系统提供的当前案例资料，现在用简体中文自然地提出一个最重要、尚未得到答案的独立问题。只问一个问题，不要追加“另外”或第二问。';
     active.openAITextChars+=Buffer.byteLength(opening,'utf8');
     if(checkOpenAISpending(active))return;
     source.send(JSON.stringify({type:'conversation.item.create',item:{id:itemId,type:'message',role:'user',content:[{type:'input_text',text:opening}]}}));
@@ -521,19 +564,27 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
   if(type==='input_audio_buffer.speech_started'){
     const itemId=typeof event.item_id==='string'?event.item_id:`input_${randomUUID()}`;
     active.openAIPendingInputIds.add(itemId);
+    active.openAISpeechActive=true;active.openAIUncommittedSpeech=true;active.openAIVadCommitPending=false;
     const interruptedItem=active.openAIResponseActive?active.lastOutputItemId:null;
     if(interruptedItem)active.openAIInterrupted.add(interruptedItem);
     if(interruptedItem)send(active.browser,{type:'interrupted',itemId:interruptedItem});
     await active.hooks.status(active.sessionId,'listening');
     return;
   }
-  if(type==='input_audio_buffer.committed'||type==='input_audio_buffer.speech_stopped'){
+  if(type==='input_audio_buffer.speech_stopped'){
+    active.openAISpeechActive=false;active.openAIUncommittedSpeech=false;active.openAIVadCommitPending=true;active.openAIAudioPending=false;
+    if(typeof event.item_id==='string')active.openAIPendingInputIds.add(event.item_id);
+    maybeFinishOpenAI(active);return;
+  }
+  if(type==='input_audio_buffer.committed'){
+    const wasVADCommit=active.openAIVadCommitPending;
+    active.openAISpeechActive=false;active.openAIUncommittedSpeech=false;active.openAIVadCommitPending=false;
     active.openAIAudioPending=false;
-    if(type==='input_audio_buffer.committed')active.openAICommitPending=false;
+    if(!wasVADCommit)active.openAICommitPending=false;
     if(typeof event.item_id==='string'){
       const turnId=openAITurnId(active,event.item_id);
       active.openAIPendingInputIds.add(event.item_id);
-      if(type==='input_audio_buffer.committed'&&!active.openAIQueuedInputIds.has(event.item_id)){
+      if(!active.openAIQueuedInputIds.has(event.item_id)){
         active.openAIQueuedInputIds.add(event.item_id);active.openAIPendingTurnIds.push(turnId);
       }
     }
@@ -553,7 +604,9 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
     await persistTranscript(active,'user',text,true,false,event.item_id,openAITurnId(active,event.item_id));
     try{
       if(!active.openAIUsageId||event.usage===undefined)throw new Error('missing transcription usage');
-      recordUsage(active.openAIUsageId,`transcription:${event.item_id}`,'transcription',event.usage,event.item_id);
+      const inserted=recordUsage(active.openAIUsageId,`transcription:${event.item_id}`,'transcription',event.usage,event.item_id);
+      const usage=event.usage as {type?:unknown;seconds?:unknown};
+      if(inserted&&usage.type==='duration'&&typeof usage.seconds==='number'&&Number.isFinite(usage.seconds)&&usage.seconds>=0)active.openAIAccountedTranscriptionMs+=Math.round(usage.seconds*1_000);
     }catch{
       active.openAIUsageUncertain=true;
       stopForOpenAISpending(active,'实时转写未返回可核对的用量，本次语音已停止并保留费用预留。',true);
@@ -585,13 +638,14 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
       active.lastOutputItemId=item.id;active.lastOutputAudioMs=0;
       const responseId=typeof event.response_id==='string'?event.response_id:active.openAICurrentResponseId;
       if(responseId)active.openAIItemResponseIds.set(item.id,responseId);
-      active.openAIOutputTurnIds.set(item.id,active.openAICurrentResponseTurnId||openAITurnId(active,item.id));
+      const baseTurnId=active.openAICurrentResponseTurnId||openAITurnId(active,item.id);
+      active.openAIOutputTurnIds.set(item.id,openAIAssistantTurnId(baseTurnId,item.id));
     }
     return;
   }
   if(type==='response.output_audio.delta'){
     if(typeof event.item_id!=='string'||typeof event.delta!=='string')return;
-    if(!active.openAIOutputTurnIds.has(event.item_id))active.openAIOutputTurnIds.set(event.item_id,active.openAICurrentResponseTurnId||openAITurnId(active,event.item_id));
+    if(!active.openAIOutputTurnIds.has(event.item_id)){const baseTurnId=active.openAICurrentResponseTurnId||openAITurnId(active,event.item_id);active.openAIOutputTurnIds.set(event.item_id,openAIAssistantTurnId(baseTurnId,event.item_id));}
     const durationMs=base64PcmDurationMs(event.delta);
     active.lastOutputItemId=event.item_id;active.lastOutputAudioMs+=durationMs;active.openAIOutputAudioMs+=durationMs;
     const responseId=typeof event.response_id==='string'?event.response_id:active.openAIItemResponseIds.get(event.item_id)||active.openAICurrentResponseId;
@@ -603,7 +657,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
   }
   if(type==='response.output_audio_transcript.delta'){
     if(typeof event.item_id==='string'&&typeof event.delta==='string'){
-      if(!active.openAIOutputTurnIds.has(event.item_id))active.openAIOutputTurnIds.set(event.item_id,active.openAICurrentResponseTurnId||openAITurnId(active,event.item_id));
+      if(!active.openAIOutputTurnIds.has(event.item_id)){const baseTurnId=active.openAICurrentResponseTurnId||openAITurnId(active,event.item_id);active.openAIOutputTurnIds.set(event.item_id,openAIAssistantTurnId(baseTurnId,event.item_id));}
       const text=mergeTranscript(active.openAIOutputText.get(event.item_id)||'',event.delta);
       active.openAIOutputText.set(event.item_id,text);send(active.browser,{type:'transcript',role:'assistant',text,final:false});
     }
@@ -611,6 +665,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
   }
   if(type==='response.output_audio_transcript.done'){
     if(typeof event.item_id!=='string')return;
+    if(!active.openAIOutputTurnIds.has(event.item_id)){const baseTurnId=active.openAICurrentResponseTurnId||openAITurnId(active,event.item_id);active.openAIOutputTurnIds.set(event.item_id,openAIAssistantTurnId(baseTurnId,event.item_id));}
     const text=typeof event.transcript==='string'?event.transcript:active.openAIOutputText.get(event.item_id)||'';
     active.openAIOutputText.delete(event.item_id);
     active.openAICompletedOutputs.set(event.item_id,text);
@@ -646,8 +701,17 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
     await flushOpenAITurnComplete(active);if(!checkOpenAISpending(active))maybeFinishOpenAI(active);return;
   }
   if(type==='error'){
-    const error=event.error as {message?:unknown}|undefined;
-    await failActive(active,typeof error?.message==='string'?'实时语音服务拒绝了请求，可继续使用文字。':'实时语音服务发生错误，可继续使用文字。');
+    const error=event.error as {code?:unknown;type?:unknown;param?:unknown}|undefined;
+    const diagnostic={code:safeOpenAIErrorField(error?.code),type:safeOpenAIErrorField(error?.type),param:safeOpenAIErrorField(error?.param)};
+    if(diagnostic.code==='input_audio_buffer_commit_empty'&&active.openAICommitPending){
+      active.openAICommitPending=false;active.openAIAudioPending=false;active.openAISpeechActive=false;active.openAIUncommittedSpeech=false;
+      maybeFinishOpenAI(active);return;
+    }
+    const category=classifyOpenAIError(diagnostic.code,diagnostic.type,diagnostic.param);
+    console.error('openai_realtime_error',{...diagnostic,category});
+    active.openAIUsageUncertain=true;
+    const client=openAIClientError(category);
+    await failActive(active,client.message,{code:client.code,retryable:client.retryable});
   }
 }
 
@@ -724,17 +788,24 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
   const identity = hooks.consumeToken(token);
   if (!identity || !hooks.isActive(identity.sessionId)) return browser.close(1008, 'invalid or expired token');
 
-  const config = options.configOverride||(realtimeVoiceConfig() as {provider:'gemini'|'openai';apiKey:string;model:string}|null);
+  let config:{provider:'gemini'|'openai';apiKey:string;model:string;transcriptionModel?:OpenAITranscriptionModel}|null;
+  try{config=options.configOverride||realtimeVoiceConfig();}
+  catch{
+    send(browser,{type:'unavailable',code:'transcription_config',retryable:false,message:'OpenAI 转写模型配置无效，未建立付费语音连接。'});
+    return browser.close(1013,'invalid transcription config');
+  }
   if (!config) {
     send(browser, { type: 'unavailable', message: '实时语音未配置，可继续使用文字。' });
     return browser.close(1013, 'voice not configured');
   }
   const { apiKey, model } = config;
   let openAIUsage:{id:string;reservedMicros:number}|null=null,openAIMaxSeconds=0;
+  let openAITranscriptionModel:OpenAITranscriptionModel='gpt-4o-mini-transcribe';
   if(config.provider==='openai'){
     try{
       openAIMaxSeconds=openAIVoiceMaxSeconds();
-      openAIUsage=beginUsage({context:{caseId:identity.caseId,sessionId:identity.sessionId},operation:'realtime',model});
+      openAITranscriptionModel=requireOpenAITranscriptionModel(config.transcriptionModel);
+      openAIUsage=beginUsage({context:{caseId:identity.caseId,sessionId:identity.sessionId},operation:'realtime',model,transcriptionModel:openAITranscriptionModel});
     }catch{
       send(browser,{type:'unavailable',code:'spending_limit',retryable:false,message:'OpenAI 费用保护额度不足或计费配置不可用，未建立付费语音连接。'});
       return browser.close(1013,'spending protection');
@@ -784,6 +855,9 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
     openAIOutputTurnIds:new Map(),
     openAIAudioPending:false,
     openAICommitPending:false,
+    openAISpeechActive:false,
+    openAIUncommittedSpeech:false,
+    openAIVadCommitPending:false,
     openAIResponseActive:false,
     openAITurnCompletePending:0,
     openAIReady:false,
@@ -793,6 +867,8 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
     openAIResponsesStarted:0,
     openAIResponsesAccounted:0,
     openAIInputAudioMs:0,
+    openAITranscriptionModel,
+    openAIAccountedTranscriptionMs:0,
     openAIOutputAudioMs:0,
     openAITextChars:Buffer.byteLength(systemInstruction(context),'utf8'),
     openAIAccountedInputMs:0,
@@ -885,7 +961,7 @@ export function closeVoiceSession(sessionId: string, timeoutMs = 1_500): Promise
   });
   if(active.upstream?.readyState===WebSocket.OPEN){
     if(active.provider==='openai'){
-      if(active.openAIAudioPending){active.upstream.send(JSON.stringify({type:'input_audio_buffer.commit'}));active.openAIAudioPending=false;active.openAICommitPending=true;}
+      finishOpenAIInput(active);
       maybeFinishOpenAI(active);
     }else active.upstream.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
   }

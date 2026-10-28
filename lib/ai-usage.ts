@@ -4,10 +4,11 @@ export type UsageOperation='interview'|'extraction'|'report'|'realtime';
 export type UsageContext={caseId:string;sessionId?:string};
 export type UsageOutcome='settled'|'unknown'|'released';
 export type UsageEventKind='responses'|'realtime'|'transcription';
+export type TranscriptionModel='whisper-1'|'gpt-4o-mini-transcribe';
 export class UsageBudgetError extends Error {readonly code='AI_BUDGET_LIMIT';}
 export class UsageDataError extends Error {readonly code='AI_USAGE_DATA';}
 type UsageStatus='reserved'|UsageOutcome;
-type UsageCallRow={id:string;org_id:string;case_id:string;session_id:string|null;model:string;operation:UsageOperation;status:UsageStatus;reserved_micros:number;actual_micros:number;budget_day_utc:string;budget_month_utc:string;created_at:string;settled_at:string|null};
+type UsageCallRow={id:string;org_id:string;case_id:string;session_id:string|null;model:string;transcription_model:TranscriptionModel;operation:UsageOperation;status:UsageStatus;reserved_micros:number;actual_micros:number;budget_day_utc:string;budget_month_utc:string;created_at:string;settled_at:string|null};
 type ScopeSummary={costMicros:number;heldMicros:number;remainingMicros:number};
 export type UsageSummary={
   estimatedNotBilled:boolean;
@@ -21,7 +22,7 @@ export type UsageSummary={
   records:Array<{id:string;operation:UsageOperation;model:string;status:string;createdAt:string;costMicros:number;reservedMicros:number;inputTokens:number;outputTokens:number;cachedTokens:number;inputAudioTokens:number;outputAudioTokens:number;transcriptionSeconds:number}>;
 };
 
-const RATE_CARD_VERSION='openai-2026-10-28';
+const RATE_CARD_VERSION='openai-2026-10-28-whisper';
 const DEFAULT_TEXT_RESERVATION_MICROS=50_000;
 const MIN_REALTIME_RESERVATION_MICROS=50_000;
 const MONEY_SCALE=1_000_000;
@@ -29,7 +30,10 @@ const MODEL_RATES={
   'gpt-6-luna':{input:0.10,cached:0.01,output:0.50},
   'gpt-realtime-2.1':{textInput:4,cached:0.40,audioInput:32,textOutput:24,audioOutput:64},
 } as const;
-const TRANSCRIPTION_RATES={textInput:1.25,audioInput:1.25,output:5,durationPerMinute:0.003} as const;
+const TRANSCRIPTION_RATES={
+  'gpt-4o-mini-transcribe':{textInput:1.25,audioInput:1.25,output:5,durationPerMinute:0.003},
+  'whisper-1':{durationPerMinute:0.006},
+} as const;
 
 function integer(value:unknown,name:string){
   if(typeof value!=='number'||!Number.isSafeInteger(value)||value<0)throw new UsageDataError(`Invalid OpenAI usage field: ${name}.`);
@@ -83,8 +87,10 @@ function validateModel(operation:UsageOperation,model:string){
   }else if(model!=='gpt-6-luna')throw new UsageBudgetError('所选文字模型没有已批准的费率表，已停止调用。');
 }
 
-export function beginUsage(input:{context:UsageContext;operation:UsageOperation;model:string;reserveMicros?:number}){
+export function beginUsage(input:{context:UsageContext;operation:UsageOperation;model:string;transcriptionModel?:TranscriptionModel;reserveMicros?:number}){
   validateModel(input.operation,input.model);
+  const transcriptionModel=input.transcriptionModel??'gpt-4o-mini-transcribe';
+  if(transcriptionModel!=='whisper-1'&&transcriptionModel!=='gpt-4o-mini-transcribe')throw new UsageBudgetError('所选语音转写模型没有已批准的费率表，已停止调用。');
   const requested=input.reserveMicros===undefined?null:integer(input.reserveMicros,'reserveMicros');
   if(requested===0)throw new UsageBudgetError('费用预留必须大于零。');
   return transaction(()=>{
@@ -98,13 +104,13 @@ export function beginUsage(input:{context:UsageContext;operation:UsageOperation;
     const reservation=requested??(input.operation==='realtime'?available:DEFAULT_TEXT_RESERVATION_MICROS);
     if(reservation<=0||reservation>available||(input.operation==='realtime'&&reservation<MIN_REALTIME_RESERVATION_MICROS))throw new UsageBudgetError('已达到 OpenAI 应用费用上限。');
     const usageId=id(),createdAt=now();
-    db().prepare('INSERT INTO ai_usage_calls(id,org_id,case_id,session_id,provider,model,operation,status,reserved_micros,actual_micros,budget_day_utc,budget_month_utc,rate_card_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(usageId,identity.org_id,input.context.caseId,input.context.sessionId??null,'openai',input.model,input.operation,'reserved',reservation,0,buckets.day,buckets.month,RATE_CARD_VERSION,createdAt);
+    db().prepare('INSERT INTO ai_usage_calls(id,org_id,case_id,session_id,provider,model,transcription_model,operation,status,reserved_micros,actual_micros,budget_day_utc,budget_month_utc,rate_card_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(usageId,identity.org_id,input.context.caseId,input.context.sessionId??null,'openai',input.model,transcriptionModel,input.operation,'reserved',reservation,0,buckets.day,buckets.month,RATE_CARD_VERSION,createdAt);
     return {id:usageId,reservedMicros:reservation};
   });
 }
 
-function normalizedUsage(model:string,kind:UsageEventKind,usage:unknown){
+function normalizedUsage(model:string,transcriptionModel:TranscriptionModel,kind:UsageEventKind,usage:unknown){
   const value=object(usage,'usage');
   let inputTokens=0,cachedInputTokens=0,outputTokens=0,inputTextTokens=0,inputAudioTokens=0,cachedTextTokens=0,cachedAudioTokens=0,outputTextTokens=0,outputAudioTokens=0,transcriptionMs=0,estimatedMicros=0;
   if(kind==='responses'){
@@ -129,12 +135,14 @@ function normalizedUsage(model:string,kind:UsageEventKind,usage:unknown){
   }else{
     if(value.type==='duration'){
       const seconds=value.seconds;if(typeof seconds!=='number'||!Number.isFinite(seconds)||seconds<0)throw new UsageDataError('Invalid transcription duration.');
-      transcriptionMs=Math.round(seconds*1_000);estimatedMicros=Math.ceil(seconds/60*TRANSCRIPTION_RATES.durationPerMinute*MONEY_SCALE);
+      transcriptionMs=Math.round(seconds*1_000);estimatedMicros=Math.ceil(seconds/60*TRANSCRIPTION_RATES[transcriptionModel].durationPerMinute*MONEY_SCALE);
     }else if(value.type==='tokens'){
+      if(transcriptionModel==='whisper-1')throw new UsageDataError('Whisper transcription usage requires duration in seconds.');
+      const rate=TRANSCRIPTION_RATES[transcriptionModel];
       inputTokens=integer(value.input_tokens,'input_tokens');outputTokens=integer(value.output_tokens,'output_tokens');
       const details=object(value.input_token_details,'input_token_details');inputTextTokens=integer(details.text_tokens,'input_token_details.text_tokens');inputAudioTokens=integer(details.audio_tokens,'input_token_details.audio_tokens');
       if(inputTextTokens+inputAudioTokens!==inputTokens)throw new UsageDataError('Transcription input token details are inconsistent.');
-      estimatedMicros=Math.ceil(inputTextTokens*TRANSCRIPTION_RATES.textInput+inputAudioTokens*TRANSCRIPTION_RATES.audioInput+outputTokens*TRANSCRIPTION_RATES.output);
+      estimatedMicros=Math.ceil(inputTextTokens*rate.textInput+inputAudioTokens*rate.audioInput+outputTokens*rate.output);
     }else throw new UsageDataError('Invalid transcription usage type.');
   }
   return {inputTokens,cachedInputTokens,outputTokens,inputTextTokens,inputAudioTokens,cachedTextTokens,cachedAudioTokens,outputTextTokens,outputAudioTokens,transcriptionMs,estimatedMicros};
@@ -147,7 +155,7 @@ export function recordUsage(callId:string,eventKey:string,kind:UsageEventKind,us
   return transaction(()=>{
     const row=usageCall(callId);
     if(db().prepare('SELECT id FROM ai_usage_events WHERE call_id=? AND event_key=?').get(callId,eventKey))return false;
-    const event=normalizedUsage(row.model,kind,usage),eventId=id();
+    const event=normalizedUsage(row.model,row.transcription_model,kind,usage),eventId=id();
     const detail={inputTokens:event.inputTokens,cachedInputTokens:event.cachedInputTokens,outputTokens:event.outputTokens,inputTextTokens:event.inputTextTokens,inputAudioTokens:event.inputAudioTokens,cachedTextTokens:event.cachedTextTokens,cachedAudioTokens:event.cachedAudioTokens,outputTextTokens:event.outputTextTokens,outputAudioTokens:event.outputAudioTokens,transcriptionMs:event.transcriptionMs};
     const inserted=db().prepare('INSERT OR IGNORE INTO ai_usage_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(eventId,callId,eventKey,kind,requestId??null,event.inputTokens,event.cachedInputTokens,event.outputTokens,event.inputTextTokens,event.inputAudioTokens,event.cachedTextTokens,event.cachedAudioTokens,event.outputTextTokens,event.outputAudioTokens,event.transcriptionMs,event.estimatedMicros,pack(detail),now()).changes;

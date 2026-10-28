@@ -1,11 +1,18 @@
 /** Explicit cloud selection is required; incomplete cloud configuration never passes as mock success. */
-export interface CloudModelConfig { provider:'gemini'|'openai'; apiKey:string; model:string }
+export type OpenAITranscriptionModel='whisper-1'|'gpt-4o-mini-transcribe';
+export interface CloudModelConfig { provider:'gemini'|'openai'; apiKey:string; model:string; transcriptionModel?:OpenAITranscriptionModel }
+
+export function requireOpenAITranscriptionModel(value=process.env.OPENAI_TRANSCRIPTION_MODEL):OpenAITranscriptionModel {
+  const model=value?.trim()||'gpt-4o-mini-transcribe';
+  if(model!=='whisper-1'&&model!=='gpt-4o-mini-transcribe')throw new Error('Unsupported OPENAI_TRANSCRIPTION_MODEL.');
+  return model;
+}
 
 function cloudConfig(selector:'LLM_PROVIDER'|'VOICE_PROVIDER',modelKey:'GEMINI_MODEL'|'GEMINI_LIVE_MODEL'):CloudModelConfig|null {
   if(process.env[selector]?.trim()==='openai'){
     const apiKey=process.env.OPENAI_API_KEY?.trim();
     const model=process.env[selector==='LLM_PROVIDER'?'OPENAI_MODEL':'OPENAI_REALTIME_MODEL']?.trim();
-    return apiKey&&model?{provider:'openai',apiKey,model}:null;
+    return apiKey&&model?{provider:'openai',apiKey,model,...(selector==='VOICE_PROVIDER'?{transcriptionModel:requireOpenAITranscriptionModel()}: {})}:null;
   }
   if(process.env[selector]?.trim()!=='gemini') return null;
   const apiKey=process.env.GEMINI_API_KEY?.trim();
