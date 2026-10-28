@@ -19,7 +19,7 @@ VOICE_PROVIDER=mock
 
 mock 是显式选择，不是“缺少密钥后的隐式云端回退”。它不会调用网络，不要求 API 密钥，也不把模拟结果标记为真实服务结果。
 
-## 后续云端配置
+## 云端配置
 
 只有显式把 `LLM_PROVIDER` 或 `VOICE_PROVIDER` 设置为 `openai`／`gemini`，并同时提供该能力所需的密钥与准确模型名，程序才启用对应云端适配器：
 
@@ -33,6 +33,8 @@ mock 是显式选择，不是“缺少密钥后的隐式云端回退”。它不
 - `GEMINI_TIMEOUT_MS`：结构化分析超时，默认 30000 毫秒。
 
 文字访谈与后台处理按所选 Provider 使用 OpenAI Responses REST API 或 Gemini Interactions REST API，均使用 JSON Schema 并设置 `store=false`。OpenAI 的拒答、不完整响应、HTTP 失败或结构不合法会明确失败，不会切换成模拟结果。
+
+当前本机验证选择 `OPENAI_MODEL=gpt-6-luna` 与 `OPENAI_REALTIME_MODEL=gpt-realtime-2.1`。真实 `GET /v1/models` 已返回 HTTP 200，证明凭证认证成功且列表中可见这两个模型；这不证明项目具有推理额度、模型输出质量或 Realtime 会话权限。随后项目真实 InterviewAgent 对一句合成客户输入发起 Responses 请求，收到 HTTP 429 `credit_balance_exhausted`／`insufficient_quota`，未得到 `reply` 或 `facts`。需补充可用余额／额度后重试，不能把模型列表可见写成推理通过。
 
 单个 InterviewAgent 负责自然下一问与候选事实；文字模式逐轮保存，语音模式结束后从最终客户转写提取并保存。上下文包含当前案例的已知事实、最近 60 条最终对话、建档州和语言、缺失项及冲突项。建档信息不伪装成对话来源，顾问更正有独立来源标记且不能被模型当成新客户陈述。原文中的常见邮箱、电话和日期形式会脱敏，但这不是通用去标识保证；示范阶段使用合成客户。
 
@@ -58,7 +60,7 @@ OpenAI Realtime 使用服务端 Bearer 鉴权连接 `/v1/realtime`，API key 不
 
 自动测试覆盖：身份字段过滤和文本脱敏、四类别及案例内证据验证、未配置状态、同源 WebSocket 检查、一次性凭证消费、缺少云端配置时清晰失败；Gemini Live 假上游验证案例上下文只由服务端写入 setup、受控主动首问、自动 VAD／打断配置、最终转写、断线唯一 turn ID、超时残留 `final=false`、session resumption 以及恢复时不重复首问。OpenAI 假上游验证 Bearer 服务端连接、24kHz 输入／输出、案例指令、主动首问、自动 VAD、speech-started 停播、受限截断、source item ID、最终字幕和正常 drain。浏览器单测验证获取短凭证失败时麦克风轨道与 AudioContext 会立即释放。
 
-尚未执行：真实 OpenAI Realtime 调用、真实 Gemini API 调用、真实云端音频、手机麦克风、回声消除效果、锁屏／后台恢复、网络重连时序和真实 HTTPS 代理。用户曾授权安全创建 OpenAI key，但本机写入确认未获批准，因此没有创建或写入 key，也没有进行真实调用。浏览器的 OpenAI 截断毫秒数使用实际 `AudioContext.currentTime` 并限制在已收到音频长度内，但不同手机的系统输出缓冲、蓝牙延迟和回声路径仍可能造成少量偏差；只有目标手机真机测试能验证听感与截断精度。以后配置密钥后仍需用普通话在实际目标手机上逐项验收，不能把假上游自动测试视为真实服务通过。
+真实验证分层：OpenAI 凭证认证／模型列表请求已成功；OpenAI Responses 真实访谈请求已发出但因 API 余额不足失败，没有模型输出；真实 OpenAI Realtime、真实 Gemini API、真实云端音频、手机麦克风、回声消除、锁屏／后台恢复、网络重连时序和真实 HTTPS 代理均未执行。浏览器的 OpenAI 截断毫秒数使用实际 `AudioContext.currentTime` 并限制在已收到音频长度内，但不同手机的系统输出缓冲、蓝牙延迟和回声路径仍可能造成少量偏差；只有补足 API 额度并完成目标手机真机测试，才能验证听感与截断精度。假上游自动测试不能视为真实服务通过。
 
 ## Ollama 与其他本地 Provider
 
