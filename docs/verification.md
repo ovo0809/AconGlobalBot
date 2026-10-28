@@ -9,7 +9,10 @@
 - `npm run build`：通过。中文合成 PDF 共 3 页，已用 Poppler 逐页渲染检查来源标签、中文、页码与边界；调整了整节分页与页脚保留空间。
 - `npm run test:e2e`：4/4 Chromium 工作流通过，证明没有客户端 `generateReport` 请求时仍自动生成报告；文字云端失败后保留回答、相同 eventId 重试；预览与权限正常。
 - 最终生产构建实际启动后，用合成客户执行登录→访谈→结束→独立后台报告：返回顾问原案例，任务 `ready`，PDF HTTP 200／111768 字节，邮件任务 0。运行配置仍为明确的 mock，未接通真实语音。
-- OpenAI/Gemini HTTP 与 WebSocket 使用假上游。**没有真实 API 调用，没有目标手机测试。** 本机密钥写入确认未获批准，没有创建或保存密钥。
+- OpenAI/Gemini 的功能回归仍使用假上游。本机安全密钥已写入 Git 忽略的 `.env.local`，未读取或记录密钥值。2026-10-27 21:01:44（America/Los_Angeles；UTC 2026-10-28 04:01:44）真实 `GET https://api.openai.com/v1/models` 返回 HTTP 200，证明认证成功；返回列表包含 `gpt-6-luna` 与 `gpt-realtime-2.1`，但模型可见不代表推理权限或质量通过。
+- 2026-10-28 04:02:54Z，运行 `node --import tsx tmp/probe-interview.ts`，以 `LLM_PROVIDER=openai`、`OPENAI_MODEL=gpt-6-luna` 调用项目真实 `interviewWithProvider`。合成输入为“我希望为孩子准备家庭保障。我每年的收入是80000美元。”；OpenAI Responses 请求返回 HTTP 429，`credit_balance_exhausted`／`insufficient_quota`。没有真实 AI 回复或事实提取。脱敏原始记录位于本机 `tmp/validation/openai-connectivity.json` 与 `tmp/validation/openai-interview.json`，不含密钥。
+- 未执行真实 Realtime 音频、目标手机、完整真实访谈→事实→后台报告／PDF 链路。当前阻碍是 API 可用余额／额度；认证通过不能标记为真实推理通过。
+- 用户选择暂不充值并保留配置，因此本轮没有重试生成请求，也没有继续实时语音测试。
 - 完整逐项状态和真机记录表见 [acceptance.md](acceptance.md)。本轮通过的是工程自动检查，不是 Charles 首版交付验收。
 
 以下为上一版历史检查记录，保留用于比较。

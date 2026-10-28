@@ -33,19 +33,19 @@
 
 ## OpenAI 验证准入
 
-默认 `.env.local` 保持 `LLM_PROVIDER=mock` 与 `VOICE_PROVIDER=mock`。进入 Charles 首版真实服务验证时，需经获准的本机流程写入密钥，再显式设置：
+默认开发模式保持 `LLM_PROVIDER=mock` 与 `VOICE_PROVIDER=mock`，避免无意联网。进入受控 OpenAI 验证时，本机使用 Git 忽略的 `.env.local` 显式设置：
 
 ```dotenv
 LLM_PROVIDER=openai
 VOICE_PROVIDER=openai
-OPENAI_API_KEY=<本机安全写入的密钥>
-OPENAI_MODEL=<该账户实际可用的文字模型>
-OPENAI_REALTIME_MODEL=<该账户实际可用的实时模型>
+OPENAI_API_KEY=<仅存在于本机环境>
+OPENAI_MODEL=gpt-6-luna
+OPENAI_REALTIME_MODEL=gpt-realtime-2.1
 ```
 
-key picker 已选择 `AECON`，但本机 `.env.local` 写入确认结果为 `not_approved/decline`，因此目前没有创建或写入密钥，也没有执行真实 API 测试。不要把密钥提交到 Git、粘贴到聊天或复制到本文；不要猜测具体模型名。Gemini 变量与适配器继续保留，可作为单独验证的可选 Provider。
+安全密钥已写入本机环境且未进入 Git。不要读取、打印、提交、粘贴或复制密钥到文档。真实模型列表请求 HTTP 200，只证明认证成功；项目真实 InterviewAgent 请求随后因 `credit_balance_exhausted`／`insufficient_quota` 返回 HTTP 429，没有生成回复或事实。模型列表中可见 `gpt-6-luna`、`gpt-realtime-2.1` 不等于推理或实时语音已验收。Gemini 变量与适配器继续保留，可作为单独验证的可选 Provider。
 
-启用后先用合成案例分别验证文字 API 与实时语音，再进入手机矩阵。模拟测试、真实 API 测试和目标手机测试必须分别记录；任何一层通过都不能替代下一层。
+下一步先在对应 API 账户补充可用余额／额度，再用同一合成输入重试文字 InterviewAgent；成功后继续验证完整访谈、最终事实、后台报告与 PDF。随后再单独验证实时音频，最后进入手机矩阵。模拟测试、认证请求、真实推理、实时音频和目标手机测试必须分别记录；任何一层通过都不能替代下一层。
 
 ## 手机 HTTPS
 
