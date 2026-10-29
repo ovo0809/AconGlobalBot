@@ -7,6 +7,8 @@ import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIE
 import { closeVoiceSession, forgetVoiceSession, type VoiceDiagnosticEvent } from './voice-server';
 import { DryRunMailProvider } from './mail';
 import { getUsageSummary, purgeCaseUsage, recoverUsageReservations, UsageBudgetError } from './ai-usage';
+import { confirmRecording, finishRecording, getRecording, getRecordingAudio, pauseRecording, processRecordingJobs, RecordingError, recordingBlocksCaseDeletion, recordingBlocksCaseMutation, recoverRecordingJobs, resumeRecording, retryRecording, startRecording, uploadRecordingChunk } from './recordings';
+import type { RecordingSegment } from './recording-types';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
 
 type Input=Record<string,unknown>;
@@ -100,14 +102,15 @@ async function respondToText(session:Interview,text:string,eventId:string){
 async function finalizeInterviewFacts(caseId:string){
   const sessions=db().prepare("SELECT * FROM interviews WHERE case_id=? AND state='ended'").all(caseId) as Interview[];
   for(const session of sessions){
-    const input=interviewInput(session);
+    const base=interviewInput(session),recordingSessionId=session.id.startsWith('recording:')?session.id.split(':')[1]:null,input=recordingSessionId?(()=>{const sourceIds=new Set(base.facts.flatMap(fact=>fact.sourceMessageIds)),anchors=base.messages.filter(message=>sourceIds.has(message.id)&&message.sessionId!==session.id),current=base.messages.filter(message=>message.sessionId===session.id);return {...base,messages:[...anchors,...current]};})():base;
     const finalized=input.messages.filter(m=>m.sessionId===session.id&&m.role==='user'&&m.final);
     const hash=digest(pack(finalized));
     const prior=db().prepare('SELECT transcript_hash FROM interview_extractions WHERE session_id=?').get(session.id);
     if(prior?.transcript_hash===hash)continue;
     // A real voice transcript must not silently finish with mock extraction.
     if(finalized.some(m=>m.eventId.includes(':voice:')))requireThat(requireAnalysisConfig(),409,'语音事实提取需要完整的云端文字模型配置。');
-    const before=digest(pack({facts:input.facts,messages:input.messages}));
+    if(recordingSessionId){const recording=db().prepare('SELECT provider FROM recording_sessions WHERE id=?').get(recordingSessionId) as {provider:string}|undefined;if(recording?.provider==='openai')requireThat(requireAnalysisConfig(),409,'真实录音事实提取需要完整的云端文字模型配置。');}
+    const before=digest(pack({facts:base.facts,messages:base.messages}));
     const output=finalized.length?await interviewWithProvider(input,true):null;
     requireThat(before===digest(pack({facts:factsFor(caseId),messages:messagesFor(caseId)})),409,'提取期间资料已变化，请重试。');
     transaction(()=>{for(const fact of output?.facts??[])saveFact(caseId,fact);db().prepare('INSERT INTO interview_extractions VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET transcript_hash=excluded.transcript_hash,updated_at=excluded.updated_at').run(session.id,hash,now());});
@@ -141,7 +144,7 @@ export function recoverReportJobs(){
     for(const job of docs<ReportJob>("SELECT doc FROM report_jobs WHERE status='generating'"))saveReportJob({...job,status:'queued',error:null,updatedAt:now()});
   });
 }
-export function startReportWorker(){if(shared.aeconnReportWorker)return;recoverUsageReservations();recoverReportJobs();shared.aeconnReportWorker=setInterval(()=>{void processReportJobs();},500);shared.aeconnReportWorker.unref();}
+export function startReportWorker(){if(shared.aeconnReportWorker)return;recoverUsageReservations();recoverReportJobs();recoverRecordingJobs();shared.aeconnReportWorker=setInterval(()=>{void processRecordingJobs();void processReportJobs();},500);shared.aeconnReportWorker.unref();}
 
 export function bootstrap(request:Request):Response {
   let auth=readAuth(request);let setCookie:string|undefined;if(!auth){const created=newAuth(request);auth=created.auth;setCookie=created.cookie;}
@@ -173,16 +176,53 @@ export function bootstrap(request:Request):Response {
   return json(data,200,setCookie);
 }
 export function json(value:unknown,status=200,setCookie?:string):Response {const headers:Record<string,string>={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, private','Vary':'Cookie'};if(setCookie)headers['Set-Cookie']=setCookie;return new Response(JSON.stringify(value),{status,headers});}
-export function errorResponse(error:unknown){if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。',...(error instanceof AppError&&error.code?{code:error.code}:{})},error instanceof AppError?error.status:error instanceof UsageBudgetError?429:500);}
+export function errorResponse(error:unknown){if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof RecordingError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。',...((error instanceof AppError||error instanceof RecordingError)&&error.code?{code:error.code}:{})},error instanceof AppError||error instanceof RecordingError?error.status:error instanceof UsageBudgetError?429:500);}
+
+function verifyMutationRequest(request:Request,auth:Auth){
+  requireThat(request.headers.get('x-csrf-token')===auth.csrf,403,'会话校验失败，请刷新页面。');
+  const requestUrl=new URL(request.url),expectedOrigin=process.env.HTTPS_PROXY_ORIGIN||`${requestUrl.protocol}//${request.headers.get('host')||requestUrl.host}`;
+  requireThat(request.headers.get('origin')===expectedOrigin,403,'请求来源校验失败。');
+}
+
+/** Owner-only recording endpoint. Raw audio and unreviewed transcripts never enter bootstrap. */
+export async function recordingRequest(request:Request):Promise<Response>{
+  const auth=readAuth(request);requireThat(auth,401,'会话已过期，请刷新页面。');const user=requireAdvisorMode(auth);requireThat(user.role==='advisor',403,'仅归属顾问可以使用录音转写。');
+  const url=new URL(request.url),queryCaseId=url.searchParams.get('caseId')?.trim()??'';
+  if(request.method==='GET'){
+    requireThat(queryCaseId,400,'缺少案例。');const record=caseFor(user,queryCaseId,true);
+    const audioIndex=url.searchParams.get('audioIndex');
+    if(audioIndex!==null){const bytes=getRecordingAudio(record.id,user,Number(audioIndex));return new Response(bytes,{headers:{'Content-Type':'audio/wav','Content-Length':String(bytes.byteLength),'Cache-Control':'no-store, private','Vary':'Cookie','X-Content-Type-Options':'nosniff'}});}
+    return json(getRecording(record.id,user));
+  }
+  requireThat(request.method==='POST',405,'请求方法不支持。');verifyMutationRequest(request,auth);
+  if((request.headers.get('content-type')??'').split(';',1)[0].trim().toLowerCase()==='audio/wav'){
+    requireThat(queryCaseId,400,'缺少案例。');const record=caseFor(user,queryCaseId,true);const sessionId=url.searchParams.get('sessionId')?.trim()??'',index=Number(url.searchParams.get('index'));requireThat(sessionId,400,'缺少录音会话。');return json(await uploadRecordingChunk(request,record.id,user,sessionId,index));
+  }
+  const raw=await request.text();requireThat(raw.length<=2_000_000,413,'输入过长。');let input:Input;try{input=JSON.parse(raw);}catch{throw new AppError(400,'请求格式错误。');}requireThat(input&&typeof input==='object'&&!Array.isArray(input),400,'请求格式错误。');
+  const caseId=str(input,'caseId',100)||queryCaseId;requireThat(caseId,400,'缺少案例。');const record=caseFor(user,caseId,true);const name=str(input,'action',40),sessionId=str(input,'sessionId',100);
+  if(name==='start'){requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能开始录音。');return json(startRecording(record,user,auth.id,input.consent===true));}
+  requireThat(sessionId,400,'缺少录音会话。');
+  if(name==='pause')return json(pauseRecording(record.id,user,sessionId,str(input,'leaseToken',100)||undefined));
+  if(name==='resume')return json(resumeRecording(record.id,user,sessionId));
+  if(name==='finish')return json(finishRecording(record.id,user,sessionId,Number(input.expectedChunks),str(input,'leaseToken',100)||undefined));
+  if(name==='retry')return json(retryRecording(record.id,user,sessionId));
+  if(name==='confirm'){
+    requireThat(Array.isArray(input.segments)&&input.segments.length<=20_000,400,'转写核对内容无效。');
+    const segments=input.segments.map((value):RecordingSegment=>{requireThat(value&&typeof value==='object'&&!Array.isArray(value),400,'转写核对内容无效。');const item=value as Input;return {id:str(item,'id',100),chunkIndex:0,startSeconds:0,endSeconds:0,originalText:'',text:str(item,'text',8000),speaker:str(item,'speaker',20) as RecordingSegment['speaker']};});
+    const result=confirmRecording(record,user,sessionId,segments);enqueueReport(record.id);return json(result);
+  }
+  throw new AppError(400,'未知录音操作。');
+}
 
 async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:string):Promise<ReportRecord>{
   const existing=locks.get(caseId);if(existing){requireThat(!reviewNote,409,'另一份报告正在生成，请完成后再提交复核。');return existing;}
   const task=(async()=>{
     let record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];requireThat(record,404,'案例不存在。');
     requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(caseId),409,'请先结束访谈，等待转写收尾。');
+    requireThat(!recordingBlocksCaseMutation(caseId),409,'请先完成录音转写核对，再生成报告。');
     await finalizeInterviewFacts(caseId);
     const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];
-    const messages=messagesFor(caseId);const facts=factsFor(caseId);const incomplete=!!db().prepare('SELECT id FROM interviews WHERE case_id=? AND incomplete=1').get(caseId);
+    const messages=messagesFor(caseId);const facts=factsFor(caseId);const incomplete=!!db().prepare('SELECT id FROM interviews WHERE case_id=? AND incomplete=1').get(caseId)||!!db().prepare('SELECT id FROM recording_sessions WHERE case_id=? AND incomplete=1').get(caseId);
     const before=digest(pack({messages,facts}));
     const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
     const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];if(prior)return reportRecord(prior,record);
@@ -247,7 +287,7 @@ export async function action(request:Request):Promise<Response>{
   if(name==='deleteCase'||name==='restoreCase'||name==='purgeCase'){
     requireThat(user.role==='advisor',403,'仅归属顾问可以管理案例。');const record=caseFor(user,str(input,'caseId'),true,name!=='deleteCase');
     if(name==='restoreCase'){requireThat(record.deletedAt,409,'案例未被删除。');transaction(()=>{record.deletedAt=null;record.deletedBy=null;saveCase(record);audit(user.id,record.id,'case.restored');});return json({ok:true,nextCaseId:record.id});}
-    requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'进行中的访谈不能删除，请先结束访谈。');requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能删除案例。');
+    requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'进行中的访谈不能删除，请先结束访谈。');requireThat(!recordingBlocksCaseDeletion(record.id),409,'录音正在采集或转写，暂时不能删除案例。');requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能删除案例。');
     if(name==='purgeCase'){
       requireThat(record.deletedAt,409,'请先将案例移入已删除案例。');requireThat(str(input,'confirmation',20)==='永久删除',400,'请输入“永久删除”确认此操作。');
       const sessions=db().prepare('SELECT id FROM interviews WHERE case_id=?').all(record.id) as {id:string}[];
@@ -258,6 +298,10 @@ export async function action(request:Request):Promise<Response>{
         db().prepare("UPDATE auth_sessions SET mode=CASE WHEN active_case=? OR active_interview IN (SELECT id FROM interviews WHERE case_id=?) THEN 'advisor' ELSE mode END,active_case=CASE WHEN active_case=? THEN NULL ELSE active_case END,active_interview=CASE WHEN active_interview IN (SELECT id FROM interviews WHERE case_id=?) THEN NULL ELSE active_interview END,last_ended_case=CASE WHEN last_ended_case=? THEN NULL ELSE last_ended_case END WHERE active_case=? OR active_interview IN (SELECT id FROM interviews WHERE case_id=?) OR last_ended_case=?").run(record.id,record.id,record.id,record.id,record.id,record.id,record.id,record.id);
         db().prepare('DELETE FROM voice_tokens WHERE interview_id IN (SELECT id FROM interviews WHERE case_id=?)').run(record.id);
         db().prepare('DELETE FROM interview_extractions WHERE session_id IN (SELECT id FROM interviews WHERE case_id=?)').run(record.id);
+        db().prepare('DELETE FROM recording_extractions WHERE session_id IN (SELECT id FROM recording_sessions WHERE case_id=?)').run(record.id);
+        db().prepare('DELETE FROM recording_segments WHERE session_id IN (SELECT id FROM recording_sessions WHERE case_id=?)').run(record.id);
+        db().prepare('DELETE FROM recording_chunks WHERE session_id IN (SELECT id FROM recording_sessions WHERE case_id=?)').run(record.id);
+        db().prepare('DELETE FROM recording_sessions WHERE case_id=?').run(record.id);
         db().prepare('DELETE FROM notification_jobs WHERE case_id=?').run(record.id);
         db().prepare('DELETE FROM approvals WHERE case_id=?').run(record.id);
         for(const table of ['reviews','reports','profile_fields','messages','report_jobs','audit_events','interviews'])db().prepare(`DELETE FROM ${table} WHERE case_id=?`).run(record.id);
@@ -271,7 +315,7 @@ export async function action(request:Request):Promise<Response>{
     const next=docs<Case>('SELECT doc FROM cases WHERE owner_id=? ORDER BY rowid DESC',user.id).find(item=>!item.deletedAt);return json({ok:true,nextCaseId:next?.id??null});
   }
   if(name==='enterClient'){
-    const record=caseFor(user,str(input,'caseId'),true);requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，请等待完成或新建访谈。');requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'此案例已有进行中的访谈。请回到原设备结束，或新建一次访谈。');requireThat(record.reportVersion===0,409,'已有报告的案例请新建访谈，以保留历史。');
+    const record=caseFor(user,str(input,'caseId'),true);requireThat(!recordingBlocksCaseMutation(record.id)&&!db().prepare('SELECT id FROM recording_sessions WHERE case_id=?').get(record.id),409,'此案例已使用录音转写模式，不能同时开始 AI 访谈。');requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，请等待完成或新建访谈。');requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'此案例已有进行中的访谈。请回到原设备结束，或新建一次访谈。');requireThat(record.reportVersion===0,409,'已有报告的案例请新建访谈，以保留历史。');
     const sessionId=id();transaction(()=>{db().prepare("INSERT INTO interviews(id,case_id,auth_id,state,created_at) VALUES(?,?,?,'active',?)").run(sessionId,record.id,auth.id,now());db().prepare("UPDATE auth_sessions SET mode='client',active_case=?,active_interview=?,last_ended_case=NULL WHERE id=?").run(record.id,sessionId,auth.id);record.status='interviewing';saveCase(record);});audit(user.id,record.id,'client_mode.entered');return json({ok:true,caseId:record.id});
   }
   if(name==='generateReport'){const record=caseFor(user,str(input,'caseId'),true);const old=reportJobFor(record.id);try{const report=await generateReport(record.id);saveReportJob({caseId:record.id,status:'ready',attempts:(old?.attempts??0)+1,error:null,updatedAt:now()});return json({ok:true,version:report.version});}catch(error){saveReportJob({caseId:record.id,status:'failed',attempts:(old?.attempts??0)+1,error:reportFailureMessage(error),updatedAt:now()});throw error;}}

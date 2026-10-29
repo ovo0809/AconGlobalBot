@@ -1,6 +1,6 @@
 import { db, id, now, pack, transaction } from './db';
 
-export type UsageOperation='interview'|'extraction'|'report'|'realtime';
+export type UsageOperation='interview'|'extraction'|'report'|'realtime'|'transcription';
 export type UsageContext={caseId:string;sessionId?:string};
 export type UsageOutcome='settled'|'unknown'|'released';
 export type UsageEventKind='responses'|'realtime'|'transcription';
@@ -97,15 +97,18 @@ function usageCall(callId:string){
   return row;
 }
 function validateModel(operation:UsageOperation,model:string){
-  if(operation==='realtime'){
+  if(operation==='transcription'){
+    if(model!=='whisper-1')throw new UsageBudgetError('所选录音转写模型没有已批准的费率表，已停止调用。');
+  }else if(operation==='realtime'){
     if(model!=='gpt-realtime-2.1')throw new UsageBudgetError('所选实时语音模型没有已批准的费率表，已停止调用。');
   }else if(model!=='gpt-6-luna')throw new UsageBudgetError('所选文字模型没有已批准的费率表，已停止调用。');
 }
 
 export function beginUsage(input:{context:UsageContext;operation:UsageOperation;model:string;transcriptionModel?:TranscriptionModel;reserveMicros?:number}){
   validateModel(input.operation,input.model);
-  const transcriptionModel=input.transcriptionModel??'gpt-4o-mini-transcribe';
+  const transcriptionModel=input.transcriptionModel??(input.operation==='transcription'?'whisper-1':'gpt-4o-mini-transcribe');
   if(transcriptionModel!=='whisper-1'&&transcriptionModel!=='gpt-4o-mini-transcribe')throw new UsageBudgetError('所选语音转写模型没有已批准的费率表，已停止调用。');
+  if(input.operation==='transcription'&&transcriptionModel!==input.model)throw new UsageBudgetError('录音转写模型与费用预留模型不一致，已停止调用。');
   const requested=input.reserveMicros===undefined?null:integer(input.reserveMicros,'reserveMicros');
   if(requested===0)throw new UsageBudgetError('费用预留必须大于零。');
   return transaction(()=>{

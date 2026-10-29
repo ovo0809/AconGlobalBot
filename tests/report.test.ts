@@ -55,6 +55,16 @@ test('provides at least ten distinct synthetic edge scenarios', () => {
   assert.ok(scenarios.some((scenario) => scenario.name.includes('injection')));
 });
 
+test('recording facts retain advisor review and segment provenance in the report', () => {
+  const input=reportInput([{key:'goal',value:'明年准备家庭保障',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:['recording-message-1'],confirmedBy:null,confirmedAt:null}]);
+  input.messages[0]={...input.messages[0],source:'customer',sourceKind:'advisor_reviewed_recording',actorId:'advisor-1',recordingSegmentIds:['segment-1','segment-2']};
+  const report=buildReport(input);
+  assert.match(report.fullText,/顾问核对的录音客户发言/);
+  assert.match(report.fullText,/actor_id=advisor-1/);
+  assert.match(report.fullText,/录音片段=segment-1,segment-2/);
+  assert.equal(report.facts[0].factStatus,'reported_unverified');
+});
+
 test('demo analysis returns exactly four unique categories and valid case-local evidence', () => {
   for (const scenario of scenarios) {
     const results = analyzeDemo(scenario.facts);
