@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { backup, DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import type { Bootstrap, Message, ReportJob, ReportRecord } from '../lib/domain';
+import { beginUsage, completeUsage, getUsageProgress, getUsageSummary, recordUsage } from '../lib/ai-usage';
 
 const databaseRoot = mkdtempSync(join(tmpdir(), 'aeconn-service-test-'));
 process.env.DATABASE_PATH = join(databaseRoot, 'service.sqlite');
@@ -173,6 +175,168 @@ test('client creation requires all six fields and ownership is server-derived', 
   const data = (await advisor.bootstrap(caseId)).data as Bootstrap;
   assert.equal(data.activeCase?.ownerAgentId, 'advisor-1');
   assert.equal(data.clients.find((client) => client.id === data.activeCase?.clientId)?.ownerAgentId, 'advisor-1');
+});
+
+test('voice diagnostics persist only fixed reason metadata and retain separate attempts',async()=>{
+  const advisor=new BrowserSession();await advisor.login('advisor1@aeconn.example');const caseId=await createCase(advisor,'语音诊断');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  const sessionId=((await advisor.bootstrap()).data as Bootstrap).clientSession!.id;
+  const service=await servicePromise;
+  service.voiceHooks.diagnostic(sessionId,{code:'spending_limit',stage:'preflight'});
+  service.voiceHooks.diagnostic(sessionId,{code:'spending_limit',stage:'preflight'});
+  service.voiceHooks.diagnostic(sessionId,{code:'voice_usage_unverified',stage:'runtime'});
+  const {db,unpack}=await import('../lib/db');
+  const rows=db().prepare("SELECT action,metadata FROM audit_events WHERE case_id=? AND action IN ('voice.start_failed','voice.stopped') ORDER BY rowid").all(caseId) as {action:string;metadata:string}[];
+  assert.deepEqual(rows.map(row=>({action:row.action,metadata:unpack(row.metadata)})),[
+    {action:'voice.start_failed',metadata:{code:'spending_limit',stage:'preflight',sessionId}},
+    {action:'voice.start_failed',metadata:{code:'spending_limit',stage:'preflight',sessionId}},
+    {action:'voice.stopped',metadata:{code:'voice_usage_unverified',stage:'runtime',sessionId}},
+  ]);
+  assert.doesNotMatch(JSON.stringify(rows),/语音诊断|OPENAI|sk-|客户/);
+  await advisor.action({action:'end',caseId});
+});
+
+test('owner can soft-delete and restore stable numbered cases without deleting usage or history',async()=>{
+  await drainReportJobs();
+  const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');
+  createdCounter+=1;
+  const created=await owner.action({action:'createClient',name:'Mike',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`mike-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'});
+  assert.equal(created.response.status,200,JSON.stringify(created.data));
+  const clientId=String(created.data.clientId),baseId=String(created.data.caseId);
+  const second=await owner.action({action:'createCase',clientId});const third=await owner.action({action:'createCase',clientId});
+  const secondId=String(second.data.caseId),thirdId=String(third.data.caseId);
+  let state=(await owner.bootstrap()).data as Bootstrap;
+  const names=new Map(state.cases.filter(record=>record.clientId===clientId).map(record=>[record.id,record.clientName]));
+  assert.equal(names.get(baseId),'Mike');assert.equal(names.get(secondId),'Mike（1）');assert.equal(names.get(thirdId),'Mike（2）');
+  assert.equal(state.activeCase?.clientName,state.cases.find(record=>record.id===state.activeCase?.id)?.clientName);
+
+  const otherOwnerSession=new BrowserSession();await otherOwnerSession.login('advisor1@aeconn.example');
+  const anotherAdvisor=new BrowserSession();await anotherAdvisor.login('advisor2@aeconn.example');
+  assert.equal((await anotherAdvisor.action({action:'deleteCase',caseId:thirdId})).response.status,403);
+  const reviewer=new BrowserSession();await reviewer.login('charles@aeconn.example');
+  assert.equal((await reviewer.action({action:'deleteCase',caseId:thirdId})).response.status,403);
+
+  const usage=beginUsage({context:{caseId:thirdId},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000});
+  await owner.action({action:'enterClient',caseId:thirdId});
+  assert.equal((await owner.action({action:'deleteCase',caseId:thirdId})).response.status,403,'client mode cannot delete cases');
+  assert.equal((await otherOwnerSession.action({action:'deleteCase',caseId:thirdId})).response.status,409,'an active interview blocks deletion');
+  await owner.action({action:'chooseEntry',caseId:thirdId,entry:'life'});await owner.action({action:'end',caseId:thirdId});
+  assert.equal((await otherOwnerSession.action({action:'deleteCase',caseId:thirdId})).response.status,409,'a queued report blocks deletion');
+  await drainReportJobs();
+
+  const {db}=await import('../lib/db');
+  db().exec("CREATE TEMP TRIGGER fail_soft_delete_audit BEFORE INSERT ON audit_events WHEN NEW.action='case.soft_deleted' BEGIN SELECT RAISE(ABORT,'synthetic soft delete rollback'); END");
+  assert.equal((await otherOwnerSession.action({action:'deleteCase',caseId:thirdId})).response.status,500);
+  db().exec('DROP TRIGGER fail_soft_delete_audit');
+  assert.equal((await otherOwnerSession.bootstrap(thirdId)).response.status,200,'audit failure rolls back the soft-delete state');
+  const deleted=await otherOwnerSession.action({action:'deleteCase',caseId:thirdId});
+  assert.equal(deleted.response.status,200,JSON.stringify(deleted.data));assert.equal(deleted.data.nextCaseId,secondId);
+  state=(await otherOwnerSession.bootstrap()).data as Bootstrap;
+  assert.equal(state.cases.some(record=>record.id===thirdId),false);
+  const endedOwnerBootstrap=await owner.bootstrap();assert.equal(endedOwnerBootstrap.response.status,200);assert.notEqual((endedOwnerBootstrap.data as Bootstrap).activeCase?.id,thirdId,'a deleted last-ended case falls back safely');
+  const deletedBootstrap=await otherOwnerSession.bootstrap(thirdId);assert.equal(deletedBootstrap.response.status,404,'deleted cases cannot be selected directly');assert.equal((deletedBootstrap.data as {code?:string}).code,'CASE_NOT_FOUND');
+  assert.deepEqual(getUsageProgress(usage.id),{costMicros:0,reservedMicros:50_000},'soft delete retains usage reservations');
+
+  db().exec("CREATE TEMP TRIGGER fail_restore_audit BEFORE INSERT ON audit_events WHEN NEW.action='case.restored' BEGIN SELECT RAISE(ABORT,'synthetic restore rollback'); END");
+  assert.equal((await otherOwnerSession.action({action:'restoreCase',caseId:thirdId})).response.status,500);
+  db().exec('DROP TRIGGER fail_restore_audit');
+  assert.ok(((await otherOwnerSession.bootstrap()).data as Bootstrap).deletedCases?.some(record=>record.id===thirdId),'audit failure rolls back the restored state');
+  const restored=await otherOwnerSession.action({action:'restoreCase',caseId:thirdId});
+  assert.equal(restored.response.status,200);assert.equal(restored.data.nextCaseId,thirdId);
+  state=(await otherOwnerSession.bootstrap(thirdId)).data as Bootstrap;
+  assert.equal(state.activeCase?.clientName,'Mike（2）');assert.equal(state.cases.find(record=>record.id===thirdId)?.clientName,'Mike（2）');
+  completeUsage(usage.id,'released');
+});
+
+test('permanent deletion requires ownership, explicit confirmation and atomically removes every case-linked record',async()=>{
+  await drainReportJobs();
+  const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');
+  createdCounter+=1;
+  const created=await owner.action({action:'createClient',name:'永久删除合成客户',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`purge-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'});
+  assert.equal(created.response.status,200,JSON.stringify(created.data));
+  const clientId=String(created.data.clientId),caseId=String(created.data.caseId);
+  await owner.action({action:'enterClient',caseId});await owner.action({action:'chooseEntry',caseId,entry:'life'});
+  await owner.action({action:'message',caseId,text:'我想保障家庭。',eventId:'purge-goal'});await owner.action({action:'end',caseId});await drainReportJobs();
+  let state=(await owner.bootstrap(caseId)).data as Bootstrap;const report=state.reports[0];assert.ok(report);
+  const approved=await owner.action({action:'approveSend',caseId,version:report.version,snapshotId:report.snapshotId,recipientFingerprint:report.recipientFingerprint});assert.equal(approved.response.status,200,JSON.stringify(approved.data));
+  const {db,id,now,pack}=await import('../lib/db');
+  const interview=db().prepare('SELECT id,auth_id FROM interviews WHERE case_id=?').get(caseId) as {id:string;auth_id:string};
+  const reviewId=id();db().prepare('INSERT INTO reviews VALUES(?,?,?)').run(reviewId,caseId,pack({id:reviewId,caseId,reportVersion:report.version,reviewerId:'charles',decision:'approved',reason:'合成测试',createdAt:now()}));
+  db().prepare('INSERT INTO voice_tokens VALUES(?,?,?,?)').run(`purge-token-${createdCounter}`,interview.id,interview.auth_id,Date.now()+60_000);
+  const deleted=await owner.action({action:'deleteCase',caseId});assert.equal(deleted.response.status,200,JSON.stringify(deleted.data));
+  state=(await owner.bootstrap()).data as Bootstrap;assert.equal(state.deletedCases?.find(item=>item.id===caseId)?.clientName,'永久删除合成客户');
+  assert.equal(state.clients.some(client=>client.id===clientId),false,'a deleted-only client profile is not returned with the recycle-bin summary');
+  assert.equal((await owner.report(caseId,report.version)).status,404,'soft-deleted reports cannot be downloaded directly');
+  const pendingUsage=beginUsage({context:{caseId},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000});
+  assert.equal((await owner.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,409,'an unsettled call blocks permanent deletion');completeUsage(pendingUsage.id,'released');
+  const settledUsage=beginUsage({context:{caseId},operation:'interview',model:'gpt-6-luna',reserveMicros:50_000});recordUsage(settledUsage.id,'purge-settled','responses',{input_tokens:1_000,output_tokens:100,input_tokens_details:{cached_tokens:0}});completeUsage(settledUsage.id,'settled');
+  const usageBeforePurge=getUsageSummary('org-demo'),settledRowBefore=db().prepare('SELECT * FROM ai_usage_calls WHERE id=?').get(settledUsage.id),settledEventsBefore=db().prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id=?').get(settledUsage.id) as {count:number};
+
+  const other=new BrowserSession();await other.login('advisor2@aeconn.example');const otherState=(await other.bootstrap()).data as Bootstrap;assert.equal(otherState.deletedCases?.some(item=>item.id===caseId)??false,false);assert.equal(otherState.clients.some(item=>item.id===clientId),false);assert.equal((await other.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const reviewer=new BrowserSession();await reviewer.login('charles@aeconn.example');const reviewerState=(await reviewer.bootstrap()).data as Bootstrap;assert.equal(reviewerState.deletedCases,undefined);assert.equal(reviewerState.clients.some(item=>item.id===clientId),false);assert.equal((await reviewer.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const admin=new BrowserSession();await admin.login('admin@aeconn.example');const adminState=(await admin.bootstrap()).data as Bootstrap;assert.equal(adminState.deletedCases,undefined);assert.equal(adminState.clients.some(item=>item.id===clientId),false);assert.equal((await admin.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const clientMode=new BrowserSession();await clientMode.login('advisor1@aeconn.example');const activeId=await createCase(clientMode,'永久删除权限');await clientMode.action({action:'enterClient',caseId:activeId});const clientState=(await clientMode.bootstrap()).data as Bootstrap;assert.equal(clientState.deletedCases,undefined);assert.equal(clientState.clients.some(item=>item.id===clientId),false);assert.equal((await clientMode.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,403);
+  const activeRow=db().prepare('SELECT doc FROM cases WHERE id=?').get(activeId) as {doc:string},activeRecord=JSON.parse(activeRow.doc);db().prepare('UPDATE cases SET doc=? WHERE id=?').run(pack({...activeRecord,deletedAt:now(),deletedBy:'advisor-1'}),activeId);
+  assert.equal((await owner.action({action:'purgeCase',caseId:activeId,confirmation:'永久删除'})).response.status,409,'an inconsistent archived case with a live interview is still protected');db().prepare('UPDATE cases SET doc=? WHERE id=?').run(activeRow.doc,activeId);await clientMode.action({action:'end',caseId:activeId});
+  assert.equal((await owner.action({action:'purgeCase',caseId})).response.status,400);
+
+  db().exec(`CREATE TEMP TRIGGER fail_case_purge BEFORE DELETE ON cases WHEN OLD.id='${caseId}' BEGIN SELECT RAISE(ABORT,'synthetic rollback'); END`);
+  assert.equal((await owner.action({action:'purgeCase',caseId,confirmation:'永久删除'})).response.status,500);
+  db().exec('DROP TRIGGER fail_case_purge');
+  assert.ok(db().prepare('SELECT id FROM cases WHERE id=?').get(caseId),'transaction rollback keeps the case');
+  assert.ok(db().prepare('SELECT id FROM messages WHERE case_id=?').get(caseId),'transaction rollback keeps case history');
+  assert.deepEqual(db().prepare('SELECT * FROM ai_usage_calls WHERE id=?').get(settledUsage.id),settledRowBefore,'transaction rollback keeps the original usage call');assert.equal((db().prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id=?').get(settledUsage.id) as {count:number}).count,settledEventsBefore.count);
+  const usageAfterRollback=getUsageSummary('org-demo');assert.deepEqual(usageAfterRollback.day,usageBeforePurge.day);assert.deepEqual(usageAfterRollback.month,usageBeforePurge.month);
+
+  // Stale pointers from any browser are cleared as part of the same deletion transaction.
+  db().prepare("UPDATE auth_sessions SET mode='client',active_case=?,active_interview=?,last_ended_case=? WHERE user_id='advisor-1' AND id<>?").run(caseId,interview.id,caseId,interview.auth_id);
+  const purged=await owner.action({action:'purgeCase',caseId,confirmation:'永久删除'});assert.equal(purged.response.status,200,JSON.stringify(purged.data));
+  const count=(sql:string,value:string)=>Number((db().prepare(sql).get(value) as {count:number}).count);
+  for(const table of ['cases','messages','profile_fields','reports','reviews','approvals','notification_jobs','audit_events','report_jobs','interviews','ai_usage_calls'])assert.equal(count(`SELECT COUNT(*) count FROM ${table} WHERE ${table==='cases'?'id':'case_id'}=?`,caseId),0,table);
+  assert.equal(count('SELECT COUNT(*) count FROM interview_extractions WHERE session_id=?',interview.id),0);
+  assert.equal(count('SELECT COUNT(*) count FROM voice_tokens WHERE interview_id=?',interview.id),0);
+  assert.equal(db().prepare('SELECT id FROM ai_usage_calls WHERE id=?').get(settledUsage.id),undefined);assert.equal((db().prepare('SELECT COUNT(*) count FROM ai_usage_events WHERE call_id=?').get(settledUsage.id) as {count:number}).count,0);
+  const usageAfterPurge=getUsageSummary('org-demo');assert.deepEqual(usageAfterPurge.day,usageBeforePurge.day);assert.deepEqual(usageAfterPurge.month,usageBeforePurge.month);
+  assert.equal(db().prepare('SELECT id FROM clients WHERE id=?').get(clientId),undefined,'the last case removes the client profile');
+  assert.equal(db().prepare('SELECT id FROM auth_sessions WHERE active_case=? OR active_interview=? OR last_ended_case=?').get(caseId,interview.id,caseId),undefined);
+  const service=await servicePromise;
+  service.voiceHooks.persist(interview.id,{role:'user',text:'永久删除后的迟到语音',eventId:'purge:late',turnId:'purge-late',final:true});
+  service.voiceHooks.status(interview.id,'transcript_incomplete');
+  service.voiceHooks.diagnostic(interview.id,{code:'voice_usage_unverified',stage:'runtime'});
+  assert.throws(()=>service.voiceHooks.getContext(interview.id),/访谈不存在/);
+  assert.equal(count('SELECT COUNT(*) count FROM messages WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate messages');
+  assert.equal(count('SELECT COUNT(*) count FROM audit_events WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate audit history');
+  assert.equal((await owner.bootstrap(caseId)).response.status,404);assert.equal((await owner.report(caseId,report.version)).status,404);
+});
+
+test('permanent deletion preserves sibling clients and never reuses or renumbers case suffixes',async()=>{
+  await drainReportJobs();const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');
+  createdCounter+=1;const created=await owner.action({action:'createClient',name:'编号稳定客户',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`stable-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'});
+  const clientId=String(created.data.clientId),baseId=String(created.data.caseId),secondId=String((await owner.action({action:'createCase',clientId})).data.caseId),thirdId=String((await owner.action({action:'createCase',clientId})).data.caseId);
+  await owner.action({action:'deleteCase',caseId:secondId});assert.equal((await owner.action({action:'purgeCase',caseId:secondId,confirmation:'永久删除'})).response.status,200);
+  const fourthId=String((await owner.action({action:'createCase',clientId})).data.caseId);const state=(await owner.bootstrap(fourthId)).data as Bootstrap;
+  const names=new Map(state.cases.filter(item=>item.clientId===clientId).map(item=>[item.id,item.clientName]));
+  assert.equal(names.get(baseId),'编号稳定客户');assert.equal(names.get(thirdId),'编号稳定客户（2）');assert.equal(names.get(fourthId),'编号稳定客户（3）');assert.ok(state.clients.some(client=>client.id===clientId));
+  const {db,unpack}=await import('../lib/db');const seededRow=db().prepare("SELECT doc FROM cases WHERE id='case-1'").get() as {doc:string},seededClientRow=db().prepare("SELECT clients.doc FROM clients JOIN cases ON cases.client_id=clients.id WHERE cases.id='case-1'").get() as {doc:string};
+  const seeded=unpack<import('../lib/domain').Case>(seededRow.doc),seededClient=unpack<import('../lib/domain').Client>(seededClientRow.doc);
+  assert.equal(seeded.caseNumber,0,'existing rows receive stable persisted numbers during migration');assert.equal(seededClient.nextCaseNumber,1);
+});
+
+test('case-number migration preserves the first valid number and repairs later duplicates above the prior maximum',()=>{
+  const migrationPath=join(databaseRoot,'duplicate-number-migration.sqlite'),options={cwd:process.cwd(),env:{...process.env,DATABASE_PATH:migrationPath},encoding:'utf8' as const};
+  const setup=spawnSync(process.execPath,['--import','tsx','--input-type=module','--eval',`const {db,pack,unpack}=await import('./lib/db.ts');const d=db(),row=d.prepare("SELECT client_id,owner_id,doc FROM cases WHERE id='case-1'").get(),record=unpack(row.doc);record.id='case-duplicate';record.caseNumber=0;d.prepare('INSERT INTO cases(id,client_id,owner_id,reviewer_id,doc) VALUES(?,?,?,?,?)').run(record.id,row.client_id,row.owner_id,null,pack(record));`],options);
+  assert.equal(setup.status,0,setup.stderr);
+  const migrated=spawnSync(process.execPath,['--import','tsx','--input-type=module','--eval',`const {db,unpack}=await import('./lib/db.ts');const rows=db().prepare("SELECT doc FROM cases WHERE id IN ('case-1','case-duplicate') ORDER BY rowid").all().map(row=>unpack(row.doc).caseNumber);console.log(JSON.stringify(rows));`],options);
+  assert.equal(migrated.status,0,migrated.stderr);assert.deepEqual(JSON.parse(migrated.stdout.trim()),[0,1]);
+});
+
+test('failed case creation rolls back its persistent suffix counter',async()=>{
+  const owner=new BrowserSession();await owner.login('advisor1@aeconn.example');createdCounter+=1;
+  const created=await owner.action({action:'createClient',name:'编号事务客户',birthday:'1987-03-12',gender:'不指定',phone:`+1 202 555 ${String(1000+createdCounter)}`,email:`counter-${createdCounter}@example.invalid`,maritalStatus:'已婚',state:'CA',language:'普通话'}),clientId=String(created.data.clientId);
+  const {db}=await import('../lib/db');db().exec(`CREATE TEMP TRIGGER fail_case_create BEFORE INSERT ON cases WHEN NEW.client_id='${clientId}' BEGIN SELECT RAISE(ABORT,'synthetic creation rollback'); END`);
+  assert.equal((await owner.action({action:'createCase',clientId})).response.status,500);db().exec('DROP TRIGGER fail_case_create');
+  const nextId=String((await owner.action({action:'createCase',clientId})).data.caseId),state=(await owner.bootstrap(nextId)).data as Bootstrap;
+  assert.equal(state.activeCase?.clientName,'编号事务客户（1）','a failed insert cannot consume a case suffix');
 });
 
 test('all four entries start and end through restricted client mode', async () => {
@@ -465,14 +629,14 @@ test('real-provider interview and background voice extraction save sourced facts
   await drainReportJobs();
   const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
-  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
   const {db,docs}=await import('../lib/db');
   let phase='text';let caseId='';
   t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
     const request=JSON.parse(String(options.body));const prompt=request.input[0].content as string;
     let output:unknown;
     const customer=docs<Message>("SELECT doc FROM messages WHERE case_id=? AND role='user' ORDER BY rowid",caseId);
-    if(request.text.format.name==='aeconn_interview'){
+    if(['aeconn_interview','aeconn_extraction'].includes(request.text.format.name)){
       if(phase==='text')output={reply:'哪些家人依赖您的收入？',facts:[{key:'goal',value:'家庭保障',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:[customer[0].id]}]};
       else{assert.match(prompt,/conversation is ended/);const voice=customer.find(m=>m.text==='每月收入 5000 美元。')!;output={reply:'访谈已保存。',facts:[{key:'income',value:5000,currency:'USD',period:'month',factStatus:'reported_unverified',sourceMessageIds:[voice.id]}]};}
     }else{
@@ -480,7 +644,7 @@ test('real-provider interview and background voice extraction save sourced facts
       const saved=db().prepare("SELECT doc FROM profile_fields WHERE case_id=? AND field_key='income'").get(caseId);assert.ok(saved,'facts must be durable before report call');
       output={analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'待补充资料。',missingFields:['budget'],constraints:[],nextQuestions:[]}))};
     }
-    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(output)}]}]}));
+    return new Response(JSON.stringify({usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(output)}]}]}));
   });
   const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');caseId=await createCase(advisor,'云端事实链');
   await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
@@ -504,12 +668,12 @@ test('cloud failure keeps conversation, fails background job without a mock repo
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
   const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'失败重试');
   await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
-  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
   let fail=true;
   t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
     if(fail)return new Response('{}',{status:503});
-    const request=JSON.parse(String(options.body));const result=request.text.format.name==='aeconn_interview'?{reply:'访谈已保存。',facts:[]}:{analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}))};
-    return new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(result)}]}]}));
+    const request=JSON.parse(String(options.body));const result=['aeconn_interview','aeconn_extraction'].includes(request.text.format.name)?{reply:'访谈已保存。',facts:[]}:{analyses:['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}))};
+    return new Response(JSON.stringify({usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(result)}]}]}));
   });
   assert.equal((await advisor.action({action:'message',caseId,text:'需要更多保障',eventId:'failed-message'})).response.status,503);
   assert.equal(((await advisor.bootstrap()).data as Bootstrap).messages.some(m=>m.eventId==='failed-message'),true);
@@ -519,18 +683,50 @@ test('cloud failure keeps conversation, fails background job without a mock repo
   state=(await advisor.bootstrap(caseId)).data as Bootstrap;assert.equal(state.reportJob?.status,'ready');assert.equal(state.reports.length,1);assert.match(state.reports[0].provider,/openai/);
 });
 
+test('repeated unsafe extraction fails report job without facts or reports and returns a stable safe error',async(t)=>{
+  await drainReportJobs();
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+  t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
+  process.env.LLM_PROVIDER='mock';
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'严格提取失败');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'strict-source'});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
+  const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({
+    usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},
+    status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'访谈已保存。',facts:[{key:'goal',value:'家庭保障',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:['outside-case']}]})}]}],
+  })));
+  assert.equal((await advisor.action({action:'end',caseId})).response.status,200);
+  const factsBefore=((await advisor.bootstrap(caseId)).data as Bootstrap).facts;
+  await drainReportJobs();
+  let state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.reportJob?.status,'failed');
+  assert.equal(state.reportJob?.error,'事实提取未通过来源校验，原对话已保存；请核对后重试。');
+  assert.deepEqual(state.facts,factsBefore);assert.equal(state.reports.length,0);
+  const {db,unpack}=await import('../lib/db');
+  const auditRow=db().prepare("SELECT metadata FROM audit_events WHERE case_id=? AND action='report.background_failed' ORDER BY rowid DESC LIMIT 1").get(caseId);
+  assert.deepEqual(unpack<Record<string,string>>(auditRow!.metadata),{failureCode:'AI_EXTRACTION_VALIDATION',category:'source_evidence'});
+
+  const manual=await advisor.action({action:'generateReport',caseId});
+  assert.equal(manual.response.status,422);
+  assert.deepEqual(manual.data,{error:'事实提取未通过来源校验，原对话已保存；请核对后重试。',code:'AI_EXTRACTION_VALIDATION'});
+  state=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(state.reportJob?.status,'failed');assert.deepEqual(state.facts,factsBefore);assert.equal(state.reports.length,0);
+  assert.equal(network.mock.callCount(),4,'background and manual extraction each make at most two metered attempts');
+});
+
 test('pause and resume invalidate an in-flight cloud turn instead of resurrecting its late reply',async(t)=>{
   const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
   const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');const caseId=await createCase(advisor,'暂停代次');
   await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
-  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='synthetic-model';
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
   let resolveRequest!:(value:Response)=>void;let markStarted!:()=>void;const started=new Promise<void>(resolve=>{markStarted=resolve;});
   t.mock.method(globalThis,'fetch',async()=>{markStarted();return await new Promise<Response>(resolve=>{resolveRequest=resolve;});});
   const pending=advisor.action({action:'message',caseId,text:'家庭保障',eventId:'delayed-turn'});await started;
   assert.equal((await advisor.action({action:'pause',caseId})).response.status,200);
   assert.equal((await advisor.action({action:'resume',caseId})).response.status,200);
-  resolveRequest(new Response(JSON.stringify({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'这条迟到的问题不应出现。',facts:[]})}]}]})));
+  resolveRequest(new Response(JSON.stringify({usage:{input_tokens:2000,output_tokens:100,total_tokens:2100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:0}},status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:'这条迟到的问题不应出现。',facts:[]})}]}]})));
   assert.equal((await pending).response.status,409);
   const state=(await advisor.bootstrap()).data as Bootstrap;assert.equal(state.messages.some(m=>m.eventId==='delayed-turn:reply'),false);assert.equal(state.messages.filter(m=>m.eventId==='delayed-turn').length,1);
   process.env.LLM_PROVIDER='mock';await advisor.action({action:'end',caseId});await drainReportJobs();
@@ -547,4 +743,39 @@ test('mock money parsing never changes CAD into CNY or truncates ambiguous magni
   const correction=await advisor.action({action:'updateFact',caseId,key:'goal',value:'保护家庭',factStatus:'confirmed',reason:'顾问核对后的更正'});assert.equal(correction.response.status,200);
   state=(await advisor.bootstrap(caseId)).data as Bootstrap;const corrected=state.facts.find(f=>f.key==='goal')!;const message=state.messages.find(m=>m.id===corrected.sourceMessageIds[0])!;
   assert.equal(message.source,'advisor');assert.equal(message.actorId,'advisor-1');assert.match(state.reports[0].fullText,/顾问更正/);
+});
+
+test('usage is scoped to authorized internal cases and budget refusal preserves the conversation',async t=>{
+  await drainReportJobs();
+  const advisor=new BrowserSession();await advisor.login('advisor1@verified.test');
+  const caseId=await createCase(advisor,'预算保护');
+  const usage=await import('../lib/ai-usage');
+  const held=usage.beginUsage({context:{caseId},model:'gpt-realtime-2.1',operation:'realtime'});
+  usage.completeUsage(held.id,'unknown');
+  const internal=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(internal.usage?.case?.remainingMicros,0);
+  assert.equal(internal.usage?.records.length,1);
+  assert.equal(internal.usage?.records[0].status,'unknown');
+  const another=new BrowserSession();await another.login('advisor2@aeconn.example');
+  assert.equal((await another.bootstrap(caseId)).response.status,403);
+  const other=(await another.bootstrap()).data as Bootstrap;
+  assert.equal(other.usage?.records.some(record=>record.id===held.id),false);
+  const admin=new BrowserSession();await admin.login('admin@aeconn.example');
+  const administrative=(await admin.bootstrap()).data as Bootstrap;
+  assert.equal(administrative.usage?.case,null);assert.deepEqual(administrative.usage?.records,[]);
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  assert.equal(((await advisor.bootstrap()).data as Bootstrap).usage,undefined);
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-test';process.env.OPENAI_MODEL='gpt-6-luna';
+  const network=t.mock.method(globalThis,'fetch',async()=>{throw new Error('Budget test must not call network');});
+  const response=await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'budget-protected-answer'});
+  assert.equal(response.response.status,429);
+  assert(((await advisor.bootstrap()).data as Bootstrap).messages.some(message=>message.eventId==='budget-protected-answer'));
+  await advisor.action({action:'end',caseId});await drainReportJobs();
+  const ended=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(ended.mode,'advisor');assert.equal(ended.reportJob?.status,'failed');assert.equal(ended.reports.length,0);
+  assert.match(ended.reportJob?.error??'',/额度|预算/);
+  assert.equal(network.mock.callCount(),0);
+  const anonymous=new BrowserSession();assert.equal(((await anonymous.bootstrap()).data as Bootstrap).usage,undefined);
 });

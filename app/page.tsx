@@ -3,9 +3,11 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import type { Bootstrap, Case, Category, FactStatus, ProfileField, ReportRecord } from '../lib/domain';
 import { BrowserVoiceClient, type BrowserVoiceState } from '../lib/browser-voice';
+import { factLabels, demandStatusLabels, formatFactValue } from '../lib/report-labels';
+import { presentReport } from '../lib/report-presentation';
 
 type ActionBody = Record<string, unknown> & { action: string };
-type ActionResult = Record<string, unknown> & { error?: string; caseId?: string };
+type ActionResult = Record<string, unknown> & { error?: string; caseId?: string; nextCaseId?: string | null };
 type ActionFn = (body: ActionBody, options?: { caseId?: string; noRefresh?: boolean }) => Promise<ActionResult | null>;
 type Toast = { kind: 'success' | 'error' | 'info'; text: string } | null;
 
@@ -18,21 +20,22 @@ const categories: { id: Category; title: string; caption: string; icon: string }
 
 const roleNames = { advisor: '顾问', reviewer: 'Charles 审核人', admin: '管理员' } as const;
 const statusNames: Record<string, string> = {
+  ...demandStatusLabels,
   new: '尚未访谈', draft: '报告草稿', needs_report: '待生成报告', interviewing: '访谈进行中', ended: '访谈已结束', report_ready: '报告已生成', reviewed: '已复核',
   pending_review: '待复核', approved: '已复核', returned: '退回补问', quote_handoff: '已转现有报价流程',
-};
-const factLabels: Record<string, string> = {
-  goal: '主要目标', horizon: '目标时间', dependents: '家庭责任', state: '居住州', employment: '工作情况', income: '收入',
-  expenses: '家庭开支', debt: '债务', reserve: '应急储备', assets: '资产与资金', existing_life: '现有人寿保障', existing_di: '现有伤残保障', existing_ltc: '现有照护安排',
-  budget: '预算', liquidity: '流动性偏好', retirement: '退休计划', care: '照护考虑',
 };
 const factStatusNames: Record<FactStatus, string> = {
   confirmed: '已确认', reported_unverified: '客户自述·待核验', unknown: '不知道', declined: '不愿提供', conflicting: '存在冲突',
 };
 const moneyFactKeys = new Set(['income','expenses','debt','reserve','assets','budget']);
+type ReviewScope = 'pending' | 'all';
+function inReviewScope(record:Case, scope:ReviewScope) {
+  return Boolean(record.assignedReviewerId) && (scope==='all' || record.status==='pending_review');
+}
 
-function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
+function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'trash' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
   const paths: Record<string, React.ReactNode> = {
+    trash: <><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></>,
     search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>, plus: <><path d="M12 5v14M5 12h14"/></>,
     user: <><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></>, chat: <path d="M21 15a4 4 0 0 1-4 4H8l-5 3 1.7-5A8 8 0 1 1 21 15Z"/>,
     file: <><path d="M6 2h9l4 4v16H6z"/><path d="M15 2v5h5M9 12h6M9 16h6"/></>, review: <><path d="M5 3h14v18H5z"/><path d="m8 10 2 2 5-5M8 16h8"/></>,
@@ -48,6 +51,10 @@ function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | '
 async function getBootstrap(caseId?: string): Promise<Bootstrap> {
   const url = caseId ? `/api/bootstrap?caseId=${encodeURIComponent(caseId)}` : '/api/bootstrap';
   const response = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+  if(response.status===404&&caseId){
+    const problem=await response.json().catch(()=>null) as {code?:string}|null;
+    if(problem?.code==='CASE_NOT_FOUND')return getBootstrap();
+  }
   if (!response.ok) throw new Error('无法读取当前会话，请刷新重试。');
   return response.json() as Promise<Bootstrap>;
 }
@@ -59,14 +66,25 @@ export default function Home() {
   const [toast, setToast] = useState<Toast>(null);
   const [handback, setHandback] = useState(false);
   const selectedCaseIdRef = useRef<string | undefined>(undefined);
+  const refreshVersion = useRef(0);
+  const initialBootstrap = useRef<Promise<Bootstrap> | null>(null);
+  const bootstrapLoaded = useRef(false);
+  const sessionChannel = useRef<BroadcastChannel | null>(null);
   const sessionMode = data?.mode;
   const sessionUserId = data?.user?.id;
 
   const refresh = useCallback(async (caseId?: string) => {
-    const next = await getBootstrap(caseId ?? selectedCaseIdRef.current);
-    if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
-    else if (next.activeCase) selectedCaseIdRef.current = next.activeCase.id;
-    setData(next);
+    const version = ++refreshVersion.current;
+    // Share the first request so concurrent focus events cannot create competing session cookies.
+    const request = bootstrapLoaded.current ? getBootstrap(caseId ?? selectedCaseIdRef.current) : initialBootstrap.current ??= getBootstrap(caseId ?? selectedCaseIdRef.current);
+    let next:Bootstrap;
+    try { next=await request; bootstrapLoaded.current=true; }
+    finally { if(initialBootstrap.current===request)initialBootstrap.current=null; }
+    if(version===refreshVersion.current){
+      if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
+      else selectedCaseIdRef.current = next.activeCase?.id;
+      setData(next);
+    }
     return next;
   }, []);
 
@@ -87,9 +105,10 @@ export default function Home() {
   useEffect(() => {
     if (!sessionMode) return;
     const channel = new BroadcastChannel('aeconn-session-mode');
+    sessionChannel.current=channel;
     channel.postMessage({ mode: sessionMode, userId: sessionUserId ?? null, at: Date.now() });
     channel.onmessage = () => { setLoading(true); void refresh().catch(() => undefined).finally(() => setLoading(false)); };
-    return () => channel.close();
+    return () => { sessionChannel.current=null;channel.close(); };
   }, [sessionMode, sessionUserId, refresh]);
 
   useEffect(() => {
@@ -108,6 +127,7 @@ export default function Home() {
       });
       const result = await response.json() as ActionResult;
       if (!response.ok) throw new Error(result.error || '操作未完成，请重试。');
+      if(['deleteCase','restoreCase','purgeCase'].includes(body.action))sessionChannel.current?.postMessage({type:'cases-changed'});
       if (body.action === 'login' || body.action === 'logout') selectedCaseIdRef.current = undefined;
       if (!options?.noRefresh) await refresh(options?.caseId ?? result.caseId);
       return result;
@@ -157,16 +177,24 @@ function LoginScreen({ busy, onLogin, toast }: { busy:boolean; onLogin:(email:st
 }
 
 function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, setToast, toast, selectedCaseIdRef }: { data:Bootstrap; busy:string; act:ActionFn; refresh:(caseId?:string)=>Promise<Bootstrap>; handback:boolean; setHandback:(value:boolean)=>void; setToast:(v:Toast)=>void; toast:Toast; selectedCaseIdRef:React.MutableRefObject<string|undefined> }) {
-  const [nav, setNav] = useState<'workspace'|'review'|'settings'>(data.user?.role === 'admin' ? 'settings' : data.user?.role === 'reviewer' ? 'review' : 'workspace');
+  const [nav, setNav] = useState<'workspace'|'review'|'settings'|'trash'>(data.user?.role === 'admin' ? 'settings' : data.user?.role === 'reviewer' ? 'review' : 'workspace');
   const [search, setSearch] = useState('');
   const [newClient, setNewClient] = useState(false);
-  const [reportOpen, setReportOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(data.user?.role==='reviewer');
+  const [reviewScope, setReviewScope] = useState<ReviewScope>('pending');
   const [handoff, setHandoff] = useState(false);
   const [mobileDetail, setMobileDetail] = useState(false);
-  const activeCase = data.activeCase;
-  const activeCaseId = activeCase?.id;
+  const [deleteTarget, setDeleteTarget] = useState<Case | null>(null);
+  const [purgeTarget, setPurgeTarget] = useState<Case | null>(null);
+  const selectionVersion = useRef(0);
+  const scopedCases = nav==='review' ? data.cases.filter(item=>inReviewScope(item,reviewScope)) : data.cases;
+  const activeCase = data.activeCase && scopedCases.some(item=>item.id===data.activeCase?.id) ? data.activeCase : null;
+  const activeCaseId = data.activeCase?.id;
   const reportJob = data.reportJob;
-  const filteredCases = data.cases.filter(item => (item.clientName || '').toLowerCase().includes(search.toLowerCase()));
+  const filteredCases = scopedCases.filter(item => (item.clientName || '').toLowerCase().includes(search.trim().toLowerCase()));
+  const reviewTitle = reviewScope==='all' ? '已交接案例' : data.user?.role==='reviewer' ? '待我复核' : '待 Charles 复核';
+  const reviewDescription = reviewScope==='all' ? '查看已交接案例的当前状态，包括已复核、退回补问和后续更新。' : data.user?.role==='reviewer' ? '仅显示分配给您的待复核案例。' : '仅显示已提交给 Charles、等待复核的案例。报告草稿请在“客户”中处理。';
+  const reviewEmptyDescription = data.user?.role==='reviewer' ? '顾问提交并分配给您的案例会出现在这里。' : '在“客户”的内部报告中提交 Charles 复核后，案例会出现在这里。';
 
   useEffect(()=>{
     const shouldPoll=Boolean(document.visibilityState==='visible'&&activeCaseId&&reportJob?.caseId===activeCaseId&&(reportJob.status==='queued'||reportJob.status==='generating'||reportJob.status==='ready'&&data.reports.length===0));
@@ -175,51 +203,113 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
     return()=>window.clearTimeout(timer);
   },[activeCaseId,data.reports.length,refresh,reportJob?.caseId,reportJob?.status]);
 
-  async function selectCase(item: Case) { selectedCaseIdRef.current = item.id; setReportOpen(false); setMobileDetail(true); await refresh(item.id); }
+  async function selectCase(item: Case) {
+    const version=++selectionVersion.current;
+    selectedCaseIdRef.current = item.id; setDeleteTarget(null); setReportOpen(nav==='review');
+    try { await refresh(item.id); if(version===selectionVersion.current)setMobileDetail(true); }
+    catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'无法读取案例，请重试。'}); }
+  }
+  async function openCaseList(nextNav:'workspace'|'review', scope:ReviewScope='pending') {
+    ++selectionVersion.current;
+    setNav(nextNav);setReviewScope(scope);setSearch('');setMobileDetail(false);setDeleteTarget(null);setReportOpen(nextNav==='review');
+    const candidates=nextNav==='review'?data.cases.filter(item=>inReviewScope(item,scope)):data.cases;
+    const selected=candidates.find(item=>item.id===data.activeCase?.id)??candidates[0];
+    selectedCaseIdRef.current=selected?.id;
+    try { await refresh(selected?.id); }
+    catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'无法读取案例，请重试。'}); }
+  }
+  async function deleteCase() {
+    if (!deleteTarget) return;
+    const result = await act({action:'deleteCase',caseId:deleteTarget.id},{noRefresh:true});
+    const nextCaseId = typeof result?.nextCaseId === 'string' ? result.nextCaseId : undefined;
+    selectedCaseIdRef.current = nextCaseId;
+    setDeleteTarget(null);
+    setReportOpen(false);
+    await refresh(nextCaseId);
+    setToast({kind:'success',text:'案例已从列表移除，历史资料仍然保留。'});
+  }
   async function logout() { await act({action:'logout'}); }
+  async function restoreCase(record:Case) {
+    try {
+      const result=await act({action:'restoreCase',caseId:record.id},{noRefresh:true});
+      if(!result)return;
+      selectedCaseIdRef.current=record.id;
+      await refresh(record.id);
+      setNav('workspace');setMobileDetail(true);setReportOpen(false);
+      setToast({kind:'success',text:'案例已还原，访谈记录与报告可以继续查看。'});
+    } catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'还原未完成，请重试。'}); }
+  }
+  async function purgeCase() {
+    if(!purgeTarget)return;
+    try {
+      const result=await act({action:'purgeCase',caseId:purgeTarget.id,confirmation:'永久删除'},{noRefresh:true});
+      if(!result)return;
+      setPurgeTarget(null);selectedCaseIdRef.current=undefined;
+      await refresh();
+      setToast({kind:'success',text:'案例及本应用中的历史资料已彻底删除，无法还原。'});
+    } catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'删除未完成，请重试。'}); }
+  }
   if (data.user?.role === 'admin') return <AdminScreen data={data} busy={busy} act={act} logout={logout} toast={toast}/>;
 
   return <main className="app-shell">
     <aside className="rail"><Brand compact/><nav aria-label="主导航">
-      {data.user?.role === 'advisor' && <button className={nav==='workspace'?'active':''} onClick={()=>setNav('workspace')}><Icon name="chat"/><span>客户</span></button>}
-      <button className={nav==='review'?'active':''} onClick={()=>setNav('review')}><Icon name="review"/><span>{data.user?.role === 'reviewer'?'审核':'复核'}</span></button>
+      {data.user?.role === 'advisor' && <button className={nav==='workspace'?'active':''} onClick={()=>void openCaseList('workspace')}><Icon name="chat"/><span>客户</span></button>}
+      <button className={nav==='review'?'active':''} onClick={()=>void openCaseList('review')}><Icon name="review"/><span>{data.user?.role === 'reviewer'?'审核':'复核'}</span></button>
       <button className={nav==='settings'?'active':''} onClick={()=>setNav('settings')}><Icon name="settings"/><span>设置</span></button>
+      {data.user?.role==='advisor'&&<button className={nav==='trash'?'active':''} onClick={()=>{setNav('trash');void refresh().catch((error:Error)=>setToast({kind:'error',text:error.message}));}}><Icon name="trash"/><span>已删除案例</span></button>}
     </nav><button className="rail-profile" onClick={()=>setNav('settings')}><span className="avatar">{data.user?.name.slice(0,1)}</span><span>{data.user?.name}</span></button></aside>
 
     {(nav === 'workspace' || nav === 'review') && <aside className={`case-sidebar ${mobileDetail ? 'mobile-hide' : ''}`}>
-      <header><div><span className="eyebrow">{nav==='review'?'交接队列':'客户工作区'}</span><h2>{nav==='review'?'待 Charles 复核':'我的客户'}</h2></div>{data.user?.role==='advisor' && <button className="icon-button" aria-label="新建客户" onClick={()=>setNewClient(true)}><Icon name="plus"/></button>}</header>
+      <header><div><span className="eyebrow">{nav==='review'?'交接队列':'客户工作区'}</span><h2>{nav==='review'?reviewTitle:'我的客户'}</h2></div>{data.user?.role==='advisor' && nav==='workspace' && <button className="icon-button" aria-label="新建客户" onClick={()=>setNewClient(true)}><Icon name="plus"/></button>}</header>
+      {nav==='review'&&<div className="review-queue-controls"><label>复核范围<select value={reviewScope} onChange={event=>void openCaseList('review',event.target.value as ReviewScope)}><option value="pending">待复核</option><option value="all">全部已交接</option></select></label><p>{reviewDescription}</p></div>}
       <label className="search-field"><Icon name="search"/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜索客户或案例"/></label>
       <div className="case-list">{filteredCases.map(item=><button key={item.id} className={`case-item ${activeCase?.id===item.id?'selected':''}`} onClick={()=>void selectCase(item)}>
         <span className="avatar avatar-soft">{(item.clientName||'客').slice(0,1)}</span><span className="case-copy"><b>{item.clientName||'合成客户'}</b><small>{statusNames[item.status]||item.status}</small></span><time>{new Date(item.updatedAt).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'})}</time>
       </button>)}</div>
-      {filteredCases.length===0 && <EmptyState title="没有匹配的案例" body="换个关键词，或建立一位合成客户。"/>}
+      {filteredCases.length===0 && <EmptyState title={search.trim()?'没有匹配的案例':nav==='review'?(reviewScope==='pending'?'暂无待复核案例':'暂无已交接案例'):'暂无客户案例'} body={search.trim()?'换个关键词试试。':nav==='review'?reviewEmptyDescription:'建立一位合成客户即可开始。'}/>}
     </aside>}
 
-    <section className={`workspace ${nav==='settings'?'no-sidebar':''} ${mobileDetail||nav==='settings'?'mobile-show':''}`}>
-      <header className="workspace-header"><div>{nav!=='settings'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<h1>{nav==='settings'?'账户设置':activeCase?.clientName||'选择一个案例'}</h1>{activeCase && nav!=='settings' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">合成数据</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
-      {nav==='settings' ? <UserSettings user={data.user!}/> : activeCase ? <CaseWorkspace data={data} busy={busy} act={act} reportOpen={reportOpen} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff}/> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
+    <section className={`workspace ${nav==='settings'||nav==='trash'?'no-sidebar':''} ${mobileDetail||nav==='settings'||nav==='trash'?'mobile-show':''}`}>
+      <header className="workspace-header"><div>{nav!=='settings'&&nav!=='trash'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<h1>{nav==='settings'?'账户设置':nav==='trash'?'已删除案例':activeCase?.clientName||'选择一个案例'}</h1>{activeCase && nav!=='settings'&&nav!=='trash' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">合成数据</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
+      {nav==='settings' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace key={`${nav}:${activeCase.id}`} data={data} busy={busy} act={act} reportOpen={reportOpen} reviewMode={nav==='review'} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)}/> : nav==='review' ? <div className="welcome-workspace"><h2>{scopedCases.length?'请选择一个复核案例':'当前没有可查看的复核案例'}</h2><p>{scopedCases.length?'从左侧列表选择案例，查看报告与来源。':reviewDescription}</p></div> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
     </section>
     {newClient && <NewClientModal busy={busy==='createClient'} onClose={()=>setNewClient(false)} onSubmit={async form=>{ const result=await act({action:'createClient',...form}); setNewClient(false); selectedCaseIdRef.current=result?.caseId; setToast({kind:'success',text:'客户档案与首个案例已建立。'}); }}/>}
+    {deleteTarget && <DeleteCaseModal caseRecord={deleteTarget} busy={busy==='deleteCase'} onClose={()=>setDeleteTarget(null)} onConfirm={deleteCase}/>}
+    {purgeTarget&&<PurgeCaseModal key={purgeTarget.id} caseRecord={purgeTarget} busy={busy==='purgeCase'} onClose={()=>setPurgeTarget(null)} onConfirm={purgeCase}/>}
     {handoff && <HandoffBanner onClose={()=>setHandoff(false)}/>} {handback&&<HandbackBanner onClose={()=>setHandback(false)}/>}<ToastView toast={toast}/>
   </main>;
 }
 
 function EmptyState({ title, body }: {title:string;body:string}) { return <div className="empty-state"><span>○</span><b>{title}</b><p>{body}</p></div>; }
 
+function DeletedCases({cases,busy,onRestore,onPurge}:{cases:Case[];busy:boolean;onRestore:(record:Case)=>Promise<void>;onPurge:(record:Case)=>void}) {
+  const [search,setSearch]=useState('');
+  const filtered=cases.filter(record=>(record.clientName||'').toLowerCase().includes(search.trim().toLowerCase()));
+  return <div className="trash-view"><div className="section-heading"><div><h2>已删除案例</h2><p>还原后可继续查看访谈和报告；彻底删除后无法恢复。</p></div><span className="source-pill">{cases.length} 个案例</span></div><label className="search-field"><Icon name="search"/><input aria-label="搜索已删除案例" placeholder="搜索客户或案例" value={search} onChange={event=>setSearch(event.target.value)}/></label>
+    <div className="trash-list">{filtered.map(record=><article className="trash-card" key={record.id} aria-label={record.clientName||'已删除案例'}><div className="trash-case-info"><h3>{record.clientName||'未命名案例'}</h3><p>删除于 {record.deletedAt?new Date(record.deletedAt).toLocaleString('zh-CN'):'未记录时间'}</p><small>{statusNames[record.status]||record.status} · {record.reportVersion>0?`报告 v${record.reportVersion}`:'尚无报告'}</small></div><div className="trash-actions"><button className="button button-secondary" disabled={busy} onClick={()=>void onRestore(record)}><Icon name="retry"/>还原</button><button className="button button-danger" disabled={busy} onClick={()=>onPurge(record)}><Icon name="trash"/>彻底删除</button></div></article>)}</div>
+    {!filtered.length&&<EmptyState title={cases.length?'没有匹配的案例':'暂无已删除案例'} body={cases.length?'换个关键词试试。':'从客户列表删除的案例会显示在这里。'}/>}
+  </div>;
+}
+
+function PurgeCaseModal({caseRecord,busy,onClose,onConfirm}:{caseRecord:Case;busy:boolean;onClose:()=>void;onConfirm:()=>Promise<void>}) {
+  const [confirmation,setConfirmation]=useState('');
+  return <div className="modal-backdrop" role="presentation" onMouseDown={event=>{if(!busy&&event.target===event.currentTarget)onClose();}}><section className="modal delete-case-modal" role="dialog" aria-modal="true" aria-labelledby="purge-case-title" aria-describedby="purge-case-description" onKeyDown={event=>{if(event.key==='Escape'&&!busy)onClose();}}><header><div><span className="eyebrow">不可恢复</span><h2 id="purge-case-title">彻底删除案例？</h2></div><button className="icon-button" aria-label="关闭" disabled={busy} onClick={onClose}><Icon name="close"/></button></header><p id="purge-case-description">将永久清除“{caseRecord.clientName||'此案例'}”在本应用中的访谈、事实、全部报告与 PDF、邮件预览和复核历史。若客户已无其他案例，其档案也会删除。</p><p className="helper">已下载的文件和已有备份不在本次清除范围内。</p><form onSubmit={event=>{event.preventDefault();if(confirmation==='永久删除'&&!busy)void onConfirm();}}><label>请输入“永久删除”确认<input value={confirmation} onChange={event=>setConfirmation(event.target.value)} autoComplete="off" disabled={busy}/></label><div className="modal-actions"><button type="button" className="button button-secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button button-danger button-danger-solid" disabled={busy||confirmation!=='永久删除'}>{busy?'正在彻底删除…':'确认彻底删除'}</button></div></form></section></div>;
+}
+
 function WelcomeWorkspace({advisor,onNew,reviewer}:{advisor:string;onNew:()=>void;reviewer:boolean}) {
   return <div className="welcome-workspace"><div className="welcome-orb">A</div><span className="eyebrow">上午好，{advisor}</span><h2>{reviewer?'从待复核队列开始':'今天，从一段清楚的对话开始。'}</h2><p>{reviewer?'请选择左侧案例，核对来源、缺失信息与四类初步方向。':'先收齐六项基础资料，再将设备交给客户进入受限访谈模式。'}</p>{!reviewer&&<button className="button button-primary" onClick={onNew}><Icon name="plus"/>建立合成客户</button>}</div>;
 }
 
-function CaseWorkspace({data,busy,act,reportOpen,setReportOpen,setToast,setHandoff}:{data:Bootstrap;busy:string;act:ActionFn;reportOpen:boolean;setReportOpen:(v:boolean)=>void;setToast:(v:Toast)=>void;setHandoff:(v:boolean)=>void}) {
+function CaseWorkspace({data,busy,act,reportOpen,reviewMode,setReportOpen,setToast,setHandoff,onDelete}:{data:Bootstrap;busy:string;act:ActionFn;reportOpen:boolean;reviewMode:boolean;setReportOpen:(v:boolean)=>void;setToast:(v:Toast)=>void;setHandoff:(v:boolean)=>void;onDelete:()=>void}) {
   const caseRecord=data.activeCase!;
   const client=data.clients.find(item=>item.id===caseRecord.clientId);
   const latest=data.reports[0];
-  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'>('conversation');
+  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'>(reviewMode?'report':'conversation');
   useEffect(()=>{ if(reportOpen)setTab('report'); },[reportOpen]);
   const enterClient=async()=>{ await act({action:'enterClient',caseId:caseRecord.id}); };
   return <>
     <div className="case-banner"><div className="client-identity"><span className="avatar avatar-large">{(client?.name||'客').slice(0,1)}</span><div><b>{client?.name}</b><span>{client?.state||'州待补充'} · {client?.language||'中文'} · 案例 {caseRecord.id.slice(-6)}</span></div></div>
-      {data.user?.role==='advisor' && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'}><Icon name="plus"/>新案例</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
+      {data.user?.role==='advisor' && !reviewMode && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'}><Icon name="plus"/>新案例</button><button className="button button-danger" onClick={onDelete} disabled={busy==='deleteCase'}>删除当前案例</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
     </div>
     <nav className="tabs" aria-label="案例详情">
       <button className={tab==='conversation'?'active':''} onClick={()=>setTab('conversation')}>访谈记录</button><button className={tab==='profile'?'active':''} onClick={()=>setTab('profile')}>画像与来源</button><button className={tab==='report'?'active':''} onClick={()=>{setTab('report');setReportOpen(true)}}>内部报告 {latest&&<i>v{latest.version}</i>}</button><button className={tab==='mail'?'active':''} onClick={()=>setTab('mail')}>通知预览</button>
@@ -242,7 +332,7 @@ function ProfileView({data,act,busy,setToast}:{data:Bootstrap;act:ActionFn;busy:
   const facts=data.facts;
   const missingKeys=Object.keys(factLabels).filter(key=>!facts.some(fact=>fact.key===key));
   return <section><div className="section-heading"><div><h3>画像与来源</h3><p>客户自述不等于顾问核验；修正事实会创建新的报告版本。</p></div><div className="section-actions"><span className="source-pill">{facts.length} 项事实</span>{missingKeys.length>0&&<select aria-label="添加事实" value="" onChange={event=>{const key=event.target.value;if(key)setEditing({key,value:null,currency:null,period:null,factStatus:'unknown',sourceMessageIds:[],confirmedBy:null,confirmedAt:null})}}><option value="">＋ 添加事实</option>{missingKeys.map(key=><option key={key} value={key}>{factLabels[key]}</option>)}</select>}</div></div>
-    <div className="fact-grid">{facts.map(fact=><button className={`fact-card fact-${fact.factStatus}`} key={fact.key} onClick={()=>setEditing(fact)}><span>{factLabels[fact.key]||fact.key}</span><b>{fact.value===null?'未提供':String(fact.value)} {fact.currency||''} {fact.period?`/ ${fact.period}`:''}</b><small>{factStatusNames[fact.factStatus]}</small><footer>{fact.sourceMessageIds.length?`${fact.sourceMessageIds.length} 个来源`:'无消息来源'}</footer></button>)}</div>
+    <div className="fact-grid">{facts.map(fact=><button className={`fact-card fact-${fact.factStatus}`} key={fact.key} onClick={()=>setEditing(fact)}><span>{factLabels[fact.key]||fact.key}</span><b>{formatFactValue(fact)}</b><small>{factStatusNames[fact.factStatus]}</small><footer>{fact.sourceMessageIds.length?`${fact.sourceMessageIds.length} 个来源`:'无消息来源'}</footer></button>)}</div>
     {!facts.length&&<EmptyState title="画像尚未形成" body="完成访谈后，系统会将有来源的事实整理在这里。"/>}
     {editing&&<FactModal fact={editing} busy={busy==='updateFact'} onClose={()=>setEditing(null)} onSave={async value=>{await act({action:'updateFact',caseId:data.activeCase!.id,...value});setEditing(null);setToast({kind:'success',text:'事实已更新，旧报告已标记过时。'});}}/>}
   </section>;
@@ -257,9 +347,10 @@ function ReportView({data,report,act,busy,setHandoff}:{data:Bootstrap;report?:Re
     {reportJob?.status==='failed'&&<div className="disclosure warning"><Icon name="alert"/><p><b>新版本生成未完成</b><br/>事实与旧报告均已保存，可安全重试。</p><button className="button button-secondary" disabled={busy==='generateReport'} onClick={()=>void act({action:'generateReport',caseId:data.activeCase!.id})}>重试</button></div>}
     <div className="disclosure"><Icon name="alert"/><p><b>{report.provider.includes('mock')?'演示规则，待业务审核':'已配置云端分析'}</b><br/>{report.provider.includes('mock')?'本报告由确定性演示规则生成，不代表保险建议或业务准确率。':`分析来源：${report.provider}`}</p></div>
     {report.stale&&<div className="disclosure warning"><Icon name="alert"/><p><b>这不是最新事实版本</b><br/>事实已修改，请重新生成后再确认发送。</p></div>}
-    <div className="report-sections">{report.sections.map((section,index)=><details open={index===0} key={section.title}><summary><span>{String(index+1).padStart(2,'0')}</span>{section.title}</summary><p>{section.body}</p></details>)}</div>
-    <div className="analysis-grid">{report.analyses.map(item=><article key={item.category}><span>{categories.find(c=>c.id===item.category)?.title}</span><b>{statusNames[item.status]||item.status.replaceAll('_',' ')}</b><p>{item.reasonSummary}</p><small>缺失：{item.missingFields.join('、')||'无'}</small></article>)}</div>
-    <div className="report-footer-actions">{data.user?.role==='advisor'&&<button className="button button-primary" disabled={busy==='submitReview'} onClick={()=>void act({action:'submitReview',caseId:report.caseId})}>提交 Charles 复核</button>}{data.user?.role==='reviewer'&&<ReviewActions report={report} act={act} busy={busy} setHandoff={setHandoff}/>}</div>
+    <div className="disclosure"><Icon name="file"/><p><b>报告依据 {report.facts.length} 项已保存事实</b><br/>“资料不足”表示本次未采集到足够信息，不代表客户没有需求。语音可能识别有误，未进入事实表的内容请到访谈记录核对。</p></div>
+    <div className="report-sections">{presentReport(report).sections.map((section,index)=><details open={index===0} key={section.title}><summary><span>{String(index+1).padStart(2,'0')}</span>{section.title}</summary><p>{section.body}</p></details>)}<details><summary>来源编号与版本信息</summary><p>页面使用中文字段和简短来源编号便于阅读；下载的 PDF 与邮件预览保留生成时的版本。</p>{presentReport(report).references.map(ref=><p key={ref.id}>{ref.label}：{ref.id}</p>)}<p>案例编号：{report.caseId}<br/>客户编号：{report.clientId}<br/>报告版本：{report.version}<br/>快照编号：{report.snapshotId}</p></details></div>
+    <div className="analysis-grid">{report.analyses.map(item=><article key={item.category}><span>{categories.find(c=>c.id===item.category)?.title}</span><b>{statusNames[item.status]||item.status.replaceAll('_',' ')}</b><p>{item.reasonSummary}</p><small>待补充：{[...new Set(item.missingFields.map(key=>factLabels[key]||key))].join('、')||'无列出项'}</small></article>)}</div>
+    <div className="report-footer-actions">{data.user?.role==='advisor'&&<button className="button button-primary" disabled={busy==='submitReview'||data.activeCase?.status==='pending_review'} onClick={()=>void act({action:'submitReview',caseId:report.caseId})}>{data.activeCase?.status==='pending_review'?'已提交，等待 Charles 复核':'提交 Charles 复核'}</button>}{data.user?.role==='reviewer'&&<ReviewActions report={report} act={act} busy={busy} setHandoff={setHandoff}/>}</div>
   </section>;
 }
 
@@ -302,6 +393,10 @@ function NewClientModal({busy,onClose,onSubmit}:{busy:boolean;onClose:()=>void;o
   return <div className="modal-backdrop" role="presentation" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><section role="dialog" aria-modal="true" aria-labelledby="new-client-title" className="modal modal-wide"><header><div><span className="eyebrow">合成资料</span><h2 id="new-client-title">建立客户档案</h2><p>六项基础资料齐全后才能开始访谈。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭"><Icon name="close"/></button></header><form onSubmit={e=>{e.preventDefault();void onSubmit(form)}}><div className="form-grid"><label>姓名 *<input value={form.name} onChange={e=>update('name',e.target.value)} required/></label><label>生日 *<input type="date" value={form.birthday} onChange={e=>update('birthday',e.target.value)} required/></label><label>性别 *<select value={form.gender} onChange={e=>update('gender',e.target.value)} required><option value="">请选择</option><option>女性</option><option>男性</option><option>非二元／其他</option></select></label><label>电话号码 *<input type="tel" value={form.phone} onChange={e=>update('phone',e.target.value)} pattern="[+() 0-9-]{7,20}" required/></label><label>邮箱 *<input type="email" value={form.email} onChange={e=>update('email',e.target.value)} required/></label><label>婚姻状态 *<select value={form.maritalStatus} onChange={e=>update('maritalStatus',e.target.value)} required><option value="">请选择</option><option>单身</option><option>已婚</option><option>伴侣关系</option><option>离异</option><option>丧偶</option></select></label><label>居住州<input value={form.state} onChange={e=>update('state',e.target.value)} maxLength={2}/></label><label>访谈语言<select value={form.language} onChange={e=>update('language',e.target.value)}><option>中文</option><option>English</option></select></label></div><div className="modal-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button className="button button-primary" disabled={busy}>{busy?'正在建立…':'建立档案与案例'}</button></div></form></section></div>;
 }
 
+function DeleteCaseModal({caseRecord,busy,onClose,onConfirm}:{caseRecord:Case;busy:boolean;onClose:()=>void;onConfirm:()=>Promise<void>}) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={event=>{if(!busy&&event.target===event.currentTarget)onClose()}}><section role="dialog" aria-modal="true" aria-labelledby="delete-case-title" aria-describedby="delete-case-description" className="modal delete-case-modal"><header><div><span className="eyebrow">案例管理</span><h2 id="delete-case-title">删除当前案例？</h2><p id="delete-case-description">此操作会将“{caseRecord.clientName||'当前案例'}”从案例列表移除，历史资料会保留。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭" disabled={busy}><Icon name="close"/></button></header><div className="modal-actions"><button type="button" className="button button-secondary" onClick={onClose} disabled={busy}>取消</button><button type="button" className="button button-danger button-danger-solid" onClick={()=>void onConfirm()} disabled={busy}>{busy?'正在移除…':'移除案例'}</button></div></section></div>;
+}
+
 function FactModal({fact,busy,onClose,onSave}:{fact:ProfileField;busy:boolean;onClose:()=>void;onSave:(v:Record<string,unknown>)=>Promise<void>}) {
   const isMoney=moneyFactKeys.has(fact.key); const [value,setValue]=useState(String(fact.value??'')); const [currency,setCurrency]=useState(fact.currency||'USD'); const [period,setPeriod]=useState(fact.period||'year'); const [status,setStatus]=useState(fact.factStatus); const [reason,setReason]=useState(''); const noValue=status==='unknown'||status==='declined';
   return <div className="modal-backdrop"><section className="modal"><header><div><span className="eyebrow">修正事实</span><h2>{factLabels[fact.key]||fact.key}</h2></div><button className="icon-button" onClick={onClose}><Icon name="close"/></button></header><form onSubmit={e=>{e.preventDefault();void onSave({key:fact.key,value:noValue?null:isMoney?Number(value):value,currency:isMoney&&!noValue?currency:null,period:isMoney&&!noValue?period:null,factStatus:status,reason})}}><label>内容<input type={isMoney?'number':'text'} min={isMoney?'0':undefined} value={noValue?'':value} onChange={e=>setValue(e.target.value)} disabled={noValue} required={!noValue}/></label>{isMoney&&!noValue&&<div className="form-grid"><label>币种<select value={currency} onChange={e=>setCurrency(e.target.value)}><option>USD</option><option>CNY</option><option>CAD</option><option>EUR</option><option>HKD</option></select></label><label>周期<select value={period} onChange={e=>setPeriod(e.target.value)}><option value="month">每月</option><option value="year">每年</option><option value="once">一次性／余额</option></select></label></div>}<label>事实状态<select value={status} onChange={e=>setStatus(e.target.value as FactStatus)}>{Object.entries(factStatusNames).map(([key,label])=><option key={key} value={key}>{label}</option>)}</select></label><label>修正理由 *<textarea value={reason} onChange={e=>setReason(e.target.value)} required/></label><div className="modal-actions"><button type="button" className="button button-secondary" onClick={onClose}>取消</button><button className="button button-primary" disabled={busy}>{busy?'正在保存…':'保存并创建新版本'}</button></div></form></section></div>;
@@ -312,7 +407,7 @@ function HandoffBanner({onClose}:{onClose:()=>void}) {return <div className="han
 function HandbackBanner({onClose}:{onClose:()=>void}) {return <div className="handoff-banner handback-banner" role="status"><span className="success-ring"><Icon name="check"/></span><div><b>设备已回到顾问模式</b><p>请确认手机已交还。报告会在服务端后台生成，内部内容不会自动展开或朗读。</p></div><button onClick={onClose} className="icon-button" aria-label="关闭提示"><Icon name="close"/></button></div>}
 
 function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Bootstrap;busy:string;act:ActionFn;refresh:(caseId?:string)=>Promise<Bootstrap>;setHandback:(value:boolean)=>void;setToast:(v:Toast)=>void}) {
-  const session=data.clientSession!; const [draft,setDraft]=useState(''); const [muted,setMuted]=useState(false); const [ending,setEnding]=useState(false); const [interim,setInterim]=useState<{role:'user'|'assistant';text:string}|null>(null); const [voiceState,setVoiceState]=useState<BrowserVoiceState>('idle'); const messagesEnd=useRef<HTMLDivElement>(null); const voiceRef=useRef<BrowserVoiceClient|null>(null);
+  const session=data.clientSession!; const [draft,setDraft]=useState(''); const [muted,setMuted]=useState(false); const [ending,setEnding]=useState(false); const [interim,setInterim]=useState<{role:'user'|'assistant';text:string}|null>(null); const [voiceState,setVoiceState]=useState<BrowserVoiceState>('idle'); const [voiceError,setVoiceError]=useState(''); const messagesEnd=useRef<HTMLDivElement>(null); const voiceRef=useRef<BrowserVoiceClient|null>(null);
   const [pendingText,setPendingText]=useState<{text:string;eventId:string;saved:boolean}|null>(null);
   const [liveMessages,setLiveMessages]=useState(data.messages);
   useEffect(()=>setLiveMessages(data.messages),[data.messages]);
@@ -324,9 +419,10 @@ function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Boot
   },[data.csrf]);
   const started=Boolean(session.entry); const voiceConfigured=data.capabilities.voiceConfigured;
   const stateLabel:Record<BrowserVoiceState,string>={idle:'等待开始',connecting:'正在连接',listening:'正在听您说',thinking:'正在思考',speaking:'正在回答',reconnecting:'连接恢复中',paused:'访谈已暂停',ended:'访谈已结束',error:'语音不可用'};
-  async function choose(entry:Category){await act({action:'chooseEntry',entry});setVoiceState('idle');}
+  async function choose(entry:Category){await act({action:'chooseEntry',entry});setVoiceError('');setVoiceState('idle');}
   async function startVoice(){
-    if(!voiceRef.current) voiceRef.current=new BrowserVoiceClient({csrf:data.csrf,onState:setVoiceState,onInterim:event=>setInterim(event),onError:text=>setToast({kind:'error',text}),onInterrupted:()=>setInterim(null),onMicPermission:granted=>{if(!granted)setToast({kind:'error',text:'麦克风权限未开启，您仍可用文字继续。'})},onFinal:event=>{setInterim(null);setLiveMessages(previous=>[...previous,{id:crypto.randomUUID(),caseId:'client-safe',sessionId:session.id,turnId:crypto.randomUUID(),eventId:crypto.randomUUID(),role:event.role,text:event.text,final:true,interrupted:event.interrupted,createdAt:new Date().toISOString()}])}});
+    setVoiceError('');
+    if(!voiceRef.current) voiceRef.current=new BrowserVoiceClient({csrf:data.csrf,onState:setVoiceState,onInterim:event=>setInterim(event),onError:text=>{setVoiceError(text);setToast({kind:'error',text});},onInterrupted:()=>setInterim(null),onFinal:event=>{setInterim(null);setLiveMessages(previous=>[...previous,{id:crypto.randomUUID(),caseId:'client-safe',sessionId:session.id,turnId:crypto.randomUUID(),eventId:crypto.randomUUID(),role:event.role,text:event.text,final:true,interrupted:event.interrupted,createdAt:new Date().toISOString()}])}});
     try{await voiceRef.current.start();setToast({kind:'info',text:voiceConfigured?'正在建立实时语音连接。':'实时服务未配置；请使用文字完成演示。'});}catch{/* client reports a safe error through callbacks */}
   }
   async function submitText(message:{text:string;eventId:string;saved:boolean}){
@@ -342,7 +438,7 @@ function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Boot
   return <main className="client-page"><div className="client-backdrop"><Brand/><div><span className="eyebrow">受限客户模式</span><h1>安心说，我们一次聊一件事。</h1><p>这个模式只能访问当前案例的客户可见内容。</p></div><span className="demo-pill">{voiceConfigured?'实时语音已配置':'模拟功能 · 合成资料'}</span></div>
     <section className="assistant-panel"><header><div className="assistant-identity"><span className="assistant-avatar">A</span><div><b>Aeconn AI 助手</b><span><i className={`state-dot state-${voiceState}`}/>{started?stateLabel[voiceState]:'准备访谈'}</span></div></div>{started&&<button className="icon-button" aria-label={session.state==='paused'?'恢复访谈':'暂停访谈'} onClick={()=>void togglePause()}><Icon name="pause"/></button>}</header>
       <div className="assistant-content">{!started?<WelcomeAssistant onChoose={choose} busy={busy==='chooseEntry'}/>:<><div className="privacy-intro"><Icon name="check"/><p>我会通过几个问题了解您的情况，供顾问后续跟进。您可以回答“不知道”或“不愿提供”。</p></div><span className="source-pill interview-source">{data.capabilities.interview?.includes('云端 AI')?'文字访谈 · 真实 API（待验收）':data.capabilities.interview==='云端配置不完整'?'文字访谈 · 云端配置不完整':'文字访谈 · 本地演示逻辑'}</span>{session.state==='paused'&&<div className="paused-card"><Icon name="pause"/><b>访谈已暂停</b><p>采集与播音均已停止。点击右上角按钮后才会恢复。</p></div>}<div className="chat-stream">{liveMessages.map(message=><div key={message.id} className={`bubble-row ${message.role}`}><div className="bubble"><p>{message.text}</p>{message.role==='assistant'&&<button aria-label="重播这条回答" onClick={()=>void voiceRef.current?.replayLast()}><Icon name="speaker"/>重播</button>}</div></div>)}{interim&&<div className={`bubble-row ${interim.role} interim-row`} aria-live="polite"><div className="bubble"><span>实时字幕</span><p>{interim.text}</p></div></div>}<div ref={messagesEnd}/></div></>}</div>
-      {started&&<footer className="assistant-controls">{pendingText&&<div className="pending-message" role="status"><Icon name={pendingText.saved?'check':'alert'}/><div><b>{pendingText.saved?'回答已保存，云端回复未完成':'发送未完成'}</b><p>{pendingText.text}</p></div><button className="button button-secondary" disabled={busy==='message'} onClick={()=>void submitText(pendingText)}>用原回答重试</button></div>}{voiceState==='error'&&<div className="inline-error"><Icon name="alert"/><span>实时语音不可用，您仍可用文字继续。</span></div>}{voiceState==='idle'&&session.state!=='paused'&&<button className="voice-start" onClick={()=>void startVoice()}><Icon name="mic"/><span><b>开始连续语音对话</b><small>授权后无需每句话点发送</small></span></button>}<div className="voice-row"><button className={`voice-button ${voiceState==='listening'?'listening':''}`} onClick={()=>voiceState==='idle'||voiceState==='error'?void startVoice():toggleMute()} aria-label={muted?'取消静音':'麦克风静音'}><Icon name={muted?'mute':'mic'}/></button><div><b>{muted?'已静音':stateLabel[voiceState]}</b><span>{voiceConfigured?'真实服务已配置 · 待目标手机验证':'模拟界面 · 未调用实时语音服务'}</span></div><button className="end-button" disabled={busy==='end'} onClick={()=>void end()}>结束对话</button></div><form className="message-form" onSubmit={sendMessage}><input aria-label="文字回答" value={draft} onChange={e=>setDraft(e.target.value)} disabled={Boolean(pendingText)} placeholder={pendingText?'请先重试已保存的回答':'输入文字回答，或说‘不知道’…'}/><button aria-label="发送" disabled={!draft.trim()||busy==='message'||Boolean(pendingText)}><Icon name="send"/></button></form></footer>}
+      {started&&<footer className="assistant-controls">{pendingText&&<div className="pending-message" role="status"><Icon name={pendingText.saved?'check':'alert'}/><div><b>{pendingText.saved?'回答已保存，云端回复未完成':'发送未完成'}</b><p>{pendingText.text}</p></div><button className="button button-secondary" disabled={busy==='message'} onClick={()=>void submitText(pendingText)}>用原回答重试</button></div>}{voiceState==='error'&&<div className="inline-error"><Icon name="alert"/><span>{voiceError||'实时语音暂时不可用，您仍可用文字继续。'}</span></div>}{voiceState==='idle'&&session.state!=='paused'&&<button className="voice-start" onClick={()=>void startVoice()}><Icon name="mic"/><span><b>开始连续语音对话</b><small>授权后无需每句话点发送</small></span></button>}<div className="voice-row"><button className={`voice-button ${voiceState==='listening'?'listening':''}`} onClick={()=>voiceState==='idle'||voiceState==='error'?void startVoice():toggleMute()} aria-label={muted?'取消静音':'麦克风静音'}><Icon name={muted?'mute':'mic'}/></button><div><b>{muted?'已静音':stateLabel[voiceState]}</b><span>{voiceConfigured?'真实服务已配置 · 待目标手机验证':'模拟界面 · 未调用实时语音服务'}</span></div><button className="end-button" disabled={busy==='end'} onClick={()=>void end()}>结束对话</button></div><form className="message-form" onSubmit={sendMessage}><input aria-label="文字回答" value={draft} onChange={e=>setDraft(e.target.value)} disabled={Boolean(pendingText)} placeholder={pendingText?'请先重试已保存的回答':'输入文字回答，或说‘不知道’…'}/><button aria-label="发送" disabled={!draft.trim()||busy==='message'||Boolean(pendingText)}><Icon name="send"/></button></form></footer>}
     </section><ToastView toast={null}/>
   </main>;
 }

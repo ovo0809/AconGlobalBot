@@ -1,4 +1,5 @@
 import { messageSource, type Case, type Category, type Message, type ProfileField } from './domain';
+import type { UsageContext } from './ai-usage';
 
 export const INTERVIEW_QUESTIONS = {
   goal: '您最希望解决什么问题？大约计划什么时候开始？',
@@ -23,6 +24,7 @@ export const INTERVIEW_QUESTIONS = {
 export type InterviewFactKey = keyof typeof INTERVIEW_QUESTIONS;
 
 export interface InterviewInput {
+  usageContext?: UsageContext;
   facts: ProfileField[];
   messages: Message[];
   entry: Category;
@@ -65,6 +67,8 @@ const CURRENCIES = ['USD', 'CNY', 'CAD', 'EUR', 'HKD'] as const;
 const PERIODS = ['month', 'year', 'once'] as const;
 const OUTPUT_STATUSES = ['reported_unverified', 'unknown', 'declined', 'conflicting'] as const;
 const ALL_FACT_STATUSES: ProfileField['factStatus'][] = ['confirmed', 'reported_unverified', 'unknown', 'declined', 'conflicting'];
+const UNKNOWN_EVIDENCE_PATTERN = /(不知道|不曉得|未知|不清楚|需要补充|需要補充|unknown)/i;
+const DECLINED_EVIDENCE_PATTERN = /(不愿提供|不願提供|不愿回答|不願回答|拒答|跳过|跳過|declined)/i;
 
 export const INTERVIEW_SCHEMA = {
   type: 'object',
@@ -306,8 +310,8 @@ export function parseGroundedAnswer(key: string, text: string, messageId: string
     confirmedBy: null,
     confirmedAt: null,
   };
-  if (/^(不知道|未知|不清楚|需要补充|unknown)$/i.test(normalizedText)) return { ...base, value: null, factStatus: 'unknown' };
-  if (/^(不愿提供|不愿回答|拒答|跳过|declined)$/i.test(normalizedText)) return { ...base, value: null, factStatus: 'declined' };
+  if (new RegExp(`^(?:${UNKNOWN_EVIDENCE_PATTERN.source})$`, 'i').test(normalizedText)) return { ...base, value: null, factStatus: 'unknown' };
+  if (new RegExp(`^(?:${DECLINED_EVIDENCE_PATTERN.source})$`, 'i').test(normalizedText)) return { ...base, value: null, factStatus: 'declined' };
   if (!AMOUNT_KEYS.has(key as InterviewFactKey)) return base;
 
   const numbers = exactNumberTokens(normalizedText);
@@ -355,7 +359,7 @@ function validateReturnedFact(row: unknown, input: InterviewInput, finalUserById
     if (existing && !existing.sourceMessageIds.every((id) => refs.includes(id))) throw new Error('A conflict must retain the existing fact sources.');
   } else if (status === 'unknown' || status === 'declined') {
     if (fact.value !== null || fact.currency !== null || fact.period !== null) throw new Error('Unknown or declined facts must remain null without units.');
-    const pattern = status === 'unknown' ? /(不知道|未知|不清楚|需要补充|unknown)/i : /(不愿提供|不愿回答|拒答|跳过|declined)/i;
+    const pattern = status === 'unknown' ? UNKNOWN_EVIDENCE_PATTERN : DECLINED_EVIDENCE_PATTERN;
     if (!sources.some((message) => pattern.test(message.text))) throw new Error('Unknown or declined status is not supported by the cited text.');
     if (existing) throw new Error('Interview output cannot repeat an already answered fact.');
   } else {

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import PDFDocument from 'pdfkit';
 import { messageSource, type AnalysisItem, type Category, type DemandStatus, type Message, type ProfileField, type ReportContent, type ReportInput } from './domain';
+import { demandStatusLabels, factLabel, factStatusLabels, formatFactValue, reviewStatusLabel } from './report-labels';
 
 const CATEGORIES: Category[] = ['life', 'annuity', 'ltc', 'disability_income'];
 const STATUSES: DemandStatus[] = ['priority_discussion', 'secondary_discussion', 'defer', 'insufficient_information', 'review_existing'];
@@ -11,8 +12,6 @@ const RULE_VERSION = 'demo_unapproved/1.0';
 const FONT_PATH = path.join(process.cwd(), 'public', 'fonts', 'NotoSansCJKsc-Regular.otf');
 
 const categoryLabel: Record<Category, string> = { life: '人寿', annuity: '年金／退休收入', ltc: '长期护理', disability_income: '伤残收入保障' };
-const statusLabel: Record<DemandStatus, string> = { priority_discussion: '优先讨论', secondary_discussion: '次要讨论', defer: '暂缓', insufficient_information: '资料不足', review_existing: '复核现有安排' };
-const factStatusLabel: Record<ProfileField['factStatus'], string> = { confirmed: '已确认', reported_unverified: '客户陈述／待核验', unknown: '未知', declined: '不愿提供', conflicting: '存在冲突' };
 
 const factMap = (facts: ProfileField[]) => new Map(facts.map((fact) => [fact.key, fact]));
 const usable = (fact: ProfileField | undefined): fact is ProfileField => Boolean(fact && (fact.factStatus === 'confirmed' || fact.factStatus === 'reported_unverified') && fact.value !== null && fact.value !== '');
@@ -144,14 +143,6 @@ export function validateAnalyses(analyses: AnalysisItem[], facts: ProfileField[]
   }
 }
 
-function displayFact(fact: ProfileField): string {
-  if (fact.factStatus === 'unknown') return '未知';
-  if (fact.factStatus === 'declined') return '不愿提供';
-  if (fact.value === null) return '未提供';
-  const unit = [fact.currency, fact.period].filter(Boolean).join('/');
-  return `${String(fact.value)}${unit ? ` (${unit})` : ''}`;
-}
-
 const sourceKindLabel = { customer: '客户自述', advisor: '顾问更正', synthetic: '合成资料' } as const;
 
 function factSourceSummary(fact: ProfileField, messagesById: Map<string, Message>): string {
@@ -174,19 +165,29 @@ export function buildReport(input: ReportInput): ReportContent {
   if (input.caseRecord.ownerAgentId !== input.owner.id) throw new Error('报告归属顾问与案例不一致');
 
   const messagesById = new Map(input.messages.map((message) => [message.id, message]));
-  const factLines = input.facts.map((fact) => `${fact.key}: ${displayFact(fact)} [${factStatusLabel[fact.factStatus]}]；来源：${factSourceSummary(fact, messagesById)}`);
-  const directionLines = input.analyses.map((entry) => `${categoryLabel[entry.category]} — ${statusLabel[entry.status]}：${entry.reasonSummary}`);
+  const factLines = input.facts.map((fact) => {
+    const value = formatFactValue(fact);
+    const status = factStatusLabels[fact.factStatus];
+    return `${factLabel(fact.key)}：${value}${value === status ? '' : ` [${status}]`}；来源：${factSourceSummary(fact, messagesById)}`;
+  });
+  const directionLines = input.analyses.map((entry) => `${categoryLabel[entry.category]} — ${demandStatusLabels[entry.status]}：${entry.reasonSummary}`);
   const evidenceLines = input.analyses.map((entry) => `${categoryLabel[entry.category]}：${entry.evidenceRefs.length ? entry.evidenceRefs.join('、') : '无引用；资料不足'}`);
-  const limitationLines = input.analyses.flatMap((entry) => [
-    ...entry.constraints.map((constraint) => `${categoryLabel[entry.category]}：${constraint}`),
-    ...entry.missingFields.map((field) => `${categoryLabel[entry.category]}缺失：${field}`),
-  ]);
+  const limitationLines = input.analyses.flatMap((entry) => entry.constraints.map((constraint) => `${categoryLabel[entry.category]}：${constraint}`));
+  const missingCategories = new Map<string, Set<Category>>();
+  for (const entry of input.analyses) for (const field of entry.missingFields) {
+    const categories = missingCategories.get(field) ?? new Set<Category>();
+    categories.add(entry.category);
+    missingCategories.set(field, categories);
+  }
+  limitationLines.push(...[...missingCategories].map(([field, categories]) =>
+    `待补充：${factLabel(field)}（涉及：${[...categories].map((category) => categoryLabel[category]).join('、')}）`,
+  ));
   if (input.incompleteTranscript) limitationLines.unshift('部分语音转写未完成或收尾超时；未确认的残留片段未作为事实，需顾问核对。');
   const questionLines = [...new Set(input.analyses.flatMap((entry) => entry.nextQuestions))];
   const specialLines = limitationLines.filter((line) => /(专项|转移|转保|退保|冲突)/.test(line));
   const reviewNote = input.reviewNote?.trim();
   const sections = [
-    { title: '一、客户画像', body: bullets(factLines) },
+    { title: '一、客户画像', body: factLines.length ? bullets(factLines) : '尚未提取到有来源的访谈事实，请先核对访谈记录。' },
     { title: '二、四类初步方向', body: bullets(directionLines) },
     { title: '三、证据与理由', body: bullets(evidenceLines) },
     { title: '四、反对因素／限制／缺失', body: bullets(limitationLines) },
@@ -194,7 +195,7 @@ export function buildReport(input: ReportInput): ReportContent {
     {
       title: '六、给 Charles 的交接摘要与专项审核项',
       body: bullets([
-        `请复核四类方向、证据及缺失项；当前复核状态：${input.reviewStatus}。`,
+        `请复核四类方向、证据及缺失项；当前复核状态：${reviewStatusLabel(input.reviewStatus)}。`,
         ...(reviewNote ? [`本版本人工复核意见：${reviewNote}`] : []),
         ...(specialLines.length ? specialLines : ['未识别到专项执行事项；所有业务判断仍需人工审核。']),
         '本报告不生成报价，不执行申请、退保、转保、rollover 或资金转移。',
@@ -209,7 +210,7 @@ export function buildReport(input: ReportInput): ReportContent {
     `顾问联系邮箱（程序字段）：${input.owner.email}`,
     `生成时间：${input.createdAt}`,
     `report_version：${input.version}`,
-    `复核状态：${input.reviewStatus}`,
+    `复核状态：${reviewStatusLabel(input.reviewStatus)}`,
     `snapshot_id：${input.snapshotId}`,
     `规则版本：${RULE_VERSION}`,
     `分析来源：${input.provider}`,
@@ -265,7 +266,7 @@ export async function renderPdf(report: ReportContent): Promise<Buffer> {
       `case_id：${report.caseId}`,
       `生成时间：${report.createdAt}`,
       `report_version：${report.version}`,
-      `复核状态：${report.reviewStatus}`,
+      `复核状态：${reviewStatusLabel(report.reviewStatus)}`,
       `snapshot_id：${report.snapshotId}`,
       `规则版本：${report.ruleVersion}`,
       `分析来源：${report.provider}`,

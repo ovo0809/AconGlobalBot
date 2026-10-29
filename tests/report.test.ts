@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import type { Client, Message, ProfileField, ReportInput, User } from '../lib/domain';
 import { analyzeDemo, buildReport, renderPdf, validateAnalyses, validateFacts } from '../lib/report';
+import { formatFactValue } from '../lib/report-labels';
 import { scenarios } from '../lib/scenarios';
 
 function messagesFor(facts: ProfileField[], caseId = 'case-1'): Message[] {
@@ -71,6 +72,16 @@ test('unknown and declined money stay null rather than becoming zero', () => {
   assert.throws(() => validateFacts([{ ...scenario.facts[1], value: 0 }]), /必须保留为 null/);
 });
 
+test('report value labels distinguish unknown, declined, conflicts and ordinary missing values', () => {
+  const base = { key: 'budget', currency: null, period: null, sourceMessageIds: [], confirmedBy: null, confirmedAt: null };
+  assert.equal(formatFactValue({ ...base, value: null, factStatus: 'unknown' }), '客户表示不清楚');
+  assert.equal(formatFactValue({ ...base, value: null, factStatus: 'declined' }), '客户不愿提供');
+  assert.equal(formatFactValue({ ...base, value: null, factStatus: 'conflicting' }), '说法存在冲突，待核对');
+  assert.equal(formatFactValue({ ...base, value: null, factStatus: 'confirmed' }), '未提供');
+  assert.equal(formatFactValue({ ...base, value: 5000, currency: 'USD', period: 'month', factStatus: 'confirmed' }), '5000（USD／每月）');
+  assert.equal(formatFactValue({ ...base, value: 1e-21, currency: 'USD', period: 'month', factStatus: 'confirmed' }), '1e-21（USD／每月）');
+});
+
 test('conflicting income cannot become a direction until clarified', () => {
   const scenario = scenarios.find((entry) => entry.name === 'conflicting-income-period');
   assert.ok(scenario);
@@ -115,9 +126,27 @@ test('report has immutable identifiers, programmatic contact data and six requir
   assert.match(report.fullText, /demo_unapproved/);
   assert.match(report.fullText, /演示规则，待业务审核/);
   assert.match(report.fullText, /六、给 Charles 的交接摘要与专项审核项/);
+  assert.match(report.fullText, /复核状态：草稿/);
   assert.match(report.fullText, /本版本人工复核意见：approved：已核对合成案例引用与缺失项/);
   assert.ok(report.headerLines?.some((line) => line.includes('归属顾问：合成顾问 林 / advisor-1')));
   assert.match(report.sections[0].body, /来源：[^\n]+ \[合成资料\]/);
+  assert.doesNotMatch(report.sections[0].body, /\b(?:goal|income|dependents|existing_life)：/);
+});
+
+test('report groups repeated missing fields by Chinese label without dropping category constraints', () => {
+  const input = reportInput([]);
+  input.analyses = [
+    { category: 'life', status: 'insufficient_information', evidenceRefs: [], reasonSummary: '资料不足。', missingFields: ['goal'], constraints: ['人寿限制。'], nextQuestions: [] },
+    { category: 'annuity', status: 'insufficient_information', evidenceRefs: [], reasonSummary: '资料不足。', missingFields: ['goal'], constraints: ['年金限制。'], nextQuestions: [] },
+    { category: 'ltc', status: 'insufficient_information', evidenceRefs: [], reasonSummary: '资料不足。', missingFields: ['care'], constraints: [], nextQuestions: [] },
+    { category: 'disability_income', status: 'insufficient_information', evidenceRefs: [], reasonSummary: '资料不足。', missingFields: ['income'], constraints: [], nextQuestions: [] },
+  ];
+  const report = buildReport(input);
+  assert.equal(report.sections[0].body, '尚未提取到有来源的访谈事实，请先核对访谈记录。');
+  assert.equal(report.sections[3].body.match(/待补充：主要目标/g)?.length, 1);
+  assert.match(report.sections[3].body, /待补充：主要目标（涉及：人寿、年金／退休收入）/);
+  assert.match(report.sections[3].body, /人寿：人寿限制。/);
+  assert.match(report.sections[3].body, /年金／退休收入：年金限制。/);
 });
 
 test('report labels customer, advisor and synthetic fact sources without guessing actor names', () => {

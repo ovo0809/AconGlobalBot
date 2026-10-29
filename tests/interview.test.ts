@@ -136,6 +136,27 @@ test('validates exact string, amount, unknown and declined facts from final user
   assert.equal(turn.facts.find((item) => item.key === 'care')?.value, null);
 });
 
+test('accepts explicit traditional unknown and declined evidence but rejects unsupported status', () => {
+  const messages = [
+    message('traditional-unknown', 'user', '這個我不曉得，需要補充資料'),
+    message('traditional-declined', 'user', '這項我不願提供，先跳過'),
+    message('no-status-evidence', 'user', '預算還沒有決定'),
+  ];
+  const accepted = validateInterviewTurn({
+    reply: '谢谢。接下来想了解您的退休计划。',
+    facts: [
+      { key: 'care', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['traditional-unknown'] },
+      { key: 'budget', value: null, currency: null, period: null, factStatus: 'declined', sourceMessageIds: ['traditional-declined'] },
+    ],
+  }, input('ltc', [], messages));
+  assert.deepEqual(accepted.facts.map((item) => item.factStatus), ['unknown', 'declined']);
+
+  assert.throws(() => validateInterviewTurn({
+    reply: '请明确预算金额、币种和周期。',
+    facts: [{ key: 'budget', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['no-status-evidence'] }],
+  }, input('ltc', [], messages)), /not supported by the cited text/);
+});
+
 test('recognizes explicit Chinese monthly and annual amount periods', () => {
   for (const [id, text, period] of [
     ['annual-income', '年收入 80000 美元', 'year'],
