@@ -8,7 +8,9 @@ test('会谈录音：假麦克风、暂停刷新、核对来源、后台报告�
   const requests:string[]=[];
   page.on('websocket', socket=>requests.push(socket.url()));
   await page.addInitScript(()=>{
-    const state={starts:0,stops:0};Object.defineProperty(window,'__recordingMedia',{value:state});
+    const state={starts:0,stops:0,plays:0};Object.defineProperty(window,'__recordingMedia',{value:state});
+    const play=HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play=function(){state.plays++;return play.call(this);};
     const original=navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia=async constraints=>{
       state.starts++;const stream=await original(constraints);
@@ -40,19 +42,33 @@ test('会谈录音：假麦克风、暂停刷新、核对来源、后台报告�
   await page.getByRole('button',{name:'会谈录音',exact:true}).click();
   await page.getByRole('button',{name:'暂停并保存'}).click();
   await expect(page.locator('.recording-meter')).toContainText('已保存 1 段');
-  expect(await page.evaluate(()=>(window as unknown as {__recordingMedia:{starts:number;stops:number}}).__recordingMedia)).toEqual({starts:1,stops:1});
+  expect(await page.evaluate(()=>(window as unknown as {__recordingMedia:{starts:number;stops:number}}).__recordingMedia)).toMatchObject({starts:1,stops:1});
   await page.reload();
   await expect(page.locator('.recording-meter')).toContainText('已保存 1 段');
   await page.getByRole('button',{name:'结束并开始转写'}).click();
   await expect(page.getByRole('heading',{name:'核对转写和说话人'})).toBeVisible();
   expect(await page.evaluate(()=>(window as unknown as {__recordingMedia:{starts:number}}).__recordingMedia.starts)).toBe(0);
   expect(requests.filter(url=>/\/voice\?/.test(url))).toEqual([]);
+  // A slow audio download must not start playback after the advisor leaves this case.
+  let releaseAudio!:()=>void;
+  const audioGate=new Promise<void>(resolve=>{releaseAudio=resolve;});
+  await page.route('**/api/recording?*audioIndex=0',async route=>{
+    const response=await route.fetch();await audioGate;await route.fulfill({response}).catch(()=>undefined);
+  });
+  const downloading=page.waitForRequest(request=>request.url().includes('audioIndex=0'));
+  await page.getByRole('button',{name:'播放此段'}).first().click();await downloading;
+  await page.getByRole('button',{name:'设置',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'账户设置'})).toBeVisible();
+  releaseAudio();
+  await page.getByRole('button',{name:'客户',exact:true}).click();
+  await page.locator('.case-item').filter({hasText:'会谈录音合成验收'}).click();
+  await expect(page.getByRole('heading',{name:'核对转写和说话人'})).toBeVisible();
+  expect(await page.evaluate(()=>(window as unknown as {__recordingMedia:{plays:number}}).__recordingMedia.plays)).toBe(0);
   await expect(page.getByLabel('说话人').first()).toHaveValue('unclear');
   await expect(page.getByRole('button',{name:'确认客户原话并生成报告'})).toBeDisabled();
   await page.getByLabel('说话人').first().selectOption('customer');
   await page.getByLabel('核对后的文字').first().fill('我计划明年开始准备家庭保障。');
   await page.setViewportSize({width:390,height:844});
-  await page.locator('.case-item').filter({hasText:'会谈录音合成验收'}).click();
   await expect(page.getByLabel('核对后的文字').first()).toHaveValue('我计划明年开始准备家庭保障。');
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   await page.getByLabel('我已核对说话人和文字；只有客户亲自陈述的内容被标为“客户”').check();

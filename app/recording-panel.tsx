@@ -43,6 +43,7 @@ export function RecordingPanel({caseId,csrf,onChanged}:Props){
   const clientRef=useRef<BrowserRecordingClient|null>(null);
   const audioRef=useRef<HTMLAudioElement|null>(null);
   const audioUrlRef=useRef<string|null>(null);
+  const playbackRequest=useRef<AbortController|null>(null);
 
   const applyDetail=useCallback((next:RecordingDetail)=>{
     setDetail(next);setDuration(current=>Math.max(current,next.session?.durationSeconds??0));
@@ -60,7 +61,7 @@ export function RecordingPanel({caseId,csrf,onChanged}:Props){
     const client=new BrowserRecordingClient({caseId,csrf,onState:setBrowserState,onDuration:setDuration,onDetail:next=>{applyDetail(next);if(next.leaseToken)setControllable(true);},onError:setError});
     clientRef.current=client;
     void refresh();
-    return()=>{if(clientRef.current===client)clientRef.current=null;void client.dispose();if(audioUrlRef.current)URL.revokeObjectURL(audioUrlRef.current);audioRef.current?.pause();};
+    return()=>{if(clientRef.current===client)clientRef.current=null;void client.dispose();playbackRequest.current?.abort();if(audioUrlRef.current)URL.revokeObjectURL(audioUrlRef.current);audioRef.current?.pause();};
   },[applyDetail,caseId,csrf,refresh]);
 
   const serverState=detail?.session?.state;
@@ -110,14 +111,18 @@ export function RecordingPanel({caseId,csrf,onChanged}:Props){
   });
 
   const play=async(index:number)=>{
+    playbackRequest.current?.abort();
+    const request=new AbortController();playbackRequest.current=request;
     setError(null);
     try{
       audioRef.current?.pause();if(audioUrlRef.current)URL.revokeObjectURL(audioUrlRef.current);
-      const response=await fetch(`/api/recording?caseId=${encodeURIComponent(caseId)}&audioIndex=${index}`,{cache:'no-store',credentials:'same-origin'});
+      const response=await fetch(`/api/recording?caseId=${encodeURIComponent(caseId)}&audioIndex=${index}`,{cache:'no-store',credentials:'same-origin',signal:request.signal});
       if(!response.ok){const data=await response.json().catch(()=>({error:'无法播放此录音分段。'})) as {error?:string};throw new Error(data.error||'无法播放此录音分段。');}
-      audioUrlRef.current=URL.createObjectURL(await response.blob());
+      const blob=await response.blob();
+      if(request.signal.aborted||playbackRequest.current!==request)return;
+      audioUrlRef.current=URL.createObjectURL(blob);
       const audio=new Audio(audioUrlRef.current);audioRef.current=audio;await audio.play();
-    }catch(cause){setError(safeError(cause));}
+    }catch(cause){if(!request.signal.aborted)setError(safeError(cause));}
   };
 
   if(!detail)return <section className="recording-panel"><div className="recording-loading" role="status">正在读取录音状态…</div>{error&&<div className="inline-error">{error}</div>}</section>;
