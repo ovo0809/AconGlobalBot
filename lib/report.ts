@@ -152,7 +152,10 @@ function factSourceSummary(fact: ProfileField, messagesById: Map<string, Message
   return fact.sourceMessageIds.map((id) => {
     const message = messagesById.get(id)!;
     const actor = message.actorId ? `；actor_id=${message.actorId}` : '';
-    return `${id} [${sourceKindLabel[messageSource(message)]}${actor}]`;
+    const recording=message.sourceKind==='advisor_reviewed_recording';
+    const kind=recording?'顾问核对的录音客户发言':sourceKindLabel[messageSource(message)];
+    const segments=recording&&message.recordingSegmentIds?.length?`；录音片段=${message.recordingSegmentIds.join(',')}`:'';
+    return `${id} [${kind}${actor}${segments}]`;
   }).join('、');
 }
 

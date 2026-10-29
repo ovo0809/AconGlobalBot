@@ -5,6 +5,7 @@ import type { Bootstrap, Case, Category, FactStatus, ProfileField, ReportRecord 
 import { BrowserVoiceClient, type BrowserVoiceState } from '../lib/browser-voice';
 import { factLabels, demandStatusLabels, formatFactValue } from '../lib/report-labels';
 import { presentReport } from '../lib/report-presentation';
+import { RecordingPanel } from './recording-panel';
 
 type ActionBody = Record<string, unknown> & { action: string };
 type ActionResult = Record<string, unknown> & { error?: string; caseId?: string; nextCaseId?: string | null };
@@ -23,6 +24,7 @@ const statusNames: Record<string, string> = {
   ...demandStatusLabels,
   new: '尚未访谈', draft: '报告草稿', needs_report: '待生成报告', interviewing: '访谈进行中', ended: '访谈已结束', report_ready: '报告已生成', reviewed: '已复核',
   pending_review: '待复核', approved: '已复核', returned: '退回补问', quote_handoff: '已转现有报价流程',
+  recording: '会谈录音中', recording_paused: '录音已暂停', transcribing: '会谈转写中', transcript_review: '待核对转写',
 };
 const factStatusNames: Record<FactStatus, string> = {
   confirmed: '已确认', reported_unverified: '客户自述·待核验', unknown: '不知道', declined: '不愿提供', conflicting: '存在冲突',
@@ -271,7 +273,7 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
 
     <section className={`workspace ${nav==='settings'||nav==='trash'?'no-sidebar':''} ${mobileDetail||nav==='settings'||nav==='trash'?'mobile-show':''}`}>
       <header className="workspace-header"><div>{nav!=='settings'&&nav!=='trash'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<h1>{nav==='settings'?'账户设置':nav==='trash'?'已删除案例':activeCase?.clientName||'选择一个案例'}</h1>{activeCase && nav!=='settings'&&nav!=='trash' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">合成数据</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
-      {nav==='settings' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace key={`${nav}:${activeCase.id}`} data={data} busy={busy} act={act} reportOpen={reportOpen} reviewMode={nav==='review'} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)}/> : nav==='review' ? <div className="welcome-workspace"><h2>{scopedCases.length?'请选择一个复核案例':'当前没有可查看的复核案例'}</h2><p>{scopedCases.length?'从左侧列表选择案例，查看报告与来源。':reviewDescription}</p></div> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
+      {nav==='settings' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace key={`${nav}:${activeCase.id}`} data={data} busy={busy} act={act} reportOpen={reportOpen} reviewMode={nav==='review'} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)} onRefresh={async()=>{await refresh(activeCase.id);}}/> : nav==='review' ? <div className="welcome-workspace"><h2>{scopedCases.length?'请选择一个复核案例':'当前没有可查看的复核案例'}</h2><p>{scopedCases.length?'从左侧列表选择案例，查看报告与来源。':reviewDescription}</p></div> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
     </section>
     {newClient && <NewClientModal busy={busy==='createClient'} onClose={()=>setNewClient(false)} onSubmit={async form=>{ const result=await act({action:'createClient',...form}); setNewClient(false); selectedCaseIdRef.current=result?.caseId; setToast({kind:'success',text:'客户档案与首个案例已建立。'}); }}/>}
     {deleteTarget && <DeleteCaseModal caseRecord={deleteTarget} busy={busy==='deleteCase'} onClose={()=>setDeleteTarget(null)} onConfirm={deleteCase}/>}
@@ -300,22 +302,28 @@ function WelcomeWorkspace({advisor,onNew,reviewer}:{advisor:string;onNew:()=>voi
   return <div className="welcome-workspace"><div className="welcome-orb">A</div><span className="eyebrow">上午好，{advisor}</span><h2>{reviewer?'从待复核队列开始':'今天，从一段清楚的对话开始。'}</h2><p>{reviewer?'请选择左侧案例，核对来源、缺失信息与四类初步方向。':'先收齐六项基础资料，再将设备交给客户进入受限访谈模式。'}</p>{!reviewer&&<button className="button button-primary" onClick={onNew}><Icon name="plus"/>建立合成客户</button>}</div>;
 }
 
-function CaseWorkspace({data,busy,act,reportOpen,reviewMode,setReportOpen,setToast,setHandoff,onDelete}:{data:Bootstrap;busy:string;act:ActionFn;reportOpen:boolean;reviewMode:boolean;setReportOpen:(v:boolean)=>void;setToast:(v:Toast)=>void;setHandoff:(v:boolean)=>void;onDelete:()=>void}) {
+function CaseWorkspace({data,busy,act,reportOpen,reviewMode,setReportOpen,setToast,setHandoff,onDelete,onRefresh}:{data:Bootstrap;busy:string;act:ActionFn;reportOpen:boolean;reviewMode:boolean;setReportOpen:(v:boolean)=>void;setToast:(v:Toast)=>void;setHandoff:(v:boolean)=>void;onDelete:()=>void;onRefresh:()=>Promise<void>}) {
   const caseRecord=data.activeCase!;
   const client=data.clients.find(item=>item.id===caseRecord.clientId);
   const latest=data.reports[0];
-  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'>(reviewMode?'report':'conversation');
+  const canRecord=data.user?.role==='advisor'&&!reviewMode;
+  const recordingInProgress=['recording','recording_paused','transcribing','transcript_review'].includes(caseRecord.status);
+  const [tab,setTab]=useState<'conversation'|'recording'|'profile'|'report'|'mail'>(reviewMode?'report':recordingInProgress?'recording':'conversation');
+  const [recordingOpened,setRecordingOpened]=useState(recordingInProgress);
+  const openRecording=()=>{setRecordingOpened(true);setTab('recording');setReportOpen(false);};
   useEffect(()=>{ if(reportOpen)setTab('report'); },[reportOpen]);
   const enterClient=async()=>{ await act({action:'enterClient',caseId:caseRecord.id}); };
   return <>
     <div className="case-banner"><div className="client-identity"><span className="avatar avatar-large">{(client?.name||'客').slice(0,1)}</span><div><b>{client?.name}</b><span>{client?.state||'州待补充'} · {client?.language||'中文'} · 案例 {caseRecord.id.slice(-6)}</span></div></div>
-      {data.user?.role==='advisor' && !reviewMode && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'}><Icon name="plus"/>新案例</button><button className="button button-danger" onClick={onDelete} disabled={busy==='deleteCase'}>删除当前案例</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
+      {canRecord && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'||caseRecord.status==='recording'}><Icon name="plus"/>新案例</button><button className="button button-danger" onClick={onDelete} disabled={busy==='deleteCase'||caseRecord.status==='recording'||caseRecord.status==='transcribing'}>删除当前案例</button><button className="button button-secondary" onClick={openRecording}><Icon name="mic"/>录音转写＋会后报告</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'||recordingInProgress}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
     </div>
     <nav className="tabs" aria-label="案例详情">
       <button className={tab==='conversation'?'active':''} onClick={()=>setTab('conversation')}>访谈记录</button><button className={tab==='profile'?'active':''} onClick={()=>setTab('profile')}>画像与来源</button><button className={tab==='report'?'active':''} onClick={()=>{setTab('report');setReportOpen(true)}}>内部报告 {latest&&<i>v{latest.version}</i>}</button><button className={tab==='mail'?'active':''} onClick={()=>setTab('mail')}>通知预览</button>
+      {canRecord&&<button className={tab==='recording'?'active':''} onClick={openRecording}>会谈录音</button>}
     </nav>
     <div className="workspace-body">
       {tab==='conversation'&&<ConversationView data={data}/>} {tab==='profile'&&<ProfileView data={data} act={act} busy={busy} setToast={setToast}/>} {tab==='report'&&<ReportView data={data} report={latest} act={act} busy={busy} setHandoff={setHandoff}/>} {tab==='mail'&&<MailView data={data} report={latest} act={act} busy={busy}/>}
+      {canRecord&&recordingOpened&&<div hidden={tab!=='recording'}><RecordingPanel caseId={caseRecord.id} csrf={data.csrf} onChanged={onRefresh}/></div>}
     </div>
   </>;
 }
@@ -323,7 +331,7 @@ function CaseWorkspace({data,busy,act,reportOpen,reviewMode,setReportOpen,setToa
 function ConversationView({data}:{data:Bootstrap}) {
   const messages=data.messages;
   return <section className="conversation-view"><div className="timeline-heading"><div><h3>访谈记录</h3><p>最终转写会成为事实来源；临时字幕不会进入画像。</p></div><span className="source-pill">{data.capabilities.voiceConfigured?'真实语音已配置':'模拟语音／文字记录'}</span></div>
-    <div className="message-history">{messages.length?messages.map(message=><article key={message.id} className={`history-message ${message.role}`}><span className="message-role">{message.role==='assistant'?'Aeconn 助手':'客户'}</span><p>{message.text}</p><footer><time>{new Date(message.createdAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time>{message.interrupted&&<span>已被打断</span>}{!message.final&&<span className="warning-text">转写待确认</span>}</footer></article>):<EmptyState title="还没有访谈记录" body="进入客户模式，选择一个入口后即可开始。"/>}</div>
+    <div className="message-history">{messages.length?messages.map(message=><article key={message.id} className={`history-message ${message.role}`}><span className="message-role">{message.role==='assistant'?'Aeconn 助手':'客户'}</span><p>{message.text}</p><footer><time>{new Date(message.createdAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</time>{message.sourceKind==='advisor_reviewed_recording'&&<span>顾问核对的录音客户发言</span>}{message.interrupted&&<span>已被打断</span>}{!message.final&&<span className="warning-text">转写待确认</span>}</footer></article>):<EmptyState title="还没有访谈记录" body="进入客户模式，选择一个入口后即可开始。"/>}</div>
   </section>;
 }
 
