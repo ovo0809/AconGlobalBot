@@ -28,6 +28,10 @@ const factStatusNames: Record<FactStatus, string> = {
   confirmed: '已确认', reported_unverified: '客户自述·待核验', unknown: '不知道', declined: '不愿提供', conflicting: '存在冲突',
 };
 const moneyFactKeys = new Set(['income','expenses','debt','reserve','assets','budget']);
+type ReviewScope = 'pending' | 'all';
+function inReviewScope(record:Case, scope:ReviewScope) {
+  return Boolean(record.assignedReviewerId) && (scope==='all' || record.status==='pending_review');
+}
 
 function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'trash' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
   const paths: Record<string, React.ReactNode> = {
@@ -62,15 +66,25 @@ export default function Home() {
   const [toast, setToast] = useState<Toast>(null);
   const [handback, setHandback] = useState(false);
   const selectedCaseIdRef = useRef<string | undefined>(undefined);
+  const refreshVersion = useRef(0);
+  const initialBootstrap = useRef<Promise<Bootstrap> | null>(null);
+  const bootstrapLoaded = useRef(false);
   const sessionChannel = useRef<BroadcastChannel | null>(null);
   const sessionMode = data?.mode;
   const sessionUserId = data?.user?.id;
 
   const refresh = useCallback(async (caseId?: string) => {
-    const next = await getBootstrap(caseId ?? selectedCaseIdRef.current);
-    if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
-    else selectedCaseIdRef.current = next.activeCase?.id;
-    setData(next);
+    const version = ++refreshVersion.current;
+    // Share the first request so concurrent focus events cannot create competing session cookies.
+    const request = bootstrapLoaded.current ? getBootstrap(caseId ?? selectedCaseIdRef.current) : initialBootstrap.current ??= getBootstrap(caseId ?? selectedCaseIdRef.current);
+    let next:Bootstrap;
+    try { next=await request; bootstrapLoaded.current=true; }
+    finally { if(initialBootstrap.current===request)initialBootstrap.current=null; }
+    if(version===refreshVersion.current){
+      if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
+      else selectedCaseIdRef.current = next.activeCase?.id;
+      setData(next);
+    }
     return next;
   }, []);
 
@@ -166,15 +180,21 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
   const [nav, setNav] = useState<'workspace'|'review'|'settings'|'trash'>(data.user?.role === 'admin' ? 'settings' : data.user?.role === 'reviewer' ? 'review' : 'workspace');
   const [search, setSearch] = useState('');
   const [newClient, setNewClient] = useState(false);
-  const [reportOpen, setReportOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(data.user?.role==='reviewer');
+  const [reviewScope, setReviewScope] = useState<ReviewScope>('pending');
   const [handoff, setHandoff] = useState(false);
   const [mobileDetail, setMobileDetail] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Case | null>(null);
   const [purgeTarget, setPurgeTarget] = useState<Case | null>(null);
-  const activeCase = data.activeCase;
-  const activeCaseId = activeCase?.id;
+  const selectionVersion = useRef(0);
+  const scopedCases = nav==='review' ? data.cases.filter(item=>inReviewScope(item,reviewScope)) : data.cases;
+  const activeCase = data.activeCase && scopedCases.some(item=>item.id===data.activeCase?.id) ? data.activeCase : null;
+  const activeCaseId = data.activeCase?.id;
   const reportJob = data.reportJob;
-  const filteredCases = data.cases.filter(item => (item.clientName || '').toLowerCase().includes(search.toLowerCase()));
+  const filteredCases = scopedCases.filter(item => (item.clientName || '').toLowerCase().includes(search.trim().toLowerCase()));
+  const reviewTitle = reviewScope==='all' ? '已交接案例' : data.user?.role==='reviewer' ? '待我复核' : '待 Charles 复核';
+  const reviewDescription = reviewScope==='all' ? '查看已交接案例的当前状态，包括已复核、退回补问和后续更新。' : data.user?.role==='reviewer' ? '仅显示分配给您的待复核案例。' : '仅显示已提交给 Charles、等待复核的案例。报告草稿请在“客户”中处理。';
+  const reviewEmptyDescription = data.user?.role==='reviewer' ? '顾问提交并分配给您的案例会出现在这里。' : '在“客户”的内部报告中提交 Charles 复核后，案例会出现在这里。';
 
   useEffect(()=>{
     const shouldPoll=Boolean(document.visibilityState==='visible'&&activeCaseId&&reportJob?.caseId===activeCaseId&&(reportJob.status==='queued'||reportJob.status==='generating'||reportJob.status==='ready'&&data.reports.length===0));
@@ -183,7 +203,21 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
     return()=>window.clearTimeout(timer);
   },[activeCaseId,data.reports.length,refresh,reportJob?.caseId,reportJob?.status]);
 
-  async function selectCase(item: Case) { selectedCaseIdRef.current = item.id; setDeleteTarget(null); setReportOpen(false); setMobileDetail(true); await refresh(item.id); }
+  async function selectCase(item: Case) {
+    const version=++selectionVersion.current;
+    selectedCaseIdRef.current = item.id; setDeleteTarget(null); setReportOpen(nav==='review');
+    try { await refresh(item.id); if(version===selectionVersion.current)setMobileDetail(true); }
+    catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'无法读取案例，请重试。'}); }
+  }
+  async function openCaseList(nextNav:'workspace'|'review', scope:ReviewScope='pending') {
+    ++selectionVersion.current;
+    setNav(nextNav);setReviewScope(scope);setSearch('');setMobileDetail(false);setDeleteTarget(null);setReportOpen(nextNav==='review');
+    const candidates=nextNav==='review'?data.cases.filter(item=>inReviewScope(item,scope)):data.cases;
+    const selected=candidates.find(item=>item.id===data.activeCase?.id)??candidates[0];
+    selectedCaseIdRef.current=selected?.id;
+    try { await refresh(selected?.id); }
+    catch(error) { setToast({kind:'error',text:error instanceof Error?error.message:'无法读取案例，请重试。'}); }
+  }
   async function deleteCase() {
     if (!deleteTarget) return;
     const result = await act({action:'deleteCase',caseId:deleteTarget.id},{noRefresh:true});
@@ -219,24 +253,25 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
 
   return <main className="app-shell">
     <aside className="rail"><Brand compact/><nav aria-label="主导航">
-      {data.user?.role === 'advisor' && <button className={nav==='workspace'?'active':''} onClick={()=>setNav('workspace')}><Icon name="chat"/><span>客户</span></button>}
-      <button className={nav==='review'?'active':''} onClick={()=>setNav('review')}><Icon name="review"/><span>{data.user?.role === 'reviewer'?'审核':'复核'}</span></button>
+      {data.user?.role === 'advisor' && <button className={nav==='workspace'?'active':''} onClick={()=>void openCaseList('workspace')}><Icon name="chat"/><span>客户</span></button>}
+      <button className={nav==='review'?'active':''} onClick={()=>void openCaseList('review')}><Icon name="review"/><span>{data.user?.role === 'reviewer'?'审核':'复核'}</span></button>
       <button className={nav==='settings'?'active':''} onClick={()=>setNav('settings')}><Icon name="settings"/><span>设置</span></button>
       {data.user?.role==='advisor'&&<button className={nav==='trash'?'active':''} onClick={()=>{setNav('trash');void refresh().catch((error:Error)=>setToast({kind:'error',text:error.message}));}}><Icon name="trash"/><span>已删除案例</span></button>}
     </nav><button className="rail-profile" onClick={()=>setNav('settings')}><span className="avatar">{data.user?.name.slice(0,1)}</span><span>{data.user?.name}</span></button></aside>
 
     {(nav === 'workspace' || nav === 'review') && <aside className={`case-sidebar ${mobileDetail ? 'mobile-hide' : ''}`}>
-      <header><div><span className="eyebrow">{nav==='review'?'交接队列':'客户工作区'}</span><h2>{nav==='review'?'待 Charles 复核':'我的客户'}</h2></div>{data.user?.role==='advisor' && <button className="icon-button" aria-label="新建客户" onClick={()=>setNewClient(true)}><Icon name="plus"/></button>}</header>
+      <header><div><span className="eyebrow">{nav==='review'?'交接队列':'客户工作区'}</span><h2>{nav==='review'?reviewTitle:'我的客户'}</h2></div>{data.user?.role==='advisor' && nav==='workspace' && <button className="icon-button" aria-label="新建客户" onClick={()=>setNewClient(true)}><Icon name="plus"/></button>}</header>
+      {nav==='review'&&<div className="review-queue-controls"><label>复核范围<select value={reviewScope} onChange={event=>void openCaseList('review',event.target.value as ReviewScope)}><option value="pending">待复核</option><option value="all">全部已交接</option></select></label><p>{reviewDescription}</p></div>}
       <label className="search-field"><Icon name="search"/><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜索客户或案例"/></label>
       <div className="case-list">{filteredCases.map(item=><button key={item.id} className={`case-item ${activeCase?.id===item.id?'selected':''}`} onClick={()=>void selectCase(item)}>
         <span className="avatar avatar-soft">{(item.clientName||'客').slice(0,1)}</span><span className="case-copy"><b>{item.clientName||'合成客户'}</b><small>{statusNames[item.status]||item.status}</small></span><time>{new Date(item.updatedAt).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'})}</time>
       </button>)}</div>
-      {filteredCases.length===0 && <EmptyState title="没有匹配的案例" body="换个关键词，或建立一位合成客户。"/>}
+      {filteredCases.length===0 && <EmptyState title={search.trim()?'没有匹配的案例':nav==='review'?(reviewScope==='pending'?'暂无待复核案例':'暂无已交接案例'):'暂无客户案例'} body={search.trim()?'换个关键词试试。':nav==='review'?reviewEmptyDescription:'建立一位合成客户即可开始。'}/>}
     </aside>}
 
     <section className={`workspace ${nav==='settings'||nav==='trash'?'no-sidebar':''} ${mobileDetail||nav==='settings'||nav==='trash'?'mobile-show':''}`}>
       <header className="workspace-header"><div>{nav!=='settings'&&nav!=='trash'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<h1>{nav==='settings'?'账户设置':nav==='trash'?'已删除案例':activeCase?.clientName||'选择一个案例'}</h1>{activeCase && nav!=='settings'&&nav!=='trash' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">合成数据</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
-      {nav==='settings' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace data={data} busy={busy} act={act} reportOpen={reportOpen} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)}/> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
+      {nav==='settings' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace key={`${nav}:${activeCase.id}`} data={data} busy={busy} act={act} reportOpen={reportOpen} reviewMode={nav==='review'} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)}/> : nav==='review' ? <div className="welcome-workspace"><h2>{scopedCases.length?'请选择一个复核案例':'当前没有可查看的复核案例'}</h2><p>{scopedCases.length?'从左侧列表选择案例，查看报告与来源。':reviewDescription}</p></div> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}
     </section>
     {newClient && <NewClientModal busy={busy==='createClient'} onClose={()=>setNewClient(false)} onSubmit={async form=>{ const result=await act({action:'createClient',...form}); setNewClient(false); selectedCaseIdRef.current=result?.caseId; setToast({kind:'success',text:'客户档案与首个案例已建立。'}); }}/>}
     {deleteTarget && <DeleteCaseModal caseRecord={deleteTarget} busy={busy==='deleteCase'} onClose={()=>setDeleteTarget(null)} onConfirm={deleteCase}/>}
@@ -265,16 +300,16 @@ function WelcomeWorkspace({advisor,onNew,reviewer}:{advisor:string;onNew:()=>voi
   return <div className="welcome-workspace"><div className="welcome-orb">A</div><span className="eyebrow">上午好，{advisor}</span><h2>{reviewer?'从待复核队列开始':'今天，从一段清楚的对话开始。'}</h2><p>{reviewer?'请选择左侧案例，核对来源、缺失信息与四类初步方向。':'先收齐六项基础资料，再将设备交给客户进入受限访谈模式。'}</p>{!reviewer&&<button className="button button-primary" onClick={onNew}><Icon name="plus"/>建立合成客户</button>}</div>;
 }
 
-function CaseWorkspace({data,busy,act,reportOpen,setReportOpen,setToast,setHandoff,onDelete}:{data:Bootstrap;busy:string;act:ActionFn;reportOpen:boolean;setReportOpen:(v:boolean)=>void;setToast:(v:Toast)=>void;setHandoff:(v:boolean)=>void;onDelete:()=>void}) {
+function CaseWorkspace({data,busy,act,reportOpen,reviewMode,setReportOpen,setToast,setHandoff,onDelete}:{data:Bootstrap;busy:string;act:ActionFn;reportOpen:boolean;reviewMode:boolean;setReportOpen:(v:boolean)=>void;setToast:(v:Toast)=>void;setHandoff:(v:boolean)=>void;onDelete:()=>void}) {
   const caseRecord=data.activeCase!;
   const client=data.clients.find(item=>item.id===caseRecord.clientId);
   const latest=data.reports[0];
-  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'>('conversation');
+  const [tab,setTab]=useState<'conversation'|'profile'|'report'|'mail'>(reviewMode?'report':'conversation');
   useEffect(()=>{ if(reportOpen)setTab('report'); },[reportOpen]);
   const enterClient=async()=>{ await act({action:'enterClient',caseId:caseRecord.id}); };
   return <>
     <div className="case-banner"><div className="client-identity"><span className="avatar avatar-large">{(client?.name||'客').slice(0,1)}</span><div><b>{client?.name}</b><span>{client?.state||'州待补充'} · {client?.language||'中文'} · 案例 {caseRecord.id.slice(-6)}</span></div></div>
-      {data.user?.role==='advisor' && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'}><Icon name="plus"/>新案例</button><button className="button button-danger" onClick={onDelete} disabled={busy==='deleteCase'}>删除当前案例</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
+      {data.user?.role==='advisor' && !reviewMode && <div className="case-banner-actions"><button className="button button-secondary" onClick={()=>void act({action:'createCase',clientId:caseRecord.clientId})} disabled={busy==='createCase'}><Icon name="plus"/>新案例</button><button className="button button-danger" onClick={onDelete} disabled={busy==='deleteCase'}>删除当前案例</button><button className="button button-accent" onClick={()=>void enterClient()} disabled={busy==='enterClient'}><Icon name="chat"/>{busy==='enterClient'?'正在切换…':'开始客户访谈'}</button></div>}
     </div>
     <nav className="tabs" aria-label="案例详情">
       <button className={tab==='conversation'?'active':''} onClick={()=>setTab('conversation')}>访谈记录</button><button className={tab==='profile'?'active':''} onClick={()=>setTab('profile')}>画像与来源</button><button className={tab==='report'?'active':''} onClick={()=>{setTab('report');setReportOpen(true)}}>内部报告 {latest&&<i>v{latest.version}</i>}</button><button className={tab==='mail'?'active':''} onClick={()=>setTab('mail')}>通知预览</button>
@@ -315,7 +350,7 @@ function ReportView({data,report,act,busy,setHandoff}:{data:Bootstrap;report?:Re
     <div className="disclosure"><Icon name="file"/><p><b>报告依据 {report.facts.length} 项已保存事实</b><br/>“资料不足”表示本次未采集到足够信息，不代表客户没有需求。语音可能识别有误，未进入事实表的内容请到访谈记录核对。</p></div>
     <div className="report-sections">{presentReport(report).sections.map((section,index)=><details open={index===0} key={section.title}><summary><span>{String(index+1).padStart(2,'0')}</span>{section.title}</summary><p>{section.body}</p></details>)}<details><summary>来源编号与版本信息</summary><p>页面使用中文字段和简短来源编号便于阅读；下载的 PDF 与邮件预览保留生成时的版本。</p>{presentReport(report).references.map(ref=><p key={ref.id}>{ref.label}：{ref.id}</p>)}<p>案例编号：{report.caseId}<br/>客户编号：{report.clientId}<br/>报告版本：{report.version}<br/>快照编号：{report.snapshotId}</p></details></div>
     <div className="analysis-grid">{report.analyses.map(item=><article key={item.category}><span>{categories.find(c=>c.id===item.category)?.title}</span><b>{statusNames[item.status]||item.status.replaceAll('_',' ')}</b><p>{item.reasonSummary}</p><small>待补充：{[...new Set(item.missingFields.map(key=>factLabels[key]||key))].join('、')||'无列出项'}</small></article>)}</div>
-    <div className="report-footer-actions">{data.user?.role==='advisor'&&<button className="button button-primary" disabled={busy==='submitReview'} onClick={()=>void act({action:'submitReview',caseId:report.caseId})}>提交 Charles 复核</button>}{data.user?.role==='reviewer'&&<ReviewActions report={report} act={act} busy={busy} setHandoff={setHandoff}/>}</div>
+    <div className="report-footer-actions">{data.user?.role==='advisor'&&<button className="button button-primary" disabled={busy==='submitReview'||data.activeCase?.status==='pending_review'} onClick={()=>void act({action:'submitReview',caseId:report.caseId})}>{data.activeCase?.status==='pending_review'?'已提交，等待 Charles 复核':'提交 Charles 复核'}</button>}{data.user?.role==='reviewer'&&<ReviewActions report={report} act={act} busy={busy} setHandoff={setHandoff}/>}</div>
   </section>;
 }
 

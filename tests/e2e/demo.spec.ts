@@ -145,7 +145,7 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
 
 test('Charles 复核与管理员配置保持角色边界', async ({ page }) => {
   await login(page, 'charles@aeconn.example');
-  await expect(page.getByRole('heading', { name: clientName })).toBeVisible();
+  await expect(page.getByRole('heading', { name: clientName, exact: true })).toBeVisible();
   await page.getByRole('button', { name: /内部报告/ }).click();
   await page.getByLabel('复核理由／备注').fill('已核对事实来源与缺失项，允许进入人工后续流程。');
   await page.getByRole('button', { name: '确认复核' }).click();
