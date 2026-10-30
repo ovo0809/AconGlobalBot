@@ -1,6 +1,6 @@
 # OpenAI 费用保护与用量
 
-用户选定试用档：每案例 **2 USD**、整个 Demo 所属组织每天 **5 USD**、每月 **20 USD**。日／月按 UTC 切换，案例额度覆盖该案例全部访谈、重连、事实提取、报告生成与重试；不是每次重新进入页面就重置。
+用户当前指定上限：每案例 **8 USD**、整个 Demo 所属组织每天 **40 USD**、每月 **160 USD**。日／月按 UTC 切换，案例额度覆盖该案例全部访谈、重连、事实提取、报告生成与重试；不是每次重新进入页面就重置。本次 knowledge 发布将远端旧默认档位同步为已在本机使用的上限，不清空历史账本、不释放预留。检索不调用付费 embedding 服务；参考片段的模型输入用量仍受原调用保护。
 
 仓库提交的示例配置仍为 `LLM_PROVIDER=mock`、`VOICE_PROVIDER=mock`，因此克隆后不会自动发起网络调用。本机已由用户授权显式切换为 OpenAI 并配置 `whisper-1` 输入转写，用于限额内真实测试；密钥仍只保存在 Git 忽略的本机配置中。模拟操作不创建付费调用记录；历史付费记录也不会因切回 mock 而清零。上线这份账本前的请求没有回填为已核对用量。
 
@@ -13,9 +13,9 @@
 ```dotenv
 LLM_PROVIDER=mock
 VOICE_PROVIDER=mock
-AI_CASE_BUDGET_USD=2
-AI_DAILY_BUDGET_USD=5
-AI_MONTHLY_BUDGET_USD=20
+AI_CASE_BUDGET_USD=8
+AI_DAILY_BUDGET_USD=40
+AI_MONTHLY_BUDGET_USD=160
 OPENAI_VOICE_MAX_SECONDS=1200
 ```
 

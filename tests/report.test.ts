@@ -6,6 +6,7 @@ import type { Client, Message, ProfileField, ReportInput, User } from '../lib/do
 import { analyzeDemo, buildReport, renderPdf, validateAnalyses, validateFacts } from '../lib/report';
 import { formatFactValue } from '../lib/report-labels';
 import { scenarios } from '../lib/scenarios';
+import type { KnowledgeContext } from '../lib/knowledge';
 
 function messagesFor(facts: ProfileField[], caseId = 'case-1'): Message[] {
   return [...new Set(facts.flatMap((fact) => fact.sourceMessageIds))].map((id, index) => ({
@@ -47,6 +48,42 @@ function reportInput(facts: ProfileField[]): ReportInput {
     reviewNote: 'approved：已核对合成案例引用与缺失项',
   };
 }
+
+const knowledgeRevision='0123456789abcdef0123456789abcdef01234567';
+function knowledgeContext():KnowledgeContext{return {revision:knowledgeRevision,status:'ready',notices:['固定到生成时版本。'],sources:[{id:'knowledge:retirement:1',title:'退休访谈参考',path:'knowledge/retirement.md',url:`https://github.com/ovo0809/AconGlobalBot/blob/${knowledgeRevision}/knowledge/retirement.md`,revision:knowledgeRevision,startLine:8,endLine:10,excerpt:'先确认客户目标、时间与流动性约束。',reviewStatus:'reference_only'}]};}
+
+test('report validates knowledge citations separately and freezes their exact source snapshot',()=>{
+  const input=reportInput([]);input.knowledge=knowledgeContext();input.analyses=analyzeDemo([]).map((item,index)=>({...item,knowledgeRefs:index===0?['knowledge:retirement:1']:[]}));
+  const report=buildReport(input);
+  assert.equal(report.sections.length,6);
+  assert.match(report.sections[2].body,/检索到的参考资料/);
+  assert.match(report.sections[2].body,/不属于客户事实/);
+  assert.match(report.sections[2].body,/knowledge\/retirement\.md/);
+  assert.match(report.sections[2].body,/未调用 AI/);
+  assert.deepEqual(report.facts,[]);
+  input.knowledge.sources[0].excerpt='修改后的资料';
+  input.analyses[0].knowledgeRefs!.push('篡改');
+  assert.equal(report.knowledge?.sources[0].excerpt,'先确认客户目标、时间与流动性约束。');
+  assert.deepEqual(report.analyses[0].knowledgeRefs,['knowledge:retirement:1']);
+});
+
+test('report rejects knowledge references outside the selected immutable snapshot',()=>{
+  const input=reportInput([]);input.knowledge=knowledgeContext();input.analyses=analyzeDemo([]).map((item,index)=>({...item,knowledgeRefs:index===0?['knowledge:missing']:[]}));
+  assert.throws(()=>buildReport(input),/参考资料引用不属于本报告快照/);
+});
+
+test('legacy reports remain valid without a knowledge snapshot',()=>{
+  const report=buildReport(reportInput([]));
+  assert.equal(report.knowledge,undefined);
+  assert.doesNotMatch(report.fullText,/提供给 AI 的参考资料/);
+});
+
+test('empty knowledge and unsupported document notices remain in report and PDF text',()=>{
+  const input=reportInput([]);input.knowledge={revision:'',status:'unavailable',sources:[],notices:['PDF 尚未解析，请先转换为文本。']};
+  const report=buildReport(input);
+  assert.match(report.fullText,/没有可用的相关知识资料片段/);
+  assert.match(report.fullText,/PDF 尚未解析/);
+});
 
 test('provides at least ten distinct synthetic edge scenarios', () => {
   assert.ok(scenarios.length >= 10);
@@ -190,4 +227,17 @@ test('renders a real, embedded-font PDF with enough content to span pages', asyn
   const longPdf = await renderPdf(longReport);
   assert.ok(longPdf.length > pdf.length);
   assert.match(longPdf.toString('latin1'), /\/Count [2-9][0-9]*/);
+});
+
+test('renders saved knowledge provenance into the report PDF',async()=>{
+  const input=reportInput([]);input.knowledge=knowledgeContext();input.analyses=analyzeDemo([]).map((item,index)=>({...item,knowledgeRefs:index===0?['knowledge:retirement:1']:[]}));
+  const report=buildReport(input);
+  assert.match(report.fullText,/退休访谈参考/);
+  assert.match(report.fullText,/0123456789abcdef0123456789abcdef01234567/);
+  assert.match(report.fullText,/第 8–10 行/);
+  const plainPdf=await renderPdf(buildReport(reportInput([])));
+  const knowledgePdf=await renderPdf(report);
+  assert.equal(knowledgePdf.subarray(0,4).toString(),'%PDF');
+  assert.ok(knowledgePdf.length>plainPdf.length,`knowledge PDF should preserve extra provenance content: ${knowledgePdf.length} <= ${plainPdf.length}`);
+  if(process.env.KNOWLEDGE_PDF_OUTPUT){const output=path.resolve(process.env.KNOWLEDGE_PDF_OUTPUT);fs.mkdirSync(path.dirname(output),{recursive:true});fs.writeFileSync(output,knowledgePdf);}
 });

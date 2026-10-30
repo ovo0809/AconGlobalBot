@@ -109,7 +109,8 @@ test('system prompt and exported schema define one safe shared text/live contrac
   assert.match(prompt, /单个客户访谈助手/);
   assert.match(prompt, /不得报价/);
   assert.match(prompt, /模型提取的事实绝不能标 confirmed/);
-  assert.deepEqual(INTERVIEW_SCHEMA.required, ['reply', 'facts']);
+  assert.deepEqual(INTERVIEW_SCHEMA.required, ['reply', 'facts', 'knowledgeRefs']);
+  assert.equal(INTERVIEW_SCHEMA.properties.knowledgeRefs.items.type, 'string');
   assert.equal(INTERVIEW_SCHEMA.additionalProperties, false);
   assert.deepEqual(INTERVIEW_SCHEMA.properties.facts.items.properties.factStatus.enum, ['reported_unverified', 'unknown', 'declined', 'conflicting']);
 });

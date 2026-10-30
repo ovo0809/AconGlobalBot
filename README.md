@@ -1,5 +1,7 @@
 # Aeconn AI Agent · 顾问访谈 Demo
 
+资料库：访谈和报告现在可以参考 GitHub `main/knowledge` 的 Markdown、TXT、CSV，并保留文件、版本、行号及摘录来源。图片、扫描件、PDF／Word 需先转文本；当前不会自动 OCR。[资料接入说明](docs/knowledge.md)。费用保护保持每案例 $8、每天 $40、每月 $160，示例配置仍为 mock。
+
 面向 Aeconn 真人保险顾问的中文本地 Demo：建立合成客户档案 → 受限客户访谈 → 结束并交还手机 → 内部报告与中文 PDF → 顾问确认两份邮件预览 → Charles 复核。
 
 实现依据：[Notion「02｜可直接复制给 Codex 的开发 Prompt」V1.3](https://app.notion.com/p/406d9731c2408174a24dfa30ff68ee52)。这是合成数据开发检查点，不是获准处理真实客户资料的生产系统。当前分析回复和语音选择器都默认 `mock`，邮件默认 dry-run；这不代表 Charles 首版已就绪。Charles 首版必须接入真实 AI 与真实连续语音，并在目标手机验收。

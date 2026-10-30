@@ -7,6 +7,8 @@ import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, INTERVIE
 import { closeVoiceSession, forgetVoiceSession, type VoiceDiagnosticEvent } from './voice-server';
 import { DryRunMailProvider } from './mail';
 import { getUsageSummary, purgeCaseUsage, recoverUsageReservations, UsageBudgetError } from './ai-usage';
+import { loadKnowledge } from './knowledge';
+import { publicKnowledgeContext } from './knowledge-public';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
 
 type Input=Record<string,unknown>;
@@ -57,12 +59,17 @@ function settingsFor(user:User):Settings {const row=db().prepare('SELECT setting
 function recipientsFor(record:Case){const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];const settings=settingsFor(owner);return [{email:settings.companyEmail,name:'公司邮箱（Charles 管理）',verified:settings.companyVerified},{email:owner.email,name:owner.name,verified:owner.emailVerified}];}
 function recipientFingerprint(record:Case){return digest(pack(recipientsFor(record)));}
 function reportRecord(content:ReportContent,record:Case):ReportRecord {return {...content,stale:content.version!==record.reportVersion||record.status==='needs_report',recipientFingerprint:recipientFingerprint(record),recipients:recipientsFor(record),pdfUrl:`/api/report?caseId=${encodeURIComponent(record.id)}&version=${content.version}&format=pdf`,pdfReady:true};}
-function addMessage(sessionId:string,caseId:string,role:'user'|'assistant',text:string,eventId=id(),turnId=eventId,interrupted=false,final=true,source:Message['source']='customer',actorId?:string):Message {
-  const message:Message={id:id(),caseId,sessionId,role,text,final,eventId,turnId,interrupted,createdAt:now(),playbackStatus:interrupted?'interrupted':'unknown',correctionOf:null,source,actorId};
+function addMessage(sessionId:string,caseId:string,role:'user'|'assistant',text:string,eventId=id(),turnId=eventId,interrupted=false,final=true,source:Message['source']='customer',actorId?:string,reference?:Pick<Message,'knowledge'|'knowledgeRefs'>):Message {
+  const message:Message={id:id(),caseId,sessionId,role,text,final,eventId,turnId,interrupted,createdAt:now(),playbackStatus:interrupted?'interrupted':'unknown',correctionOf:null,source,actorId,...(role==='assistant'?reference:{})};
   db().prepare('INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)').run(message.id,caseId,sessionId,eventId,turnId,role,pack(message));
   return docs<Message>('SELECT doc FROM messages WHERE session_id=? AND (event_id=? OR turn_id=?) AND role=?',sessionId,eventId,turnId,role)[0];
 }
 function interviewInput(session:Interview):InterviewInput{const record=docs<Case>('SELECT doc FROM cases WHERE id=?',session.case_id)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];return {usageContext:{caseId:session.case_id,sessionId:session.id},caseRecord:{id:session.case_id},entry:session.entry??'life',knownClient:{state:client.state,language:client.language},facts:factsFor(session.case_id),messages:messagesFor(session.case_id)};}
+function knowledgeQuery(entry:Category|null,facts:ProfileField[],messages:Message[]){
+  const topic={life:'家庭责任 人寿保障',annuity:'退休 现金流 流动性',ltc:'长期照护 安排',disability_income:'职业 收入中断 伤残保障'};
+  // Used only for local ranking; no customer query is sent to GitHub.
+  return [entry?topic[entry]:'',...facts.filter(f=>f.value!==null).map(f=>`${f.key} ${String(f.value).slice(0,500)}`),...messages.filter(m=>m.role==='user'&&m.final).slice(-4).map(m=>m.text.slice(0,1000))].join('\n');
+}
 function askNext(session:Interview,eventId?:string){const next=nextInterviewTurn(interviewInput(session));db().prepare('UPDATE interviews SET current_question=? WHERE id=?').run(next.targetKey,session.id);addMessage(session.id,session.case_id,'assistant',next.reply,eventId);}
 function validateFact(fact:ProfileField,messages:Message[]){
   requireThat(Object.hasOwn(questions,fact.key),400,'未知事实字段。');requireThat(factStatuses.includes(fact.factStatus),400,'事实状态无效。');
@@ -85,12 +92,15 @@ async function respondToText(session:Interview,text:string,eventId:string){
   interviewLocks.add(session.id);
   try{
     const message=addMessage(session.id,session.case_id,'user',text,eventId);
+    const input=interviewInput(session);
+    const knowledge=await loadKnowledge(knowledgeQuery(input.entry,input.facts,input.messages));
+    requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     let turn;
-    try{turn=await interviewWithProvider(interviewInput(session));}
+    try{turn=await interviewWithProvider({...input,knowledge});}
     catch(error){if(error instanceof UsageBudgetError)throw new AppError(429,`${error.message} 您的回答已保存，可结束访谈交还顾问。`);throw new AppError(503,'您的回答已保存。云端访谈暂时未完成，请稍后重试或交还顾问；不会使用模拟回复冒充 AI。');}
     requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     transaction(()=>{
-      if(turn){for(const fact of turn.facts)saveFact(session.case_id,fact);addMessage(session.id,session.case_id,'assistant',turn.reply,replyId);}
+      if(turn){for(const fact of turn.facts)saveFact(session.case_id,fact);addMessage(session.id,session.case_id,'assistant',turn.reply,replyId,replyId,false,true,'customer',undefined,{knowledge,knowledgeRefs:turn.knowledgeRefs??[]});}
       else if(session.current_question){const fact=parseAnswer(session.current_question,text,message.id);if(fact){saveFact(session.case_id,fact);askNext(session,replyId);}else addMessage(session.id,session.case_id,'assistant','请确认金额、币种和月／年／一次性周期，例如“5000 美元 每月”。也可以回答“不知道”或“不愿提供”。',replyId);}
       else askNext(session,replyId);
     });
@@ -151,7 +161,10 @@ export function bootstrap(request:Request):Response {
     if(auth.mode==='client'){
       const session=currentInterview(auth);data.mode='client';data.clientSession={id:session.id,state:session.state,entry:session.entry};
       data.activeCase={id:session.case_id,entry:session.entry,clientId:'',ownerAgentId:'',status:'interviewing',createdAt:'',updatedAt:'',assignedReviewerId:null,reportVersion:0};
-      data.messages=messagesFor(session.case_id).filter(message=>message.sessionId===session.id);
+      data.messages=messagesFor(session.case_id).filter(message=>message.sessionId===session.id).map(message=>{
+        const knowledge=publicKnowledgeContext(message.knowledge);
+        return {...message,knowledge,knowledgeRefs:message.knowledgeRefs?.filter(ref=>knowledge?.sources.some(source=>source.id===ref))};
+      });
     }else{
       data.mode='advisor';data.user=user;
       // Only internal roles receive totals; case-level entries follow caseFor authorization.
@@ -184,14 +197,16 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
     const owner=docs<User>('SELECT doc FROM users WHERE id=?',record.ownerAgentId)[0];const client=docs<Client>('SELECT doc FROM clients WHERE id=?',record.clientId)[0];
     const messages=messagesFor(caseId);const facts=factsFor(caseId);const incomplete=!!db().prepare('SELECT id FROM interviews WHERE case_id=? AND incomplete=1').get(caseId);
     const before=digest(pack({messages,facts}));
-    const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
+    const knowledge=await loadKnowledge(knowledgeQuery(record.entry,facts,messages));
+    requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'检索期间资料发生变化，请重新生成。');
+    const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1',knowledge}));
     const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];if(prior)return reportRecord(prior,record);
-    const output=await analyzeWithProvider({messages,facts,usageContext:{caseId}});const {analyses,provider}=output;
+    const output=await analyzeWithProvider({messages,facts,knowledge,usageContext:{caseId}});const {analyses,provider}=output;
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
-    validateAnalyses(analyses,facts,messages);
-    const snapshotId=digest(pack({before:digest(pack({messages,facts})),reviewStatus,reviewNote,rule:'demo_unapproved_v1'}));
+    validateAnalyses(analyses,facts,messages,knowledge);
+    const snapshotId=originalSnapshot;
     record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];const version=record.reportVersion+1;
-    const report=buildReport({client,owner,caseRecord:record,version,snapshotId,reviewStatus,createdAt:now(),facts,messages,analyses,incompleteTranscript:incomplete,provider,reviewNote});const pdf=await renderPdf(report);
+    const report=buildReport({client,owner,caseRecord:record,version,snapshotId,reviewStatus,createdAt:now(),facts,messages,analyses,incompleteTranscript:incomplete,provider,reviewNote,knowledge});const pdf=await renderPdf(report);
     requireThat(pdf.length>500&&pdf.subarray(0,4).toString()==='%PDF',500,'PDF 生成失败，未创建发送任务。');
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
     transaction(()=>{for(const fact of facts)saveFact(caseId,fact);db().prepare('INSERT INTO reports VALUES(?,?,?,?,?)').run(caseId,version,snapshotId,pack(report),pdf);record.reportVersion=version;record.status=reviewStatus==='reviewed'?'reviewed':reviewStatus==='returned'?'returned':'draft';saveCase(record);audit(owner.id,caseId,'report.generated',{version,snapshotId,provider});});
@@ -312,12 +327,12 @@ export function reportDownload(request:Request):Response {const auth=readAuth(re
 export function notifications(request:Request):Response {const auth=readAuth(request);requireThat(auth,401,'请先登录。');const record=caseFor(requireAdvisorMode(auth),new URL(request.url).searchParams.get('caseId')||'');return json(docs<NotificationJob>('SELECT doc FROM notification_jobs WHERE case_id=?',record.id));}
 
 export const voiceHooks={
-  getContext(sessionId:string){const session=db().prepare('SELECT * FROM interviews WHERE id=?').get(sessionId) as Interview|undefined;requireThat(session,404,'访谈不存在。');return JSON.stringify(buildInterviewContext(interviewInput(session)));},
+  async getContext(sessionId:string){const session=db().prepare('SELECT * FROM interviews WHERE id=?').get(sessionId) as Interview|undefined;requireThat(session,404,'访谈不存在。');const input=interviewInput(session);const referenceKnowledge=await loadKnowledge(knowledgeQuery(input.entry,input.facts,input.messages));return JSON.stringify({...buildInterviewContext(input),referenceKnowledge});},
   consumeToken(token:string){return transaction(()=>{const row=db().prepare('SELECT * FROM voice_tokens WHERE token_hash=?').get(digest(token));if(!row)return null;db().prepare('DELETE FROM voice_tokens WHERE token_hash=?').run(digest(token));if(Number(row.expires_at)<Date.now())return null;const session=db().prepare("SELECT i.* FROM interviews i JOIN auth_sessions a ON a.id=i.auth_id WHERE i.id=? AND i.auth_id=? AND i.state='active' AND a.mode='client' AND a.active_interview=i.id AND a.expires_at>?").get(String(row.interview_id),String(row.auth_id),Date.now()) as Interview|undefined;return session?{sessionId:session.id,caseId:session.case_id}:null;});},
   isActive(sessionId:string){return !!db().prepare("SELECT i.id FROM interviews i JOIN auth_sessions a ON a.id=i.auth_id WHERE i.id=? AND i.state='active' AND a.mode='client' AND a.active_interview=i.id AND a.expires_at>?").get(sessionId,Date.now());},
-  persist(sessionId:string,event:{eventId:string;turnId:string;role:'user'|'assistant';text:string;interrupted?:boolean;final?:boolean}){
+  persist(sessionId:string,event:import('./voice-server').VoicePersistEvent){
     const session=db().prepare('SELECT * FROM interviews WHERE id=?').get(sessionId) as Interview|undefined;if(!session||!(session.state==='active'||['finishing','paused'].includes(session.state)&&Number(session.deadline)>Date.now())||!event.text?.trim())return;
-    addMessage(sessionId,session.case_id,event.role,event.text.slice(0,8000),event.eventId,event.turnId,event.interrupted,event.final??true);
+    addMessage(sessionId,session.case_id,event.role,event.text.slice(0,8000),event.eventId,event.turnId,event.interrupted,event.final??true,'customer',undefined,event.role==='assistant'?{knowledge:event.knowledge}:undefined);
   },
   status(sessionId:string,state:string){if(state==='incomplete'||state==='transcript_incomplete'){db().prepare('UPDATE interviews SET incomplete=1 WHERE id=?').run(sessionId);return;}db().prepare("UPDATE interviews SET voice_state=? WHERE id=? AND state IN ('active','finishing','paused')").run(state,sessionId);},
   diagnostic(sessionId:string,event:VoiceDiagnosticEvent){

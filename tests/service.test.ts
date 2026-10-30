@@ -303,7 +303,7 @@ test('permanent deletion requires ownership, explicit confirmation and atomicall
   service.voiceHooks.persist(interview.id,{role:'user',text:'永久删除后的迟到语音',eventId:'purge:late',turnId:'purge-late',final:true});
   service.voiceHooks.status(interview.id,'transcript_incomplete');
   service.voiceHooks.diagnostic(interview.id,{code:'voice_usage_unverified',stage:'runtime'});
-  assert.throws(()=>service.voiceHooks.getContext(interview.id),/访谈不存在/);
+  await assert.rejects(()=>service.voiceHooks.getContext(interview.id),/访谈不存在/);
   assert.equal(count('SELECT COUNT(*) count FROM messages WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate messages');
   assert.equal(count('SELECT COUNT(*) count FROM audit_events WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate audit history');
   assert.equal((await owner.bootstrap(caseId)).response.status,404);assert.equal((await owner.report(caseId,report.version)).status,404);
@@ -651,7 +651,7 @@ test('real-provider interview and background voice extraction save sourced facts
   const sent=await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'cloud-goal'});assert.equal(sent.response.status,200,JSON.stringify(sent.data));
   assert.equal((await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'cloud-goal'})).response.status,200);
   const client=(await advisor.bootstrap()).data as Bootstrap;const sessionId=client.clientSession!.id;
-  assert.match((await servicePromise).voiceHooks.getContext(sessionId),/家庭保障/);
+  assert.match(await (await servicePromise).voiceHooks.getContext(sessionId),/家庭保障/);
   (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'每月收入 5000 美元。',eventId:'test:voice:income',turnId:'voice-income',final:true});
   (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'残留草稿 999999',eventId:'test:voice:partial',turnId:'voice-partial',final:false});
   (await servicePromise).voiceHooks.status(sessionId,'transcript_incomplete');

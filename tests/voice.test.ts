@@ -8,8 +8,13 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { attachVoiceServer, closeVoiceSession, forgetVoiceSession, hasVoiceSession, type VoiceHooks } from '../lib/voice-server';
 import { getUsageSummary } from '../lib/ai-usage';
 import { db, pack } from '../lib/db';
+import type { KnowledgeContext } from '../lib/knowledge';
 
 process.env.DATABASE_PATH=join(mkdtempSync(join(tmpdir(),'aeconn-voice-usage-')),'voice.sqlite');
+// Protocol fixtures use a small explicit allowance; production defaults are tested separately.
+process.env.AI_CASE_BUDGET_USD='2';
+process.env.AI_DAILY_BUDGET_USD='5';
+process.env.AI_MONTHLY_BUDGET_USD='20';
 
 function realtimeUsage(inputAudio=20,outputAudio=20){
   return {input_tokens:inputAudio,output_tokens:outputAudio,input_token_details:{text_tokens:0,audio_tokens:inputAudio,cached_tokens:0,cached_tokens_details:{text_tokens:0,audio_tokens:0}},output_token_details:{text_tokens:0,audio_tokens:outputAudio}};
@@ -276,8 +281,12 @@ test('OpenAI realtime relay uses 24k audio, source item IDs, VAD interruption, a
       }
     });
   });
-  const persisted:Array<{role:string;text:string;final?:boolean;interrupted?:boolean;sourceItemId?:string;turnId:string}>=[];
-  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'openai-session',caseId:'case-1'}),isActive:()=>true,getContext:()=>JSON.stringify({facts:[],questionPriority:['goal']}),persist:(_session,event)=>{persisted.push(event);},status:()=>undefined};
+  const referenceKnowledge:KnowledgeContext={status:'ready',revision:'a'.repeat(40),notices:['internal-file-status'],sources:[
+    {id:'K_public',title:'公开家庭保障讨论示例',path:'knowledge/family.md',url:`https://github.com/ovo0809/AconGlobalBot/blob/${'a'.repeat(40)}/knowledge/family.md`,revision:'a'.repeat(40),startLine:1,endLine:2,excerpt:'讨论家庭保障时核实家庭责任。',reviewStatus:'demo_unapproved'},
+    {id:'K_local',title:'本地核对草稿',path:'knowledge/local.md',url:'knowledge://local/knowledge/local.md',revision:'b'.repeat(64),startLine:1,endLine:2,excerpt:'local-reference-must-not-be-in-customer-network',reviewStatus:'reference_only'},
+  ]};
+  const persisted:Array<{role:string;text:string;final?:boolean;interrupted?:boolean;sourceItemId?:string;turnId:string;knowledge?:KnowledgeContext}>=[];
+  const hooks:VoiceHooks={consumeToken:()=>({sessionId:'openai-session',caseId:'case-1'}),isActive:()=>true,getContext:()=>JSON.stringify({facts:[],questionPriority:['goal'],referenceKnowledge}),persist:(_session,event)=>{persisted.push(event);},status:()=>undefined};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'openai-test-key',model:'gpt-realtime-2.1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
   t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
@@ -296,6 +305,13 @@ test('OpenAI realtime relay uses 24k audio, source item IDs, VAD interruption, a
   const update=received.find(event=>event.type==='session.update')?.session as {audio?:{input?:{format?:unknown;turn_detection?:unknown};output?:{format?:unknown}};instructions?:string;max_output_tokens?:number};
   assert.deepEqual(update.audio?.input?.format,{type:'audio/pcm',rate:24_000});assert.deepEqual(update.audio?.output?.format,{type:'audio/pcm',rate:24_000});assert.match(update.instructions||'',/questionPriority/);
   assert.equal(update.max_output_tokens,512);
+  assert.match(update.instructions||'',/讨论家庭保障时核实家庭责任/);
+  assert.match(update.instructions||'',/绝不是客户事实/);
+  assert.deepEqual(persisted.find(event=>event.role==='assistant')?.knowledge,referenceKnowledge);
+  const publicFinal=events.find(event=>event.type==='transcript'&&event.role==='assistant'&&event.final===true)?.knowledge as KnowledgeContext;
+  assert.deepEqual(publicFinal.sources.map(source=>source.id),['K_public']);
+  assert.deepEqual(publicFinal.notices,[]);
+  assert(!JSON.stringify(events).includes('local-reference-must-not-be-in-customer-network'));
   assert(received.some(event=>event.type==='conversation.item.create'));assert(received.some(event=>event.type==='response.create'));
   assert.deepEqual(persisted.map(event=>({role:event.role,source:event.sourceItemId,interrupted:Boolean(event.interrupted)})),[
     {role:'user',source:'user-item-1',interrupted:false},{role:'assistant',source:'assistant-item-1',interrupted:true},

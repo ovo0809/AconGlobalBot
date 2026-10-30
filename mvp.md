@@ -1,5 +1,7 @@
 # Aeconn AI Agent MVP
 
+Knowledge 增量：GitHub 文本资料检索已接入文字访谈、语音连接上下文、报告和 PDF；来源包含文件版本、行号与摘录。文字／报告校验模型标注的引用，语音区分“提供给 AI 的上下文”和“实际引用已核验”。仅支持 Markdown／TXT／CSV，图片及 PDF／Word 需先转文本。$8／$40／$160 上限保持；独立发布分支的实际测试结果见 [工程验证](docs/verification.md)。原本机工作区内录音、对账和共享功能不属于本次独立发布。
+
 本文定义首版 MVP 的业务闭环、交付边界与验收门槛。完整产品需求见 [PRD](PRD.md)，工程验证证据见 [验证记录](docs/verification.md)。
 
 ## 1. MVP 目标
