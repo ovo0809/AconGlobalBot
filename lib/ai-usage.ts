@@ -55,7 +55,7 @@ function dollarsLimit(name:string,fallback:number){
   if(!Number.isSafeInteger(scaled))throw new UsageBudgetError('费用上限配置超出可支持范围。');
   return scaled;
 }
-function configuredLimits(){return {caseMicros:dollarsLimit('AI_CASE_BUDGET_USD',2),dailyMicros:dollarsLimit('AI_DAILY_BUDGET_USD',5),monthlyMicros:dollarsLimit('AI_MONTHLY_BUDGET_USD',20)};}
+function configuredLimits(){return {caseMicros:dollarsLimit('AI_CASE_BUDGET_USD',8),dailyMicros:dollarsLimit('AI_DAILY_BUDGET_USD',40),monthlyMicros:dollarsLimit('AI_MONTHLY_BUDGET_USD',160)};}
 function utcBuckets(date=new Date()){const iso=date.toISOString();return {day:iso.slice(0,10),month:iso.slice(0,7)};}
 function pending(row:UsageCallRow){return row.status==='reserved'||row.status==='unknown';}
 function held(row:UsageCallRow){return pending(row)?Math.max(0,row.reserved_micros-row.actual_micros):0;}

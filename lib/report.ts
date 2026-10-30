@@ -3,6 +3,7 @@ import path from 'node:path';
 import PDFDocument from 'pdfkit';
 import { messageSource, type AnalysisItem, type Category, type DemandStatus, type Message, type ProfileField, type ReportContent, type ReportInput } from './domain';
 import { demandStatusLabels, factLabel, factStatusLabels, formatFactValue, reviewStatusLabel } from './report-labels';
+import type { KnowledgeContext, KnowledgeSource } from './knowledge';
 
 const CATEGORIES: Category[] = ['life', 'annuity', 'ltc', 'disability_income'];
 const STATUSES: DemandStatus[] = ['priority_discussion', 'secondary_discussion', 'defer', 'insufficient_information', 'review_existing'];
@@ -114,18 +115,23 @@ export function validateFacts(facts: ProfileField[]): void {
   }
 }
 
-export function validateAnalyses(analyses: AnalysisItem[], facts: ProfileField[], messages: Message[]): void {
+export function validateAnalyses(analyses: AnalysisItem[], facts: ProfileField[], messages: Message[], knowledge?: KnowledgeContext): void {
   validateFacts(facts);
   if (analyses.length !== 4) throw new Error('分析必须恰好包含四个类别');
   const categories = new Set(analyses.map((entry) => entry.category));
   if (categories.size !== 4 || CATEGORIES.some((category) => !categories.has(category))) throw new Error('四个分析类别必须完整且不重复');
   const factsByKey = factMap(facts);
   const messagesById = new Map(messages.map((message) => [message.id, message]));
+  const knowledgeIds = new Set(knowledge?.sources.map((source) => source.id) ?? []);
   if (new Set(messages.map((message) => message.caseId)).size > 1) throw new Error('不能混用不同案例的消息');
   for (const entry of analyses) {
     if (!STATUSES.includes(entry.status)) throw new Error(`${entry.category}: 无效需求状态`);
     if (!entry.reasonSummary.trim()) throw new Error(`${entry.category}: 缺少理由摘要`);
     for (const key of ['evidenceRefs', 'missingFields', 'constraints', 'nextQuestions'] as const) if (!Array.isArray(entry[key])) throw new Error(`${entry.category}: ${key} 必须为数组`);
+    if (knowledge && entry.knowledgeRefs !== undefined) {
+      if (!Array.isArray(entry.knowledgeRefs) || entry.knowledgeRefs.some((ref) => typeof ref !== 'string' || !knowledgeIds.has(ref))) throw new Error(`${entry.category}: 参考资料引用不属于本报告快照`);
+      if (new Set(entry.knowledgeRefs).size !== entry.knowledgeRefs.length) throw new Error(`${entry.category}: 参考资料引用重复`);
+    }
     for (const ref of entry.evidenceRefs) {
       if (ref.startsWith('fact:')) {
         const sourceFact = factsByKey.get(ref.slice(5));
@@ -158,8 +164,25 @@ function factSourceSummary(fact: ProfileField, messagesById: Map<string, Message
 
 const bullets = (lines: string[]) => lines.length ? lines.map((line) => `• ${line}`).join('\n') : '• 无';
 
+function cloneKnowledge(context: KnowledgeContext | undefined): KnowledgeContext | undefined {
+  if (!context) return undefined;
+  return {
+    revision: context.revision,
+    status: context.status,
+    notices: [...context.notices],
+    sources: context.sources.map((source) => ({ ...source })),
+  };
+}
+
+function knowledgeLine(source: KnowledgeSource): string {
+  const lines = source.startLine === source.endLine ? `第 ${source.startLine} 行` : `第 ${source.startLine}–${source.endLine} 行`;
+  const status = source.reviewStatus === 'demo_unapproved' ? '合成示例／未批准' : '参考资料／待人工复核';
+  return `${source.id}｜${source.title}｜${source.path}｜版本 ${source.revision}｜${lines}｜${status}\n  摘录：${source.excerpt}\n  链接：${source.url || '本地资料，无公开链接'}`;
+}
+
 export function buildReport(input: ReportInput): ReportContent {
-  validateAnalyses(input.analyses, input.facts, input.messages);
+  if (!input.knowledge && input.analyses.some((entry) => entry.knowledgeRefs?.length)) throw new Error('报告含参考资料引用，但缺少对应资料快照');
+  validateAnalyses(input.analyses, input.facts, input.messages, input.knowledge);
   if (input.messages.some((message) => message.caseId !== input.caseRecord.id)) throw new Error('报告消息不属于当前案例');
   if (input.caseRecord.clientId !== input.client.id) throw new Error('报告客户与案例关联不一致');
   if (input.caseRecord.ownerAgentId !== input.owner.id) throw new Error('报告归属顾问与案例不一致');
@@ -171,7 +194,22 @@ export function buildReport(input: ReportInput): ReportContent {
     return `${factLabel(fact.key)}：${value}${value === status ? '' : ` [${status}]`}；来源：${factSourceSummary(fact, messagesById)}`;
   });
   const directionLines = input.analyses.map((entry) => `${categoryLabel[entry.category]} — ${demandStatusLabels[entry.status]}：${entry.reasonSummary}`);
-  const evidenceLines = input.analyses.map((entry) => `${categoryLabel[entry.category]}：${entry.evidenceRefs.length ? entry.evidenceRefs.join('、') : '无引用；资料不足'}`);
+  const evidenceLines = input.analyses.map((entry) => {
+    const clientEvidence = entry.evidenceRefs.length ? entry.evidenceRefs.join('、') : '无客户事实引用；资料不足';
+    const referenceEvidence = entry.knowledgeRefs?.length ? `；资料参考：${entry.knowledgeRefs.join('、')}` : '；未引用资料库内容';
+    return `${categoryLabel[entry.category]}：客户事实证据：${clientEvidence}${referenceEvidence}`;
+  });
+  const knowledge = cloneKnowledge(input.knowledge);
+  const knowledgeLines = knowledge?.sources.map(knowledgeLine) ?? [];
+  if (knowledgeLines.length) {
+    evidenceLines.push(input.provider.includes('mock')?'检索到的参考资料（本版本未调用 AI，不属于客户事实）：':'提供给 AI 的参考资料（不属于客户事实，仍需人工复核）：');
+    evidenceLines.push(...knowledgeLines);
+    if (input.provider.includes('mock')) evidenceLines.push('本版本由确定性演示规则生成，未调用 AI；以上资料只随报告快照保存，没有作为模型引用。');
+  }
+  if(knowledge){
+    if(!knowledgeLines.length)evidenceLines.push('本报告没有可用的相关知识资料片段，未据此补充客户事实。');
+    evidenceLines.push(...knowledge.notices.map((notice) => `资料同步说明：${notice}`));
+  }
   const limitationLines = input.analyses.flatMap((entry) => entry.constraints.map((constraint) => `${categoryLabel[entry.category]}：${constraint}`));
   const missingCategories = new Map<string, Set<Category>>();
   for (const entry of input.analyses) for (const field of entry.missingFields) {
@@ -231,8 +269,9 @@ export function buildReport(input: ReportInput): ReportContent {
     summary: `${input.client.name} 的四类需求初筛已生成，须由归属顾问与 Charles 人工复核。`,
     sections,
     fullText,
-    analyses: input.analyses.map((entry) => ({ ...entry, evidenceRefs: [...entry.evidenceRefs], missingFields: [...entry.missingFields], constraints: [...entry.constraints], nextQuestions: [...entry.nextQuestions] })),
+    analyses: input.analyses.map((entry) => ({ ...entry, evidenceRefs: [...entry.evidenceRefs], knowledgeRefs: entry.knowledgeRefs ? [...entry.knowledgeRefs] : undefined, missingFields: [...entry.missingFields], constraints: [...entry.constraints], nextQuestions: [...entry.nextQuestions] })),
     facts: input.facts.map((fact) => ({ ...fact, sourceMessageIds: [...fact.sourceMessageIds] })),
+    knowledge,
   };
   return { ...content, headerLines };
 }

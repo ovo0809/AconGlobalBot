@@ -1,4 +1,6 @@
 import type { ReportContent } from './domain';
+import type { KnowledgeSource } from './knowledge';
+import { safeKnowledgeUrl } from './knowledge-public';
 import { factLabels, factStatusLabels, formatFactValue, reviewStatusLabels } from './report-labels';
 
 /** A read-only screen view; the saved report, PDF and email version stay immutable. */
@@ -33,5 +35,15 @@ export function presentReport(report: ReportContent) {
     }
     return { ...section, body };
   });
-  return { sections, references };
+  const knowledgeSources = presentKnowledgeSources(report.knowledge?.sources ?? [], report.analyses);
+  return { sections, references, knowledgeSources };
+}
+
+export function presentKnowledgeSources(sources: KnowledgeSource[], analyses: ReportContent['analyses'] = []) {
+  return sources.map((source) => ({
+    ...source,
+    safeUrl: safeKnowledgeUrl(source),
+    lineLabel: source.startLine === source.endLine ? `第 ${source.startLine} 行` : `第 ${source.startLine}–${source.endLine} 行`,
+    citedBy: analyses.filter((item) => item.knowledgeRefs?.includes(source.id)).map((item) => item.category),
+  }));
 }

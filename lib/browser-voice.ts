@@ -1,4 +1,5 @@
 'use client';
+import type { KnowledgeContext } from './knowledge';
 
 export type BrowserVoiceState = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'reconnecting' | 'paused' | 'ended' | 'error';
 
@@ -6,7 +7,7 @@ export interface BrowserVoiceOptions {
   csrf: string;
   onState?: (state: BrowserVoiceState) => void;
   onInterim?: (event: { role: 'user' | 'assistant'; text: string }) => void;
-  onFinal?: (event: { role: 'user' | 'assistant'; text: string; interrupted: boolean }) => void;
+  onFinal?: (event: { role: 'user' | 'assistant'; text: string; interrupted: boolean; knowledge?:KnowledgeContext }) => void;
   onError?: (message: string) => void;
   onInterrupted?: () => void;
   onMicPermission?: (granted: boolean) => void;
@@ -15,7 +16,7 @@ export interface BrowserVoiceOptions {
 
 type ServerEvent =
   | { type: 'ready'; inputSampleRate?: number; outputSampleRate?: number }
-  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean }
+  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean; knowledge?:KnowledgeContext }
   | { type: 'audio'; data: string; mimeType: string; itemId?: string }
   | { type: 'interrupted'; itemId?: string }
   | { type: 'turnComplete' | 'ending' | 'reconnecting' }
@@ -223,7 +224,7 @@ export class BrowserVoiceClient {
       this.setState('listening');
     }
     else if (event.type === 'transcript') {
-      if (event.final) this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted) });
+      if (event.final) this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted),...(event.role==='assistant'&&event.knowledge?{knowledge:event.knowledge}:{}) });
       else this.options.onInterim?.({ role: event.role, text: event.text });
       if (event.role === 'user') this.setState(event.final ? 'thinking' : 'listening');
     } else if (event.type === 'audio') {
