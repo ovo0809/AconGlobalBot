@@ -1,0 +1,205 @@
+{
+  "mode": "github_main",
+  "runtimeCode": "current Demo workspace, separate process and isolated database",
+  "checkedAtUtc": "2026-10-30T06:29:35.840Z",
+  "extractSha256": "001502fdcdda715d627415160e2f969bc6373b4f05928a8f64817ac0385c8c13",
+  "queryChecks": [
+    {
+      "query": "洛杉矶地区居家护理 Home Health Aide 年参考成本",
+      "expected": [
+        "76,856",
+        "83,980",
+        "90,583",
+        "98,982",
+        "130,488",
+        "142,588"
+      ],
+      "status": "passed",
+      "revision": "d3282b368df25d4b952c813a7f000e5b5a3d1360",
+      "sources": [
+        {
+          "id": "K_283f6e6588a1d523f137fd40bb784f",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 29,
+          "endLine": 71,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L29-L71"
+        },
+        {
+          "id": "K_312d074b13891c6178b75a7cf9a6f3",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 1,
+          "endLine": 28,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L1-L28"
+        },
+        {
+          "id": "K_37444b5f543568d33bd35bf1a26e4b",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 72,
+          "endLine": 92,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L72-L92"
+        }
+      ]
+    },
+    {
+      "query": "65岁以上男性女性平均长期护理需求时长",
+      "expected": [
+        "70%",
+        "2.2",
+        "3.7"
+      ],
+      "status": "passed",
+      "revision": "d3282b368df25d4b952c813a7f000e5b5a3d1360",
+      "sources": [
+        {
+          "id": "K_312d074b13891c6178b75a7cf9a6f3",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 1,
+          "endLine": 28,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L1-L28"
+        },
+        {
+          "id": "K_283f6e6588a1d523f137fd40bb784f",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 29,
+          "endLine": 71,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L29-L71"
+        },
+        {
+          "id": "K_37444b5f543568d33bd35bf1a26e4b",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 72,
+          "endLine": 92,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L72-L92"
+        }
+      ]
+    },
+    {
+      "query": "白卡 Medi-Cal Medicaid 个人月收入核准差额全包",
+      "expected": [
+        "核准差额",
+        "无条件"
+      ],
+      "status": "passed",
+      "revision": "d3282b368df25d4b952c813a7f000e5b5a3d1360",
+      "sources": [
+        {
+          "id": "K_283f6e6588a1d523f137fd40bb784f",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 29,
+          "endLine": 71,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L29-L71"
+        }
+      ]
+    },
+    {
+      "query": "红蓝卡 Medicare 专业护理通常前20天第21–100天",
+      "expected": [
+        "前20天",
+        "第21–100天",
+        "custodial care"
+      ],
+      "status": "passed",
+      "revision": "d3282b368df25d4b952c813a7f000e5b5a3d1360",
+      "sources": [
+        {
+          "id": "K_283f6e6588a1d523f137fd40bb784f",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 29,
+          "endLine": 71,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L29-L71"
+        },
+        {
+          "id": "K_312d074b13891c6178b75a7cf9a6f3",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 1,
+          "endLine": 28,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L1-L28"
+        },
+        {
+          "id": "K_37444b5f543568d33bd35bf1a26e4b",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 72,
+          "endLine": 92,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L72-L92"
+        }
+      ]
+    },
+    {
+      "query": "55岁女性加州月缴500 80岁长期护理总给付月给付身故利益",
+      "expected": [
+        "168,615",
+        "353,041",
+        "3,359",
+        "7,032",
+        "80,607",
+        "16,121"
+      ],
+      "status": "passed",
+      "revision": "d3282b368df25d4b952c813a7f000e5b5a3d1360",
+      "sources": [
+        {
+          "id": "K_283f6e6588a1d523f137fd40bb784f",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 29,
+          "endLine": 71,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L29-L71"
+        },
+        {
+          "id": "K_37444b5f543568d33bd35bf1a26e4b",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 72,
+          "endLine": 92,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L72-L92"
+        },
+        {
+          "id": "K_312d074b13891c6178b75a7cf9a6f3",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 1,
+          "endLine": 28,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L1-L28"
+        }
+      ]
+    },
+    {
+      "query": "免责声明税务法律建议等待期理赔资格除外责任",
+      "expected": [
+        "规划说明及产品示例摘要",
+        "核保/理赔认定"
+      ],
+      "status": "passed",
+      "revision": "d3282b368df25d4b952c813a7f000e5b5a3d1360",
+      "sources": [
+        {
+          "id": "K_37444b5f543568d33bd35bf1a26e4b",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 72,
+          "endLine": 92,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L72-L92"
+        },
+        {
+          "id": "K_283f6e6588a1d523f137fd40bb784f",
+          "path": "knowledge/提取文本/长期护理宣传海报.md",
+          "startLine": 29,
+          "endLine": 71,
+          "url": "https://github.com/ovo0809/AconGlobalBot/blob/d3282b368df25d4b952c813a7f000e5b5a3d1360/knowledge/%E6%8F%90%E5%8F%96%E6%96%87%E6%9C%AC/%E9%95%BF%E6%9C%9F%E6%8A%A4%E7%90%86%E5%AE%A3%E4%BC%A0%E6%B5%B7%E6%8A%A5.md#L29-L71"
+        }
+      ]
+    }
+  ],
+  "unrelatedQuery": "empty",
+  "recordsExcluded": true,
+  "unknownWaitingPeriod": "not supplied; no model answer test",
+  "voiceContext": "poster reference supplied; no actual speech",
+  "report": "mock report contains poster reference",
+  "pdfBytes": 156545,
+  "paidApiCalls": 0,
+  "networkHosts": [
+    "api.github.com",
+    "raw.githubusercontent.com"
+  ],
+  "limits": {
+    "caseMicros": 8000000,
+    "dailyMicros": 40000000,
+    "monthlyMicros": 160000000
+  }
+}

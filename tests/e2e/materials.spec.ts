@@ -7,6 +7,7 @@ const advisor={id:'advisor-material',name:'林顾问',email:'advisor-material@ex
 const caseRecord={id:'case-material',clientId:'client-material',ownerAgentId:advisor.id,status:'draft',entry:'ltc' as const,createdAt,updatedAt:createdAt,assignedReviewerId:null,reportVersion:0,clientName:'资料测试客户',caseNumber:1};
 const screenshotDirectory=join(process.cwd(),'tmp','validation','materials');
 const png=readFileSync(join(process.cwd(),'docs','screenshots','client-mobile-390x844.png'));
+const syntheticVideoFixture=join(process.cwd(),'tests','fixtures','materials','synthetic-audio-video.webm');
 test.beforeAll(()=>mkdirSync(screenshotDirectory,{recursive:true}));
 
 function bootstrap(){return{csrf:'material-csrf',mode:'advisor',user:advisor,clients:[],cases:[caseRecord],deletedCases:[],activeCase:caseRecord,messages:[],facts:[],reports:[],notifications:[],reviews:[],settings:{companyEmail:'company@example.invalid',companyVerified:true,unreviewedSendPolicy:'pending',mailMode:'dry_run'},capabilities:{analysis:'mock',interview:'mock',voice:'mock',voiceConfigured:false,mail:'dry-run'},demo:true,publicAccess:false,sharedDemo:false};}
@@ -80,14 +81,9 @@ test('browser prepares a synthetic video with real audio before upload',async({p
     uploaded=true;expect(request.headers()['content-type']).toContain('multipart/form-data');expect(request.postDataBuffer()?.byteLength).toBeGreaterThan(1000);return route.fulfill({status:201,contentType:'application/json',body:JSON.stringify(videoDetail)});
   });
   await page.goto('/');await page.getByRole('button',{name:'资料库'}).click();await page.getByLabel('资料名称').fill('合成视频');await page.getByLabel('来源说明').fill('浏览器合成测试');
-  await page.getByLabel('图片或视频').evaluate(async(input:HTMLInputElement)=>{
-    const canvas=document.createElement('canvas');canvas.width=160;canvas.height=90;const drawing=canvas.getContext('2d')!;
-    const audio=new AudioContext(),destination=audio.createMediaStreamDestination(),oscillator=audio.createOscillator();oscillator.frequency.value=440;oscillator.connect(destination);oscillator.start();
-    const stream=new MediaStream([...canvas.captureStream(12).getVideoTracks(),...destination.stream.getAudioTracks()]);
-    const recorder=new MediaRecorder(stream,{mimeType:'video/webm'}),chunks:Blob[]=[];recorder.ondataavailable=event=>{if(event.data.size)chunks.push(event.data);};
-    const stopped=new Promise<void>(resolve=>recorder.onstop=()=>resolve());recorder.start(100);let frame=0;const timer=window.setInterval(()=>{drawing.fillStyle=frame++%2?'#203b34':'#a18047';drawing.fillRect(0,0,canvas.width,canvas.height);},50);await new Promise(resolve=>window.setTimeout(resolve,1100));recorder.stop();await stopped;window.clearInterval(timer);oscillator.stop();stream.getTracks().forEach(track=>track.stop());await audio.close();
-    const file=new File(chunks,'synthetic.webm',{type:'video/webm'}),transfer=new DataTransfer();transfer.items.add(file);input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));
-  });
+  // A fixed synthetic VP8/Opus fixture keeps browser decoding real without tying
+  // the audio/video duration boundary to scheduler timing on the CI machine.
+  await page.getByLabel('图片或视频').setInputFiles(syntheticVideoFixture);
   await page.getByText('我确认有权处理这份资料').click();await page.getByRole('button',{name:'上传并自动提取'}).click();
   await expect(page.getByText('资料已上传，提取完成后需要人工复核。')).toBeVisible({timeout:20_000});expect(uploaded).toBe(true);
 });

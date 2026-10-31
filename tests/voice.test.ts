@@ -11,6 +11,11 @@ import { db, pack } from '../lib/db';
 import type { KnowledgeContext } from '../lib/knowledge';
 
 process.env.DATABASE_PATH=join(mkdtempSync(join(tmpdir(),'aeconn-voice-usage-')),'voice.sqlite');
+// Keep protocol fixtures independent of the host environment at the current demo limits.
+// Tests for smaller allowances override and restore these values explicitly.
+process.env.AI_CASE_BUDGET_USD='8';
+process.env.AI_DAILY_BUDGET_USD='40';
+process.env.AI_MONTHLY_BUDGET_USD='160';
 
 function realtimeUsage(inputAudio=20,outputAudio=20){
   return {input_tokens:inputAudio,output_tokens:outputAudio,input_token_details:{text_tokens:0,audio_tokens:inputAudio,cached_tokens:0,cached_tokens_details:{text_tokens:0,audio_tokens:0}},output_token_details:{text_tokens:0,audio_tokens:outputAudio}};

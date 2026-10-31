@@ -13,6 +13,15 @@ process.env.AI_MONTHLY_BUDGET_USD='20';
 const usagePromise=import('../lib/ai-usage');
 const dbPromise=import('../lib/db');
 
+test('published default limits preserve the current 8/40/160 USD protection',async t=>{
+  const keys=['AI_CASE_BUDGET_USD','AI_DAILY_BUDGET_USD','AI_MONTHLY_BUDGET_USD'] as const;
+  const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];}});
+  for(const key of keys)delete process.env[key];
+  const usage=await usagePromise;
+  assert.deepEqual(usage.getUsageSummary('org-demo').limits,{caseMicros:8_000_000,dailyMicros:40_000_000,monthlyMicros:160_000_000});
+});
+
 test('Responses usage uses cached-token rate and releases unused reservation on settlement',async()=>{
   const usage=await usagePromise;
   const call=usage.beginUsage({context:{caseId:'case-1'},operation:'interview',model:'gpt-6-luna',reserveMicros:200_000});
