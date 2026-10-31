@@ -1,5 +1,7 @@
 # 合成音视频测试资料
 
+`synthetic-h264-aac.mp4` 用于 Windows 原生大视频准备集成测试。它由浏览器的 canvas、合成音调和 MediaRecorder 生成，不含客户文件、人声或外部素材；约六秒，H.264／AAC，76,698 bytes。SHA-256：`F5A9E5C3CB0C17A41EF87DA29F0256C52426CE371B0DB0B5D856EF82AB7940AA`。测试追加合法 ISO-BMFF `free` box 至 33 MiB，验证大文件分块与实际转码流程；这不是 33 MiB 有效视频内容、2 GB 文件或两小时压力测试。
+
 `synthetic-audio-video.webm` 仅用于浏览器资料预处理回归。它由自动化测试环境生成，内容是 160×90 的双色画面、`SYNTHETIC TEST` 字样和 440 Hz 合成音，不含人声、客户资料或外部素材。
 
 - 容器／编码：WebM，VP8／Opus

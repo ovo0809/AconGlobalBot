@@ -15,6 +15,7 @@ import type { RecordingSegment } from './recording-types';
 import type { ManualSettlementInput } from './usage-reconciliation-types';
 import { loadCaseKnowledge } from './material-knowledge';
 import { handleMaterialRequest, MaterialError, materialBlocksCaseDeletion, processMaterialJobs, purgeCaseMaterials, recoverMaterialJobs } from './materials';
+import { handleMaterialImportRequest, MaterialImportError, materialImportBlocksCaseDeletion, processMaterialImports, purgeCaseMaterialImports, recoverMaterialImports } from './material-imports';
 import { publicKnowledgeContext } from './knowledge-public';
 import type { Bootstrap, Case, Category, Client, FactStatus, Message, NotificationJob, ProfileField, ReportContent, ReportRecord, ReportJob, Review, Settings, User } from './domain';
 
@@ -187,11 +188,11 @@ export function processUsageReconciliation(orgId?:string){return reconcilePendin
 
 export function startReportWorker(){
   if(shared.aeconnReportWorker)return;
-  recoverUsageReservations();recoverReportJobs();recoverRecordingJobs();recoverMaterialJobs();
+  recoverUsageReservations();recoverReportJobs();recoverRecordingJobs();recoverMaterialJobs();recoverMaterialImports();
   const reconcile=()=>{try{processUsageReconciliation();}catch{console.error('调用用量自动核对未完成；保留预留，稍后重试。');}};
   reconcile();
   shared.aeconnReconciliationWorker=setInterval(reconcile,30_000);shared.aeconnReconciliationWorker.unref();
-  shared.aeconnReportWorker=setInterval(()=>{void processRecordingJobs();void processReportJobs();void processMaterialJobs().catch(()=>console.error('资料处理任务未完成。'));},500);shared.aeconnReportWorker.unref();
+  shared.aeconnReportWorker=setInterval(()=>{void processRecordingJobs();void processReportJobs();void processMaterialJobs().catch(()=>console.error('资料处理任务未完成。'));void processMaterialImports().catch(()=>console.error('视频准备任务未完成。'));},500);shared.aeconnReportWorker.unref();
 }
 
 export function bootstrap(request:Request):Response {
@@ -227,7 +228,7 @@ export function bootstrap(request:Request):Response {
   return json(data,200,setCookie);
 }
 export function json(value:unknown,status=200,setCookie?:string):Response {const headers:Record<string,string>={'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store, private','Vary':'Cookie'};if(setCookie)headers['Set-Cookie']=setCookie;return new Response(JSON.stringify(value),{status,headers});}
-export function errorResponse(error:unknown){if(error instanceof MaterialError)return json({error:error.message},error.status);if(error instanceof SharedAccessError)return json({error:error.message},403);if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof RecordingError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。',...((error instanceof AppError||error instanceof RecordingError)&&error.code?{code:error.code}:{})},error instanceof AppError||error instanceof RecordingError?error.status:error instanceof UsageBudgetError?429:500);}
+export function errorResponse(error:unknown){if(error instanceof MaterialError||error instanceof MaterialImportError)return json({error:error.message},error.status);if(error instanceof SharedAccessError)return json({error:error.message},403);if(error instanceof ProviderExtractionValidationError)return json({error:EXTRACTION_VALIDATION_MESSAGE,code:error.code},422);return json({error:error instanceof AppError||error instanceof RecordingError||error instanceof UsageBudgetError?error.message:'操作未完成。资料已保存，请重试；如反复出现，请查看不含客户资料的服务日志。',...((error instanceof AppError||error instanceof RecordingError)&&error.code?{code:error.code}:{})},error instanceof AppError||error instanceof RecordingError?error.status:error instanceof UsageBudgetError?429:500);}
 
 function verifyMutationRequest(request:Request,auth:Auth){
   requireThat(request.headers.get('x-csrf-token')===auth.csrf,403,'会话校验失败，请刷新页面。');
@@ -242,6 +243,15 @@ export async function materialsRequest(request:Request):Promise<Response>{
   requireThat(user.role==='reviewer'&&user.accessScope!=='public_tester',403,'仅复核账号可上传和管理资料。');
   if(request.method!=='GET')verifyMutationRequest(request,auth);
   return handleMaterialRequest(request,user,caseId=>{caseFor(user,caseId);});
+}
+
+/** Large-video preparation has the same local reviewer/case boundary as materials. */
+export async function materialImportRequest(request:Request):Promise<Response>{
+  requireThat(!publicRequestConfig(request)&&!isSharedDemo(),403,'视频自动处理仅在本机复核工作区开放。');
+  const auth=readAuth(request);requireThat(auth,401,'请先登录。');const user=requireAdvisorMode(auth);
+  requireThat(user.role==='reviewer'&&user.accessScope!=='public_tester',403,'仅复核账号可上传和管理资料。');
+  if(request.method!=='GET')verifyMutationRequest(request,auth);
+  return handleMaterialImportRequest(request,user,caseId=>{caseFor(user,caseId);});
 }
 
 /** Owner-only recording endpoint. Raw audio and unreviewed transcripts never enter bootstrap. */
@@ -368,13 +378,14 @@ export async function action(request:Request):Promise<Response>{
     if(name==='restoreCase'){requireThat(record.deletedAt,409,'案例未被删除。');transaction(()=>{record.deletedAt=null;record.deletedBy=null;saveCase(record);audit(user.id,record.id,'case.restored');});return json({ok:true,nextCaseId:record.id});}
     requireThat(!db().prepare("SELECT id FROM interviews WHERE case_id=? AND state IN ('active','paused','finishing')").get(record.id),409,'进行中的访谈不能删除，请先结束访谈。');requireThat(!recordingBlocksCaseDeletion(record.id),409,'录音正在采集或转写，暂时不能删除案例。');requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能删除案例。');
     requireThat(!materialBlocksCaseDeletion(record.id),409,'关联资料仍在提取，请等待处理完成后再删除案例。');
+    requireThat(!materialImportBlocksCaseDeletion(record.id),409,'视频仍在上传或准备，请先完成或取消处理。');
     if(name==='purgeCase'){
       requireThat(record.deletedAt,409,'请先将案例移入已删除案例。');requireThat(str(input,'confirmation',20)==='永久删除',400,'请输入“永久删除”确认此操作。');
       const sessions=db().prepare('SELECT id FROM interviews WHERE case_id=?').all(record.id) as {id:string}[];
       requireThat(!sessions.some(session=>interviewLocks.has(session.id)),409,'访谈消息仍在处理，请稍后重试。');
       requireThat(!db().prepare("SELECT id FROM ai_usage_calls WHERE case_id=? AND status='reserved'").get(record.id),409,'仍有进行中的调用记录，请等待结算后再永久删除。');
       transaction(()=>{
-        purgeCaseUsage(record.id);purgeCaseMaterials(record.id);
+        purgeCaseUsage(record.id);purgeCaseMaterials(record.id);purgeCaseMaterialImports(record.id);
         db().prepare("UPDATE auth_sessions SET mode=CASE WHEN active_case=? OR active_interview IN (SELECT id FROM interviews WHERE case_id=?) THEN 'advisor' ELSE mode END,active_case=CASE WHEN active_case=? THEN NULL ELSE active_case END,active_interview=CASE WHEN active_interview IN (SELECT id FROM interviews WHERE case_id=?) THEN NULL ELSE active_interview END,last_ended_case=CASE WHEN last_ended_case=? THEN NULL ELSE last_ended_case END WHERE active_case=? OR active_interview IN (SELECT id FROM interviews WHERE case_id=?) OR last_ended_case=?").run(record.id,record.id,record.id,record.id,record.id,record.id,record.id,record.id);
         db().prepare('DELETE FROM voice_tokens WHERE interview_id IN (SELECT id FROM interviews WHERE case_id=?)').run(record.id);
         db().prepare('DELETE FROM interview_extractions WHERE session_id IN (SELECT id FROM interviews WHERE case_id=?)').run(record.id);

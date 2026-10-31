@@ -12,6 +12,55 @@ test.beforeAll(()=>mkdirSync(screenshotDirectory,{recursive:true}));
 
 function bootstrap(){return{csrf:'material-csrf',mode:'advisor',user:reviewer,clients:[],cases:[caseRecord],deletedCases:[],activeCase:caseRecord,messages:[],facts:[],reports:[],notifications:[],reviews:[],settings:{companyEmail:'company@example.invalid',companyVerified:true,unreviewedSendPolicy:'pending',mailMode:'dry_run'},capabilities:{analysis:'mock',interview:'mock',voice:'mock',voiceConfigured:false,mail:'dry-run'},demo:true,publicAccess:false,sharedDemo:false};}
 
+for(const fixture of [
+  {label:'image',title:'窗口恢复图片草稿',source:'图片来源草稿',name:'focus-poster.png',files:{name:'focus-poster.png',mimeType:'image/png',buffer:png}},
+  {label:'video',title:'窗口恢复视频草稿',source:'视频来源草稿',name:'synthetic-audio-video.webm',files:syntheticVideoFixture},
+] as const){
+  test(`reviewer ${fixture.label} upload draft survives file-picker focus recovery`,async({page})=>{
+    let bootstrapRequests=0;
+    let uploadBody:Buffer|null=null;
+    const summary={id:`focus-${fixture.label}`,title:fixture.title,filename:fixture.name,kind:fixture.label,state:'needs_review',provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version:1,error:null,scope:'case'};
+    const detail={...summary,sourceNote:fixture.source,originalText:'【模拟提取】待复核。',reviewedText:'',coverage:'合成资料回归',events:[],parts:[]};
+    await page.route('**/api/bootstrap*',async route=>{
+      bootstrapRequests+=1;
+      // Keep the background verification request in flight long enough to catch
+      // a full-screen loading state that would unmount the upload form.
+      if(bootstrapRequests>1)await new Promise(resolve=>setTimeout(resolve,80));
+      await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(bootstrap())});
+    });
+    await page.route('**/api/materials*',route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(request.method()==='POST'){
+        uploadBody=request.postDataBuffer();
+        return route.fulfill({status:201,contentType:'application/json',body:JSON.stringify(summary)});
+      }
+      if(url.searchParams.get('id'))return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(detail)});
+      return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({items:uploadBody?[summary]:[],provider:'mock',configured:true})});
+    });
+    await page.goto('/');await page.getByRole('button',{name:'资料库'}).click();
+    await page.getByLabel('资料名称').fill(fixture.title);await page.getByLabel('来源说明').fill(fixture.source);
+    await page.getByLabel('图片或视频').setInputFiles(fixture.files);await page.getByLabel(/我确认有权处理这份资料/).check();
+
+    for(const eventName of ['focus','pageshow','visibilitychange'] as const){
+      const before=bootstrapRequests;
+      await page.evaluate(name=>{
+        const target=name==='visibilitychange'?document:window;
+        target.dispatchEvent(new Event(name));
+      },eventName);
+      await expect.poll(()=>bootstrapRequests).toBeGreaterThan(before);
+      await expect(page.getByRole('heading',{name:'上传参考资料'})).toBeVisible();
+      await expect(page.getByLabel('资料名称')).toHaveValue(fixture.title);
+      await expect(page.getByLabel('来源说明')).toHaveValue(fixture.source);
+      await expect(page.getByLabel(/我确认有权处理这份资料/)).toBeChecked();
+      await expect.poll(()=>page.getByLabel('图片或视频').evaluate((input:HTMLInputElement)=>input.files?.[0]?.name??'')).toBe(fixture.name);
+    }
+    await page.getByRole('button',{name:'上传并自动提取'}).click();
+    await expect(page.getByText('资料已上传，提取完成后需要人工复核。')).toBeVisible({timeout:20_000});
+    expect(uploadBody).not.toBeNull();
+    expect(uploadBody!.includes(Buffer.from(fixture.name))).toBe(true);
+  });
+}
+
 test('Charles uploads, reviews, approves and withdraws extracted image material',async({page})=>{
   let state:'none'|'needs_review'|'approved'|'withdrawn'='none',version=1;
   const summary=()=>({id:'material-1',title:'长期护理海报',filename:'poster.png',kind:'image',state:state==='none'?'needs_review':state,provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version,error:null,scope:'case'});

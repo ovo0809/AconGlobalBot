@@ -5,7 +5,8 @@ import { requireAnalysisConfig } from './provider-config';
 import { RecordingTranscriptionError, recordingProviderConfig, transcribeRecordingChunk } from './recording-transcription';
 import { validateRecordingWav } from './recording-audio';
 import { MaterialExtractionError, extractMaterialImage } from './material-extractor';
-import { MATERIAL_MAX_ORIGINAL_BYTES, MATERIAL_MAX_REQUEST_BYTES, MATERIAL_MAX_TEXT_BYTES, MATERIAL_MAX_VIDEO_SECONDS, type MaterialDetail, type MaterialPart, type MaterialProvider, type MaterialSummary } from './material-types';
+import { MATERIAL_MAX_ORIGINAL_BYTES, MATERIAL_MAX_REQUEST_BYTES, MATERIAL_MAX_STORAGE_BYTES, MATERIAL_MAX_TEXT_BYTES, MATERIAL_MAX_VIDEO_SECONDS, type MaterialDetail, type MaterialPart, type MaterialProvider, type MaterialSummary } from './material-types';
+import { validateMaterialImportSource } from './material-imports';
 
 export class MaterialError extends Error {constructor(public status:number,message:string){super(message);}}
 function requireMaterial(value:unknown,status:number,message:string):asserts value {if(!value)throw new MaterialError(status,message);}
@@ -65,7 +66,7 @@ async function readBounded(request:Request,max:number){
 function formFile(form:FormData,name:string){const value=form.get(name);requireMaterial(value instanceof File&&value.size>0,400,`缺少文件 ${name}。`);return value;}
 function numeric(value:unknown,label:string){requireMaterial(typeof value==='number'&&Number.isFinite(value)&&value>=0,400,`${label}无效。`);return value;}
 
-async function parseUpload(request:Request){
+async function parseUpload(request:Request,user:User){
   const body=await readBounded(request,MATERIAL_MAX_REQUEST_BYTES);let form:FormData;
   try {form=await new Request('http://localhost/upload',{method:'POST',headers:{'content-type':request.headers.get('content-type')||''},body:new Uint8Array(body)}).formData();}catch{throw new MaterialError(400,'上传表单无效。');}
   requireMaterial(form.get('consent')==='true',400,'请确认有权使用资料并同意云端处理。');
@@ -74,8 +75,14 @@ async function parseUpload(request:Request){
   const sourceNote=cleanText(form.get('sourceNote')??'',1600,'资料来源');const caseId=cleanText(form.get('caseId'),100,'案例');
   const requestId=cleanText(form.get('requestId'),100,'请求编号');requireMaterial(/^[a-zA-Z0-9_-]{16,100}$/.test(requestId),400,'请求编号无效。');
   const original=new Uint8Array(await file.arrayBuffer());const magic=Buffer.from(original.subarray(0,32));
+  let importSource;
+  if(form.has('importSource')){
+    let reference:unknown;try{reference=JSON.parse(String(form.get('importSource')));}catch{throw new MaterialError(400,'视频准备来源无效。');}
+    importSource=await validateMaterialImportSource(user,caseId,reference,original);
+  }
   const video=magic.toString('ascii',4,8)==='ftyp'||magic.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3]));
   const kind=video?'video':'image';const mimeType=video?(magic.toString('ascii',4,8)==='ftyp'?'video/mp4':'video/webm'):validateMaterialImage(original,10000);
+  requireMaterial(!importSource||kind==='video',400,'自动准备来源必须对应视频分段。');
   let manifest:{durationSeconds:number;audioDurationSeconds?:number;frames:Record<string,unknown>[];audio:Record<string,unknown>[]}|null=null;
   if(form.has('manifest')){try{manifest=JSON.parse(String(form.get('manifest')));}catch{throw new MaterialError(400,'媒体处理清单无效。');}}
   const parts:PreparedPart[]=[];
@@ -83,6 +90,7 @@ async function parseUpload(request:Request){
   else {
     requireMaterial(manifest&&typeof manifest==='object'&&Array.isArray(manifest.frames)&&Array.isArray(manifest.audio),400,'缺少媒体处理清单，请用页面重新上传。');
     const duration=numeric(manifest.durationSeconds,'视频时长');
+    requireMaterial(!importSource||Math.abs(duration-(importSource.endSeconds-importSource.startSeconds))<=0.5,400,'视频分段时长与准备记录不一致。');
     if(manifest.audioDurationSeconds!==undefined){const audioDuration=numeric(manifest.audioDurationSeconds,'原音轨时长');requireMaterial(kind==='image'?audioDuration===0:Math.abs(audioDuration-duration)<=0.25,400,'视频和原音轨长度差异过大，请拆分或转换后上传。');}
     requireMaterial(kind==='image'?duration===0&&manifest.frames.length===1&&manifest.audio.length===0:duration>0&&duration<=MATERIAL_MAX_VIDEO_SECONDS&&manifest.frames.length>=1&&manifest.frames.length<=20&&manifest.audio.length>=1&&manifest.audio.length<=21,400,'视频最多 10 分钟，须包含声音及抽样画面。');
     const seen=new Set<string>();let previousFrame=-1;
@@ -93,21 +101,34 @@ async function parseUpload(request:Request){
   }
   const filename=file.name.replace(/[\\/\u0000-\u001f\u007f]/g,'_').slice(0,180);
   const audioDifference=manifest?.audioDurationSeconds===undefined?'':`浏览器解码音轨 ${manifest.audioDurationSeconds.toFixed(3)} 秒；与视频相差 ${Math.abs(manifest.audioDurationSeconds-manifest.durationSeconds).toFixed(3)} 秒，尾部不足补静音、超出裁去。`;
-  const coverage=kind==='image'?'单张图片文字与可辨认图表；小字、模糊处须对照原图核对。':`音轨分段覆盖 ${manifest!.durationSeconds.toFixed(1)} 秒；${audioDifference}抽样 ${manifest!.frames.length} 帧（时间点：${manifest!.frames.map(frame=>Number(frame.startSeconds).toFixed(1)+'s').join('、')}）。非逐帧识别，画面切换间的信息可能遗漏，需人工核对原视频。`;
-  return {caseId,title,sourceNote,requestId,filename,kind,mimeType,original,parts,coverage,fingerprint:hash(pack({title,sourceNote,caseId,original:hash(original),parts:parts.map(part=>({hash:hash(part.bytes),...part.doc}))}))} as const;
+  const sourceCoverage=importSource?`原视频：${importSource.filename}；源文件 SHA-256：${importSource.sourceHash}；第 ${importSource.index+1} 段按本机转码时间轴约 ${importSource.startSeconds.toFixed(1)}–${importSource.endSeconds.toFixed(1)} 秒（与原片可能有不超过 1 秒的编码偏差）；以下时间相对此分段。` : '';
+  const coverage=kind==='image'?'单张图片文字与可辨认图表；小字、模糊处须对照原图核对。':`${sourceCoverage}音轨分段覆盖 ${manifest!.durationSeconds.toFixed(1)} 秒；${audioDifference}抽样 ${manifest!.frames.length} 帧（时间点：${manifest!.frames.map(frame=>Number(frame.startSeconds).toFixed(1)+'s').join('、')}）。非逐帧识别，画面切换间的信息可能遗漏，需人工核对原视频。`;
+  return {caseId,title,sourceNote,requestId,filename,kind,mimeType,original,parts,coverage,importSource,fingerprint:hash(pack({title,sourceNote,caseId,original:hash(original),...(importSource?{importSource}:{}),parts:parts.map(part=>({hash:hash(part.bytes),...part.doc}))}))} as const;
 }
 
 async function upload(request:Request,user:User,checkCase:(caseId:string)=>void){
-  const input=await parseUpload(request);checkCase(input.caseId);
+  const input=await parseUpload(request,user);checkCase(input.caseId);
+  if(input.importSource){
+    const source=input.importSource;
+    const previous=db().prepare("SELECT id,owner_id,case_id,original,doc FROM material_documents WHERE json_extract(doc,'$.importSource.jobId')=? AND json_extract(doc,'$.importSource.index')=?").get(source.jobId,source.index);
+    if(previous){
+      const prior=unpack<StoredMaterial>(previous.doc);
+      requireMaterial(previous.owner_id===user.id&&previous.case_id===input.caseId&&hash(new Uint8Array(previous.original as Uint8Array))===hash(input.original)&&prior.importSource?.sourceHash===source.sourceHash,409,'已提交的视频来源不一致，请核对原任务。');
+      // A lost response may require preparing JPEG/WAV again. The verified source
+      // segment identifies the existing material; derived bytes must not requeue it.
+      return json(materialDetail(String(previous.id),user));
+    }
+  }
   const existing=db().prepare('SELECT id,fingerprint FROM material_documents WHERE owner_id=? AND request_id=?').get(user.id,input.requestId);
   if(existing){requireMaterial(existing.fingerprint===input.fingerprint,409,'同一上传编号的内容已改变，请重新上传。');return json(materialDetail(String(existing.id),user));}
   const config=materialProviderConfig();requireMaterial(config.configured,409,'资料识别需要完整的 OpenAI 配置，或明确选择模拟模式。');
   if(input.kind==='video'){const audio=recordingProviderConfig();requireMaterial(audio.configured&&audio.provider===config.provider,409,'视频声音转写与图片识别的服务配置不一致。');}
   const stamp=now(),document:StoredMaterial={id:id(),title:input.title,filename:input.filename,kind:input.kind,state:'queued',provider:config.provider,caseId:input.caseId,createdAt:stamp,updatedAt:stamp,version:1,error:null,sourceNote:input.sourceNote,originalText:'',reviewedText:'',coverage:input.coverage,events:[{at:stamp,action:'uploaded',detail:`已上传；${config.provider==='mock'?'模拟处理，不代表真实识别':'使用已配置的 OpenAI 云端处理'}；未复核，不供 AI 参考。`}]};
+  if(input.importSource){document.importSource=input.importSource;event(document,'video_prepared',`本机自动压缩分段；批次 ${input.importSource.jobId}，转码时间轴约 ${input.importSource.startSeconds.toFixed(1)}–${input.importSource.endSeconds.toFixed(1)} 秒，与原片可能有不超过 1 秒的编码偏差。`);}
   transaction(()=>{
     const count=Number((db().prepare('SELECT count(*) n FROM material_documents WHERE owner_id=?').get(user.id) as {n:number}).n);requireMaterial(count<60,409,'当前资料库最多 60 份资料。');
     const bytes=Number((db().prepare('SELECT COALESCE(SUM(length(original)),0) n FROM material_documents').get() as {n:number}).n)+Number((db().prepare('SELECT COALESCE(SUM(length(bytes)),0) n FROM material_parts').get() as {n:number}).n);
-    requireMaterial(bytes+input.original.byteLength+input.parts.reduce((sum,part)=>sum+part.bytes.byteLength,0)<=512*1024*1024,409,'本机资料存储已达上限，请由维护人员整理。');
+    requireMaterial(bytes+input.original.byteLength+input.parts.reduce((sum,part)=>sum+part.bytes.byteLength,0)<=MATERIAL_MAX_STORAGE_BYTES,409,'本机资料存储已达 2 GB 上限，请由维护人员整理。');
     db().prepare('INSERT INTO material_documents VALUES(?,?,?,?,?,?,?,?,?)').run(document.id,user.id,input.caseId,input.requestId,input.fingerprint,document.state,pack(document),input.mimeType,input.original);
     for(const part of input.parts)db().prepare('INSERT INTO material_parts VALUES(?,?,?,?,?,?)').run(document.id,part.doc.position,'queued',part.doc.mimeType,part.bytes,pack(part.doc));
     audit(user.id,input.caseId,'material.uploaded',{materialId:document.id,kind:document.kind});

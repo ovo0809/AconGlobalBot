@@ -73,49 +73,60 @@ export default function Home() {
   const [handback, setHandback] = useState(false);
   const selectedCaseIdRef = useRef<string | undefined>(undefined);
   const refreshVersion = useRef(0);
+  const sessionCheckPending = useRef(false);
   const initialBootstrap = useRef<Promise<Bootstrap> | null>(null);
   const bootstrapLoaded = useRef(false);
   const sessionChannel = useRef<BroadcastChannel | null>(null);
   const sessionMode = data?.mode;
   const sessionUserId = data?.user?.id;
 
-  const refresh = useCallback(async (caseId?: string) => {
-    const version = ++refreshVersion.current;
+  const refresh = useCallback(async (caseId?: string, checkSession = false) => {
+    if(checkSession)sessionCheckPending.current=true;
+    // Polls already scheduled by the mounted workspace cannot supersede a
+    // security check, including if their responses arrive after that check.
+    const version=sessionCheckPending.current&&!checkSession?0:++refreshVersion.current;
     // Share the first request so concurrent focus events cannot create competing session cookies.
     const request = bootstrapLoaded.current ? getBootstrap(caseId ?? selectedCaseIdRef.current) : initialBootstrap.current ??= getBootstrap(caseId ?? selectedCaseIdRef.current);
-    let next:Bootstrap;
-    try { next=await request; bootstrapLoaded.current=true; }
-    finally { if(initialBootstrap.current===request)initialBootstrap.current=null; }
-    if(version===refreshVersion.current){
-      if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
-      else selectedCaseIdRef.current = next.activeCase?.id;
-      setData(next);
+    try {
+      const next=await request; bootstrapLoaded.current=true;
+      if(version===refreshVersion.current){
+        if (next.mode === 'client' || next.mode === 'anonymous') selectedCaseIdRef.current = undefined;
+        else selectedCaseIdRef.current = next.activeCase?.id;
+        setData(next);
+      }
+      return next;
+    } catch(error) {
+      // A failed check must not reveal a cached workspace from an unverified session.
+      if(version===refreshVersion.current){setData(null);selectedCaseIdRef.current=undefined;}
+      throw error;
+    } finally {
+      if(initialBootstrap.current===request)initialBootstrap.current=null;
+      if(version===refreshVersion.current){sessionCheckPending.current=false;setLoading(false);}
     }
-    return next;
   }, []);
 
+  const verifySession=useCallback(()=>{setLoading(true);void refresh(undefined,true).catch(()=>undefined);},[refresh]);
+
   useEffect(() => {
-    refresh().catch((error: Error) => setToast({ kind: 'error', text: error.message })).finally(() => setLoading(false));
+    refresh(undefined,true).catch((error: Error) => setToast({ kind: 'error', text: error.message }));
   }, [refresh]);
 
   useEffect(() => {
-    const verify = () => { setLoading(true); void refresh().catch(() => undefined).finally(() => setLoading(false)); };
-    const pageShow = () => verify();
-    const visibility = () => { if (document.visibilityState === 'visible') verify(); };
-    window.addEventListener('focus', verify);
-    window.addEventListener('pageshow', pageShow);
+    const visibility = () => { if (document.visibilityState === 'visible') verifySession(); };
+    window.addEventListener('focus', verifySession);
+    window.addEventListener('pageshow', verifySession);
     document.addEventListener('visibilitychange', visibility);
-    return () => { window.removeEventListener('focus', verify); window.removeEventListener('pageshow', pageShow); document.removeEventListener('visibilitychange', visibility); };
-  }, [refresh]);
+    return () => { window.removeEventListener('focus', verifySession); window.removeEventListener('pageshow', verifySession); document.removeEventListener('visibilitychange', visibility); };
+  }, [verifySession]);
 
   useEffect(() => {
     if (!sessionMode) return;
     const channel = new BroadcastChannel('aeconn-session-mode');
     sessionChannel.current=channel;
     channel.postMessage({ mode: sessionMode, userId: sessionUserId ?? null, at: Date.now() });
-    channel.onmessage = () => { setLoading(true); void refresh().catch(() => undefined).finally(() => setLoading(false)); };
+    channel.onmessage = verifySession;
     return () => { sessionChannel.current=null;channel.close(); };
-  }, [sessionMode, sessionUserId, refresh]);
+  }, [sessionMode, sessionUserId, verifySession]);
 
   useEffect(() => {
     if (!toast) return;
@@ -144,10 +155,14 @@ export default function Home() {
     } finally { setBusy(''); }
   }, [data, refresh]);
 
-  if (loading) return <LoadingScreen />;
-  if (!data || data.mode === 'anonymous') return <LoginScreen publicAccess={Boolean(data?.publicAccess)} sharedDemo={Boolean(data?.sharedDemo)} busy={busy === 'login'} onLogin={async (email, password) => { await act({ action: 'login', email, password }); }} toast={toast} />;
+  if (loading && data?.mode !== 'advisor') return <LoadingScreen />;
+  if (!data) return <main className="loading-screen"><Brand/><p role="alert">无法确认当前登录状态，请重新连接。</p><button className="button button-primary" onClick={verifySession}>重新连接</button></main>;
+  if (data.mode === 'anonymous') return <LoginScreen publicAccess={Boolean(data.publicAccess)} sharedDemo={Boolean(data.sharedDemo)} busy={busy === 'login'} onLogin={async (email, password) => { await act({ action: 'login', email, password }); }} toast={toast} />;
   if (data.mode === 'client') return <ClientAssistant data={data} busy={busy} act={act} refresh={refresh} setHandback={setHandback} setToast={setToast} />;
-  return <InternalWorkspace data={data} busy={busy} act={act} refresh={refresh} handback={handback} setHandback={setHandback} setToast={setToast} toast={toast} selectedCaseIdRef={selectedCaseIdRef} />;
+  // File pickers trigger focus checks. Mask the existing tree instead of unmounting
+  // its file inputs/drafts; a different session or access boundary still resets it.
+  const workspaceKey=JSON.stringify([data.csrf,data.user?.id,data.user?.role,data.user?.orgId,data.user?.accessScope,data.publicAccess,data.sharedDemo]);
+  return <>{loading&&<LoadingScreen/>}<div hidden={loading} inert={loading}><InternalWorkspace key={workspaceKey} data={data} busy={busy} act={act} refresh={refresh} handback={handback} setHandback={setHandback} setToast={setToast} toast={toast} selectedCaseIdRef={selectedCaseIdRef} /></div></>;
 }
 
 function LoadingScreen() {

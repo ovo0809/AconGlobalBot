@@ -52,8 +52,12 @@ export function db():DatabaseSync {
     CREATE TABLE IF NOT EXISTS material_documents (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), case_id TEXT NOT NULL REFERENCES cases(id), request_id TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL, doc TEXT NOT NULL, mime_type TEXT NOT NULL, original BLOB NOT NULL, UNIQUE(owner_id,request_id));
     CREATE TABLE IF NOT EXISTS material_parts (material_id TEXT NOT NULL REFERENCES material_documents(id) ON DELETE CASCADE, position INTEGER NOT NULL, state TEXT NOT NULL, mime_type TEXT NOT NULL, bytes BLOB NOT NULL, doc TEXT NOT NULL, PRIMARY KEY(material_id,position));
     CREATE TABLE IF NOT EXISTS material_versions (material_id TEXT NOT NULL REFERENCES material_documents(id) ON DELETE CASCADE, revision TEXT NOT NULL, doc TEXT NOT NULL, PRIMARY KEY(material_id,revision));
+    CREATE TABLE IF NOT EXISTS material_import_jobs (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), case_id TEXT NOT NULL REFERENCES cases(id), state TEXT NOT NULL, doc TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS material_documents_owner_state ON material_documents(owner_id,state);
-    PRAGMA user_version=9;
+    CREATE UNIQUE INDEX IF NOT EXISTS material_documents_import_source ON material_documents(json_extract(doc,'$.importSource.jobId'),json_extract(doc,'$.importSource.index')) WHERE json_extract(doc,'$.importSource.jobId') IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS material_import_jobs_owner_request ON material_import_jobs(owner_id,json_extract(doc,'$.requestId'));
+    CREATE INDEX IF NOT EXISTS material_import_jobs_case_state ON material_import_jobs(case_id,state);
+    PRAGMA user_version=10;
   `);
   if(!database.prepare('PRAGMA table_info(interviews)').all().some(row=>row.name==='epoch'))database.exec('ALTER TABLE interviews ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0');
   for(const table of ['auth_sessions','voice_tokens']){

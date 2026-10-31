@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Bootstrap, Case, Client, User } from '../lib/domain';
 import type { MaterialDetail } from '../lib/material-types';
 import { db, pack, unpack } from '../lib/db';
@@ -46,7 +46,7 @@ class Browser {
   async login(email='charles@aeconn.example'){await this.refresh();assert.equal((await this.action({action:'login',email,password:'AeconnDemo!2026'})).status,200);await this.refresh();return this;}
   async request(body?:FormData|Record<string,unknown>,query='',headers:Record<string,string>={}){const multipart=body instanceof FormData;try{return await service.materialsRequest(new Request(`http://localhost/api/materials${query}`,{method:body?'POST':'GET',headers:{cookie:this.cookie,origin:'http://localhost','x-csrf-token':this.csrf,...(body&&!multipart?{'content-type':'application/json'}:{}),...headers},body:body?(multipart?body:JSON.stringify(body)):undefined}));}catch(e){return service.errorResponse(e);}}
 }
-function imageForm(requestId=randomUUID(),caseId='case-1'){const form=new FormData();form.set('caseId',caseId);form.set('title','长期护理合成培训资料');form.set('sourceNote','合成示例，非保险产品条款');form.set('consent','true');form.set('requestId',requestId);form.set('file',new Blob([png],{type:'image/png'}),'poster.png');return form;}
+function imageForm(requestId:string=randomUUID(),caseId='case-1'){const form=new FormData();form.set('caseId',caseId);form.set('title','长期护理合成培训资料');form.set('sourceNote','合成示例，非保险产品条款');form.set('consent','true');form.set('requestId',requestId);form.set('file',new Blob([png],{type:'image/png'}),'poster.png');return form;}
 async function create(browser:Browser,form=imageForm()){const response=await browser.request(form);assert.equal(response.status,201,JSON.stringify(await response.clone().json()));return await response.json() as MaterialDetail;}
 async function detail(browser:Browser,id:string){return await (await browser.request(undefined,`?id=${id}`)).json() as MaterialDetail;}
 async function approve(browser:Browser,doc:MaterialDetail,extra:Record<string,unknown>={}){const r=await browser.request({action:'approve',id:doc.id,version:doc.version,reviewedText:'长期护理应核对照护偏好与家庭支持。金额及适用条件未知，应由顾问核实。',confirmed:true,...extra});assert.equal(r.status,200);return r.json() as Promise<MaterialDetail>;}
@@ -156,4 +156,29 @@ test('approved private references reach voice context and report PDF without bec
   assert(JSON.parse(String(report.doc)).knowledge.sources.some((source:{path:string})=>source.path.includes(uploaded.id)));
   assert.equal(Buffer.from(report.pdf as Uint8Array).subarray(0,4).toString(),'%PDF');
   assert.deepEqual(db().prepare('SELECT doc FROM profile_fields WHERE case_id=? ORDER BY field_key').all('case-6'),beforeFacts);
+});
+
+test('a prepared source segment is idempotent even when a lost response requires different derived frames',async()=>{
+  const browser=await new Browser().login(),jobId=randomUUID(),stamp=new Date().toISOString();assignReviewer('case-1');
+  const original=Buffer.from('0000ftypisom00000000000000000000'),checksum=createHash('sha256').update(original).digest('hex');
+  const job={id:jobId,requestId:randomUUID(),title:'合成视频',sourceNote:'无真实内容',caseId:'case-1',filename:'synthetic-source.mp4',size:original.length,lastModified:1,state:'ready',receivedChunks:1,totalChunks:1,durationSeconds:1,sourceHash:checksum,segments:[{index:0,filename:'part-000.mp4',startSeconds:0,endSeconds:1,bytes:original.length,sha256:checksum}],error:null,createdAt:stamp,updatedAt:stamp,receivedBytes:original.length,chunkHashes:[checksum]};
+  db().prepare('INSERT INTO material_import_jobs VALUES(?,?,?,?,?)').run(jobId,'charles','case-1','ready',pack(job));
+  function preparedForm(requestId:string,frame=png){
+    const form=imageForm(requestId);form.set('file',new Blob([original],{type:'video/mp4'}),'part-000.mp4');
+    form.set('frame0',new Blob([new Uint8Array(frame)]),'frame.png');form.set('audio0',new Blob([new Uint8Array(encodeRecordingWav(new Int16Array(16000)))]),'audio.wav');
+    form.set('manifest',JSON.stringify({durationSeconds:1,frames:[{field:'frame0',startSeconds:0}],audio:[{field:'audio0',startSeconds:0}]}));form.set('importSource',JSON.stringify({jobId,index:0}));return form;
+  }
+  const concurrent=await Promise.all([browser.request(preparedForm(`${jobId}-0`)),browser.request(preparedForm(randomUUID(),Buffer.concat([png,Buffer.from([0])])))]);
+  assert.deepEqual(concurrent.map(response=>response.status).sort(),[200,201]);
+  const [first,duplicate]=await Promise.all(concurrent.map(response=>response.json() as Promise<MaterialDetail>));
+  assert.equal(duplicate.id,first.id);
+  assert.equal(first.importSource?.sourceHash,checksum);assert.match(first.coverage,/转码时间轴约 0.0–1.0 秒/);
+  // Preserve the completed state; retry must not turn it into another cloud job.
+  const completed={...first,state:'needs_review'};db().prepare("UPDATE material_documents SET state='needs_review',doc=? WHERE id=?").run(pack(completed),first.id);
+  for(const requestId of [`${jobId}-0`,randomUUID()]){
+    const response=await browser.request(preparedForm(requestId,Buffer.concat([png,Buffer.from([0])])));
+    assert.equal(response.status,200,JSON.stringify(await response.clone().json()));const retried=await response.json() as MaterialDetail;
+    assert.equal(retried.id,first.id);assert.equal(retried.state,'needs_review');
+  }
+  assert.equal(db().prepare("SELECT count(*) n FROM material_documents WHERE json_extract(doc,'$.importSource.jobId')=?").get(jobId)!.n,1);
 });
