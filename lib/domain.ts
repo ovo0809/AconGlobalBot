@@ -1,10 +1,19 @@
 import type { UsageSummary } from './ai-usage';
+import type { ReconciliationOverview } from './usage-reconciliation-types';
+import type { KnowledgeContext } from './knowledge';
 
 export type Role = 'advisor' | 'reviewer' | 'admin';
 export type Category = 'life' | 'annuity' | 'ltc' | 'disability_income';
 export type FactStatus = 'confirmed' | 'reported_unverified' | 'unknown' | 'declined' | 'conflicting';
 export type DemandStatus = 'priority_discussion' | 'secondary_discussion' | 'defer' | 'insufficient_information' | 'review_existing';
-export interface User { id:string; name:string; email:string; role:Role; orgId:string; emailVerified:boolean }
+// Reference snapshots are separate from customer evidence; old records need no migration.
+export interface Message { knowledge?:KnowledgeContext; knowledgeRefs?:string[] }
+// A stream-final caption is not proof that the model generated a complete answer.
+export interface Message { responseStatus?:'incomplete'|'cancelled'|'failed' }
+export interface AnalysisItem { knowledgeRefs?:string[] }
+export interface ReportInput { knowledge?:KnowledgeContext }
+export interface ReportContent { knowledge?:KnowledgeContext }
+export interface User { id:string; name:string; email:string; role:Role; orgId:string; emailVerified:boolean; accessScope?:'public_tester'; sharedRunId?:string }
 export interface Client { id:string; name:string; birthday:string; gender:string; phone:string; email:string; maritalStatus:string; state:string; language:string; ownerAgentId:string; consentStatus:string; createdAt:string; nextCaseNumber?:number }
 export interface Case { id:string; clientId:string; ownerAgentId:string; status:string; entry:Category|null; createdAt:string; updatedAt:string; assignedReviewerId:string|null; reportVersion:number; clientName?:string; deletedAt?:string|null; deletedBy?:string|null; caseNumber?:number }
 export interface Message { id:string; caseId:string; sessionId:string; turnId:string; eventId:string; role:'user'|'assistant'; text:string; final:boolean; interrupted:boolean; createdAt:string; playbackStatus?:string; correctionOf?:string|null; source?:'customer'|'advisor'|'synthetic'; actorId?:string; sourceKind?:'advisor_reviewed_recording'; recordingSegmentIds?:string[] }
@@ -18,4 +27,4 @@ export interface NotificationJob { id:string; caseId:string; reportVersion:numbe
 export interface Review { id:string; caseId:string; reportVersion:number; reviewerId:string; decision:string; reason:string; createdAt:string }
 export interface ReportJob { caseId:string; status:'queued'|'generating'|'ready'|'failed'; error:string|null; attempts:number; updatedAt:string }
 export interface Settings { companyEmail:string; companyVerified:boolean; unreviewedSendPolicy:'pending'|'allow'|'reviewed_only'; mailMode:string }
-export interface Bootstrap { usage?:UsageSummary; csrf:string; mode:'anonymous'|'advisor'|'client'; user:User|null; clients:Client[]; cases:Case[]; deletedCases?:Case[]; activeCase:Case|null; messages:Message[]; facts:ProfileField[]; reports:ReportRecord[]; reportJob?:ReportJob; notifications:NotificationJob[]; reviews:Review[]; settings?:Settings; users?:User[]; clientSession?:{id:string;state:string;entry:Category|null}; capabilities:{analysis:string;interview?:string;voice:string;voiceConfigured:boolean;mail:string}; demo:boolean }
+export interface Bootstrap { publicAccess?:boolean; sharedDemo?:boolean; reconciliation?:ReconciliationOverview; usage?:UsageSummary; csrf:string; mode:'anonymous'|'advisor'|'client'; user:User|null; clients:Client[]; cases:Case[]; deletedCases?:Case[]; activeCase:Case|null; messages:Message[]; facts:ProfileField[]; reports:ReportRecord[]; reportJob?:ReportJob; notifications:NotificationJob[]; reviews:Review[]; settings?:Settings; users?:User[]; clientSession?:{id:string;state:string;entry:Category|null}; capabilities:{analysis:string;interview?:string;voice:string;voiceConfigured:boolean;mail:string}; demo:boolean }

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ReportContent } from '../lib/domain';
-import { presentReport } from '../lib/report-presentation';
+import { presentKnowledgeSources, presentReport } from '../lib/report-presentation';
+import type { KnowledgeSource } from '../lib/knowledge';
 
 function legacyReport(): ReportContent {
   return {
@@ -41,4 +42,26 @@ test('new report source kinds and explicit unknown survive the screen projection
   const body=presentReport(report).sections[0].body;
   assert.equal(body,'• 预算：客户表示不清楚；来源：来源 1 [顾问更正；actor_id=advisor-1]');
   assert.equal(report.facts[0].value,null);
+});
+
+test('knowledge presentation keeps it separate from customer references and permits only commit-pinned repository links',()=>{
+  const revision='0123456789abcdef0123456789abcdef01234567';
+  const source:KnowledgeSource={id:'knowledge:1',title:'参考资料',path:'knowledge/reference.md',url:`https://github.com/ovo0809/AconGlobalBot/blob/${revision}/knowledge/reference.md`,revision,startLine:2,endLine:4,excerpt:'待人工复核的资料摘录。',reviewStatus:'reference_only'};
+  const report=legacyReport();report.knowledge={revision,status:'ready',notices:[],sources:[source]};report.analyses[0].knowledgeRefs=['knowledge:1'];
+  const view=presentReport(report);
+  assert.deepEqual(view.references,[{id:'source-1',label:'来源 1'}]);
+  assert.equal(view.knowledgeSources[0].safeUrl,source.url);
+  assert.equal(view.knowledgeSources[0].lineLabel,'第 2–4 行');
+  assert.deepEqual(view.knowledgeSources[0].citedBy,['life']);
+  const chinesePath='knowledge/家庭保障 说明.md';
+  const chineseUrl=`https://github.com/ovo0809/AconGlobalBot/blob/${revision}/${chinesePath.split('/').map(encodeURIComponent).join('/')}#L2-L4`;
+  assert.equal(presentKnowledgeSources([{...source,path:chinesePath,url:chineseUrl}])[0].safeUrl,chineseUrl);
+});
+
+test('knowledge presentation rejects mutable, foreign and script URLs',()=>{
+  const revision='0123456789abcdef0123456789abcdef01234567';
+  const base:KnowledgeSource={id:'k',title:'资料',path:'knowledge/a.md',url:'',revision,startLine:1,endLine:1,excerpt:'摘录',reviewStatus:'reference_only'};
+  for(const url of ['javascript:alert(1)','https://example.com/a','https://github.com/ovo0809/AconGlobalBot/blob/main/knowledge/a.md',`https://github.com/ovo0809/AconGlobalBot/blob/${revision}/knowledge/other.md`]){
+    assert.equal(presentKnowledgeSources([{...base,url}])[0].safeUrl,null,url);
+  }
 });

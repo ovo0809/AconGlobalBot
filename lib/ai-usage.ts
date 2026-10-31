@@ -55,7 +55,7 @@ function dollarsLimit(name:string,fallback:number){
   if(!Number.isSafeInteger(scaled))throw new UsageBudgetError('费用上限配置超出可支持范围。');
   return scaled;
 }
-function configuredLimits(){return {caseMicros:dollarsLimit('AI_CASE_BUDGET_USD',2),dailyMicros:dollarsLimit('AI_DAILY_BUDGET_USD',5),monthlyMicros:dollarsLimit('AI_MONTHLY_BUDGET_USD',20)};}
+function configuredLimits(){return {caseMicros:dollarsLimit('AI_CASE_BUDGET_USD',8),dailyMicros:dollarsLimit('AI_DAILY_BUDGET_USD',40),monthlyMicros:dollarsLimit('AI_MONTHLY_BUDGET_USD',160)};}
 function utcBuckets(date=new Date()){const iso=date.toISOString();return {day:iso.slice(0,10),month:iso.slice(0,7)};}
 function pending(row:UsageCallRow){return row.status==='reserved'||row.status==='unknown';}
 function held(row:UsageCallRow){return pending(row)?Math.max(0,row.reserved_micros-row.actual_micros):0;}
@@ -64,7 +64,10 @@ function rowsFor(orgId:string){return db().prepare('SELECT * FROM ai_usage_calls
 function periodCosts(orgId:string,period:'day'|'month',value:string){
   const length=period==='day'?10:7;
   const rows=db().prepare(`SELECT events.call_id,SUM(events.estimated_usd_micros) cost FROM ai_usage_events events JOIN ai_usage_calls calls ON calls.id=events.call_id WHERE calls.org_id=? AND substr(events.created_at,1,?)=? GROUP BY events.call_id`).all(orgId,length,value) as {call_id:string;cost:number}[];
-  return new Map(rows.map(row=>[row.call_id,row.cost]));
+  const result=new Map(rows.map(row=>[row.call_id,Number(row.cost)]));
+  const adjustments=db().prepare(`SELECT adjustments.call_id,SUM(adjustments.amount_micros) cost FROM ai_usage_adjustments adjustments JOIN ai_usage_calls calls ON calls.id=adjustments.call_id WHERE calls.org_id=? AND substr(adjustments.charge_day_utc,1,?)=? GROUP BY adjustments.call_id`).all(orgId,length,value) as {call_id:string;cost:number}[];
+  for(const row of adjustments)result.set(row.call_id,(result.get(row.call_id)??0)+Number(row.cost));
+  return result;
 }
 function deletedPeriodCost(orgId:string,period:'day'|'month',value:string){
   const predicate=period==='day'?'day_utc=?':'substr(day_utc,1,7)=?';
@@ -178,8 +181,21 @@ export function recordUsage(callId:string,eventKey:string,kind:UsageEventKind,us
     const inserted=db().prepare('INSERT OR IGNORE INTO ai_usage_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(eventId,callId,eventKey,kind,requestId??null,event.inputTokens,event.cachedInputTokens,event.outputTokens,event.inputTextTokens,event.inputAudioTokens,event.cachedTextTokens,event.cachedAudioTokens,event.outputTextTokens,event.outputAudioTokens,event.transcriptionMs,event.estimatedMicros,pack(detail),now()).changes;
     if(!inserted)return false;
-    const total=(db().prepare('SELECT COALESCE(SUM(estimated_usd_micros),0) total FROM ai_usage_events WHERE call_id=?').get(callId) as {total:number}).total;
-    db().prepare("UPDATE ai_usage_calls SET actual_micros=?,status=CASE WHEN status='released' THEN 'unknown' ELSE status END,settled_at=CASE WHEN status='released' THEN ? ELSE settled_at END WHERE id=?").run(total,now(),callId);
+    const eventTotal=Number((db().prepare('SELECT COALESCE(SUM(estimated_usd_micros),0) total FROM ai_usage_events WHERE call_id=?').get(callId) as {total:number}).total);
+    const manual=db().prepare("SELECT id,confirmed_micros FROM ai_usage_reconciliations WHERE call_id=? AND method='manual' ORDER BY confirmed_micros DESC,created_at DESC,id DESC LIMIT 1").get(callId) as {id:string;confirmed_micros:number}|undefined;
+    const manualConfirmed=Number(manual?.confirmed_micros??0),ledgerTotal=Math.max(eventTotal,manualConfirmed),derivedAdjustment=ledgerTotal-eventTotal;
+    if(!Number.isSafeInteger(eventTotal)||eventTotal<0||!Number.isSafeInteger(manualConfirmed)||manualConfirmed<0||!Number.isSafeInteger(ledgerTotal)||!Number.isSafeInteger(derivedAdjustment))throw new UsageDataError('费用账本汇总超出可支持范围。');
+    // Manual confirmation represents a final call total, not an additive fee. Keep
+    // one derived gap so late provider events fill the confirmation before adding cost.
+    db().prepare('DELETE FROM ai_usage_adjustments WHERE call_id=?').run(callId);
+    if(derivedAdjustment>0&&manual)db().prepare('INSERT INTO ai_usage_adjustments VALUES(?,?,?,?,?,?)').run(id(),callId,manual.id,derivedAdjustment,row.created_at.slice(0,10),now());
+    const durableCompletion=Boolean(db().prepare('SELECT 1 FROM ai_usage_completion_receipts WHERE call_id=?').get(callId));
+    const reconciled=Boolean(db().prepare('SELECT 1 FROM ai_usage_reconciliations WHERE call_id=? LIMIT 1').get(callId));
+    const mustReopen=durableCompletion||reconciled;
+    db().prepare("UPDATE ai_usage_calls SET actual_micros=?,status=CASE WHEN status='released' OR (? AND status='settled') THEN 'unknown' ELSE status END,settled_at=CASE WHEN status='released' OR (? AND status='settled') THEN ? ELSE settled_at END WHERE id=?").run(ledgerTotal,mustReopen?1:0,mustReopen?1:0,now(),callId);
+    // A completion receipt covers the exact event set present when it was recorded.
+    // Any newly inserted provider event invalidates that proof, reconciled or not.
+    db().prepare('DELETE FROM ai_usage_completion_receipts WHERE call_id=?').run(callId);
     return true;
   });
 }
@@ -213,12 +229,17 @@ export function purgeCaseUsage(caseId:string):void{
   const orgIds=[...new Set(calls.map(call=>call.org_id))];
   if(orgIds.length!==1)throw new UsageDataError('案例费用归属不一致，不能彻底删除。');
   const orgId=orgIds[0];
-  const daily=database.prepare(`SELECT substr(events.created_at,1,10) day_utc,SUM(events.estimated_usd_micros) cost_micros
+  const eventDaily=database.prepare(`SELECT substr(events.created_at,1,10) day_utc,SUM(events.estimated_usd_micros) cost_micros
     FROM ai_usage_events events JOIN ai_usage_calls calls ON calls.id=events.call_id
     WHERE calls.case_id=? AND calls.status='settled' GROUP BY substr(events.created_at,1,10)`).all(caseId) as {day_utc:string;cost_micros:number}[];
-  for(const row of daily){
+  const adjustmentDaily=database.prepare(`SELECT adjustments.charge_day_utc day_utc,SUM(adjustments.amount_micros) cost_micros
+    FROM ai_usage_adjustments adjustments JOIN ai_usage_calls calls ON calls.id=adjustments.call_id
+    WHERE calls.case_id=? AND calls.status='settled' GROUP BY adjustments.charge_day_utc`).all(caseId) as {day_utc:string;cost_micros:number}[];
+  const daily=new Map<string,number>();
+  for(const row of [...eventDaily,...adjustmentDaily])daily.set(row.day_utc,(daily.get(row.day_utc)??0)+Number(row.cost_micros));
+  for(const [day,costMicros] of daily){
     database.prepare(`INSERT INTO ai_deleted_usage_daily(org_id,day_utc,cost_micros) VALUES(?,?,?)
-      ON CONFLICT(org_id,day_utc) DO UPDATE SET cost_micros=cost_micros+excluded.cost_micros`).run(orgId,row.day_utc,row.cost_micros);
+      ON CONFLICT(org_id,day_utc) DO UPDATE SET cost_micros=cost_micros+excluded.cost_micros`).run(orgId,day,costMicros);
   }
   const unknown=calls.filter(call=>call.status==='unknown').reduce((total,call)=>({
     cost:total.cost+call.actual_micros,
@@ -228,6 +249,9 @@ export function purgeCaseUsage(caseId:string):void{
     database.prepare(`INSERT INTO ai_deleted_usage_holds(org_id,cost_micros,held_micros) VALUES(?,?,?)
       ON CONFLICT(org_id) DO UPDATE SET cost_micros=cost_micros+excluded.cost_micros,held_micros=held_micros+excluded.held_micros`).run(orgId,unknown.cost,unknown.held);
   }
+  database.prepare('DELETE FROM ai_usage_completion_receipts WHERE call_id IN (SELECT id FROM ai_usage_calls WHERE case_id=?)').run(caseId);
+  database.prepare('DELETE FROM ai_usage_adjustments WHERE call_id IN (SELECT id FROM ai_usage_calls WHERE case_id=?)').run(caseId);
+  database.prepare('DELETE FROM ai_usage_reconciliations WHERE call_id IN (SELECT id FROM ai_usage_calls WHERE case_id=?)').run(caseId);
   database.prepare('DELETE FROM ai_usage_events WHERE call_id IN (SELECT id FROM ai_usage_calls WHERE case_id=?)').run(caseId);
   database.prepare('DELETE FROM ai_usage_calls WHERE case_id=?').run(caseId);
 }

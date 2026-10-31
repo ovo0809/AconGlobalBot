@@ -1,6 +1,10 @@
 import type { NextConfig } from 'next';
 const config: NextConfig = {
   serverExternalPackages: ['pdfkit', 'ws'],
+  // Database, retrieval caches and credentials are runtime state, never deployment assets.
+  outputFileTracingExcludes: {
+    '*': ['./data/**/*', './tmp/**/*', './output/**/*', './.env', './.env.*'],
+  },
   async headers() {
     return [{ source: '/:path*', headers: [
       { key: 'Cache-Control', value: 'no-store, max-age=0' },

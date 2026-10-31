@@ -61,3 +61,66 @@ test('same-origin capture worklet sends fake microphone PCM, receives captions a
   expect(browserMessages.some(message=>message.audioStreamEnd===true)).toBe(true);expect(consoleErrors.filter(message=>/Content Security Policy|audio worklet/i.test(message))).toEqual([]);
 });
 
+test('real browser playback finishes all queued PCM before switching back to listening',async({page})=>{
+  await stubClient(page);
+  await page.addInitScript(()=>{
+    const state={started:0,ended:0,stopped:0};Object.defineProperty(window,'__playbackTailTest',{value:state});
+    const createSource=AudioContext.prototype.createBufferSource;
+    AudioContext.prototype.createBufferSource=function(){
+      const source=createSource.call(this);const start=source.start.bind(source);const stop=source.stop.bind(source);
+      source.start=(...args:Parameters<typeof source.start>)=>{state.started+=1;start(...args);};
+      source.stop=(...args:Parameters<typeof source.stop>)=>{state.stopped+=1;stop(...args);};
+      source.addEventListener('ended',()=>{state.ended+=1;});return source;
+    };
+  });
+  // 3 x 600ms of synthetic PCM. Provider completion arrives long before playback ends.
+  const pcm=Buffer.alloc(24_000*.6*2);
+  for(let index=0;index<pcm.length/2;index++)pcm.writeInt16LE(Math.round(Math.sin(index*2*Math.PI*220/24_000)*500),index*2);
+  await page.routeWebSocket(/\/voice\?token=/,socket=>{
+    socket.send(JSON.stringify({type:'ready',inputSampleRate:24_000,outputSampleRate:24_000}));let sent=false;
+    socket.onMessage(message=>{
+      const event=JSON.parse(String(message));if(sent||typeof event.audio!=='string')return;sent=true;
+      for(let index=0;index<3;index++)socket.send(JSON.stringify({type:'audio',data:pcm.toString('base64'),mimeType:'audio/pcm;rate=24000',itemId:'synthetic-tail',responseId:'synthetic-response'}));
+      socket.send(JSON.stringify({type:'transcript',role:'assistant',text:'合成音频尾段播放检查。',final:true}));
+      socket.send(JSON.stringify({type:'turnComplete',responseId:'synthetic-response'}));
+    });
+  });
+  await page.goto('/');await page.getByRole('button',{name:'开始连续语音对话'}).click();
+  const playback=()=>page.evaluate(()=>(window as unknown as {__playbackTailTest:{started:number;ended:number;stopped:number}}).__playbackTailTest);
+  await expect.poll(async()=>(await playback()).started).toBe(3);
+  expect((await playback()).ended).toBeLessThan(3);
+  await expect(page.getByText('正在回答',{exact:true}).first()).toBeVisible();
+  await expect.poll(async()=>(await playback()).ended).toBe(3);
+  expect((await playback()).stopped).toBe(0);
+  await expect(page.getByText('正在听您说',{exact:true}).first()).toBeVisible();
+  await page.getByRole('button',{name:'暂停访谈'}).click();
+  await expect(page.getByText('访谈已暂停',{exact:true})).toBeVisible();
+});
+
+test('an output-limited reply keeps its caption and can continue without restarting the microphone',async({page})=>{
+  await stubClient(page);
+  await page.routeWebSocket(/\/voice\?token=/,socket=>{
+    socket.send(JSON.stringify({type:'ready',inputSampleRate:24_000,outputSampleRate:24_000}));let sent=false;
+    socket.onMessage(message=>{
+      const event=JSON.parse(String(message));
+      if(!sent&&typeof event.audio==='string'){
+        sent=true;
+        socket.send(JSON.stringify({type:'transcript',role:'assistant',text:'关于照护安排，您预计',final:true,responseStatus:'incomplete'}));
+        socket.send(JSON.stringify({type:'turnComplete',responseId:'limited-response'}));
+      }
+      if(event.text==='请简短重说一次'){
+        socket.send(JSON.stringify({type:'transcript',role:'assistant',text:'您希望由谁提供照护？',final:true}));
+        socket.send(JSON.stringify({type:'turnComplete',responseId:'next-response'}));
+      }
+    });
+  });
+  await page.goto('/');await page.getByRole('button',{name:'开始连续语音对话'}).click();
+  await expect(page.getByText('回复未完整生成',{exact:true})).toBeVisible();
+  await expect(page.getByText('关于照护安排，您预计',{exact:true})).toBeVisible();
+  await page.getByRole('textbox',{name:'文字回答'}).fill('请简短重说一次');
+  await page.getByRole('button',{name:'发送',exact:true}).click();
+  await expect(page.getByText('您希望由谁提供照护？',{exact:true})).toBeVisible();
+  await expect(page.getByText('正在听您说',{exact:true}).first()).toBeVisible();
+  await page.getByRole('button',{name:'暂停访谈'}).click();
+});
+

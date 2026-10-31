@@ -27,6 +27,8 @@ export default defineConfig({
       LLM_PROVIDER: 'mock',
       VOICE_PROVIDER: 'mock',
       RECORDING_PROVIDER: 'mock',
+      KNOWLEDGE_REMOTE: 'off',
+      KNOWLEDGE_LOCAL_DIR: './tests/fixtures/knowledge',
     },
   },
 });

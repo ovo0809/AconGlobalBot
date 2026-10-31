@@ -3,9 +3,13 @@ import nextEnv from '@next/env';
 import next from 'next';
 import { attachVoiceServer, type VoiceHooks } from './lib/voice-server';
 import { acquireRuntimeLock } from './lib/runtime-lock';
+import { assertSharedDemoEnvironment, isSharedDemo } from './lib/shared-demo-policy';
+import { stripSharedLiveMarker } from './lib/shared-live-access';
+import { startSharedLiveServer } from './lib/shared-live-server';
 
 const { loadEnvConfig } = nextEnv;
 loadEnvConfig(process.cwd());
+assertSharedDemoEnvironment();
 
 const production = process.argv.includes('--production') || process.env.NODE_ENV === 'production';
 const port = Number.parseInt(process.env.PORT || '3000', 10);
@@ -30,12 +34,16 @@ const serviceModulePath = './lib/service';
 const serviceModule = await import(serviceModulePath) as { voiceHooks?: VoiceHooks; startReportWorker:()=>void };
 if (!serviceModule.voiceHooks) throw new Error('lib/service.ts must export voiceHooks.');
 const server = createServer((request, response) => {
+  stripSharedLiveMarker(request.headers);
   response.setHeader('X-Content-Type-Options', 'nosniff');
   response.setHeader('Referrer-Policy', 'same-origin');
+  if(isSharedDemo())response.setHeader('X-Robots-Tag','noindex, nofollow, noarchive');
   void handle(request, response);
 });
+server.prependListener('upgrade',(request)=>stripSharedLiveMarker(request.headers));
 attachVoiceServer(server, serviceModule.voiceHooks);
 serviceModule.startReportWorker();
+startSharedLiveServer({handle, hooks:serviceModule.voiceHooks});
 
 server.listen(port, hostname, () => {
   console.log(`Aeconn Demo: http://${hostname}:${port} (${production ? 'production' : 'development'})`);

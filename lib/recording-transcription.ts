@@ -1,4 +1,5 @@
 import { beginUsage, completeUsage, recordUsage, UsageBudgetError } from './ai-usage';
+import { recordUsageCompletion } from './usage-reconciliation';
 import { validateRecordingWav } from './recording-audio';
 
 const OPENAI_TRANSCRIPTIONS_ENDPOINT='https://api.openai.com/v1/audio/transcriptions';
@@ -12,7 +13,7 @@ const WHISPER_MICROS_PER_SECOND=100;
 
 export type RecordingTranscriptionProvider='mock'|'openai';
 export interface RecordingTranscriptionSegment {startSeconds:number;endSeconds:number;text:string}
-export interface RecordingTranscriptionResult {durationSeconds:number;segments:RecordingTranscriptionSegment[]}
+export interface RecordingTranscriptionResult {durationSeconds:number;segments:RecordingTranscriptionSegment[];timingWarning?:string}
 
 export class RecordingTranscriptionError extends Error {
   readonly code:string;
@@ -54,25 +55,39 @@ function finite(value:unknown,name:string){
   return value;
 }
 
-function parseResponse(value:unknown,localDuration:number):RecordingTranscriptionResult{
+function parseResponse(value:unknown,localDuration:number,allowChunkTimingFallback=false):RecordingTranscriptionResult{
   if(!value||typeof value!=='object'||Array.isArray(value))throw new RecordingTranscriptionError('转写服务返回了无效数据。','RECORDING_RESPONSE_INVALID','unknown');
   const result=value as Record<string,unknown>;
   const upstreamDuration=finite(result.duration,'录音时长');
   const tolerance=Math.max(1,localDuration*0.02);
-  if(Math.abs(upstreamDuration-localDuration)>tolerance)throw new RecordingTranscriptionError('转写服务返回的录音时长与上传录音不一致。','RECORDING_DURATION_MISMATCH','unknown');
-  if(!Array.isArray(result.segments)||result.segments.length>MAX_SEGMENTS)throw new RecordingTranscriptionError('转写服务返回的分段无效。','RECORDING_RESPONSE_INVALID','unknown');
+  if(Math.abs(upstreamDuration-localDuration)>tolerance)throw new RecordingTranscriptionError(`转写时长不一致（本地 ${localDuration.toFixed(3)}s，返回 ${upstreamDuration.toFixed(3)}s）。`,'RECORDING_DURATION_MISMATCH','unknown');
+  const rawSegments=result.segments===undefined?[]:result.segments;
+  if(!Array.isArray(rawSegments)||rawSegments.length>MAX_SEGMENTS)throw new RecordingTranscriptionError('转写服务返回的分段无效。','RECORDING_RESPONSE_INVALID','unknown');
   let previousEnd=0,totalText=0;
-  const segments=result.segments.map((raw,index)=>{
+  let needsChunkTiming=false;
+  const segments:RecordingTranscriptionSegment[]=[];
+  for(const [index,raw] of rawSegments.entries()){
     if(!raw||typeof raw!=='object'||Array.isArray(raw))throw new RecordingTranscriptionError('转写服务返回的分段无效。','RECORDING_RESPONSE_INVALID','unknown');
     const row=raw as Record<string,unknown>,start=finite(row.start,`第 ${index+1} 段开始时间`),end=finite(row.end,`第 ${index+1} 段结束时间`);
-    const text=typeof row.text==='string'?row.text.trim():'';
-    if(!text||text.length>MAX_SEGMENT_TEXT||end<start||start+0.25<previousEnd||end>localDuration+tolerance)throw new RecordingTranscriptionError('转写服务返回的分段内容无效。','RECORDING_RESPONSE_INVALID','unknown');
+    if(typeof row.text!=='string')throw new RecordingTranscriptionError('转写服务返回的分段文字无效。','RECORDING_RESPONSE_INVALID','unknown');
+    const text=row.text.trim();
+    const invalid=text.length>MAX_SEGMENT_TEXT?'文字过长':end<start?'时间倒置':null;
+    if(invalid)throw new RecordingTranscriptionError(`转写第 ${index+1} 段${invalid}（${start.toFixed(3)}–${end.toFixed(3)}s，前段结束 ${previousEnd.toFixed(3)}s，本地 ${localDuration.toFixed(3)}s）。`,'RECORDING_RESPONSE_INVALID','unknown');
+    const timingInvalid=start+0.25<previousEnd?'时间重叠':end>localDuration+tolerance?'超出录音边界':null;
+    if(timingInvalid&&!allowChunkTimingFallback)throw new RecordingTranscriptionError(`转写第 ${index+1} 段${timingInvalid}（${start.toFixed(3)}–${end.toFixed(3)}s，前段结束 ${previousEnd.toFixed(3)}s，本地 ${localDuration.toFixed(3)}s）。`,'RECORDING_RESPONSE_INVALID','unknown');
+    if(timingInvalid||end>localDuration)needsChunkTiming=true;
     previousEnd=Math.max(previousEnd,end);totalText+=text.length;
     if(totalText>MAX_TRANSCRIPT_TEXT)throw new RecordingTranscriptionError('转写服务返回的文字过长。','RECORDING_RESPONSE_INVALID','unknown');
-    return {startSeconds:Math.min(start,localDuration),endSeconds:Math.min(end,localDuration),text};
-  });
+    // Whisper can include structurally valid empty segments for silence.
+    if(text)segments.push({startSeconds:Math.min(start,localDuration),endSeconds:Math.min(end,localDuration),text});
+  }
   const transcript=typeof result.text==='string'?result.text.trim():'';
   if(transcript.length>MAX_TRANSCRIPT_TEXT)throw new RecordingTranscriptionError('转写服务返回的文字过长。','RECORDING_RESPONSE_INVALID','unknown');
+  if(needsChunkTiming&&allowChunkTimingFallback){
+    if(!transcript||transcript.length>MAX_SEGMENT_TEXT)throw new RecordingTranscriptionError('逐句时间无法核对，且整段转写为空或过长。','RECORDING_RESPONSE_INVALID','unknown');
+    // The validated upload is the source; do not invent or clamp word timings.
+    return {durationSeconds:localDuration,segments:[{startSeconds:0,endSeconds:localDuration,text:transcript}],timingWarning:'Whisper 逐句时间越界或重叠；以下文字仅定位到整段音轨，须对照原视频复核。'};
+  }
   if(!segments.length&&transcript){
     if(transcript.length>MAX_SEGMENT_TEXT)throw new RecordingTranscriptionError('缺少分段时间的转写文字过长。','RECORDING_RESPONSE_INVALID','unknown');
     segments.push({startSeconds:0,endSeconds:localDuration,text:transcript});
@@ -91,6 +106,7 @@ export async function transcribeRecordingChunk(input:{
   audio:Uint8Array;
   context:{caseId:string;sessionId?:string};
   provider:RecordingTranscriptionProvider;
+  allowChunkTimingFallback?:boolean;
 }):Promise<RecordingTranscriptionResult>{
   const wav=validateRecordingWav(input.audio);
   if(selectedProvider()!==input.provider)throw new RecordingTranscriptionError('录音转写请求与显式服务配置不一致。','RECORDING_PROVIDER_MISMATCH');
@@ -110,18 +126,19 @@ export async function transcribeRecordingChunk(input:{
     response=await fetch(OPENAI_TRANSCRIPTIONS_ENDPOINT,{method:'POST',headers:{Authorization:`Bearer ${config.apiKey}`},body:form,signal:AbortSignal.timeout(OPENAI_TIMEOUT_MS)});
     const requestId=safeRequestId(response.headers.get('x-request-id'));
     if(requestId)eventKey=`recording:${requestId}`;
-    if(!response.ok)throw new RecordingTranscriptionError('OpenAI 录音转写未完成。','RECORDING_UPSTREAM_ERROR','unknown');
+    if(!response.ok)throw new RecordingTranscriptionError(`OpenAI 录音转写未完成（HTTP ${response.status}）。`,'RECORDING_UPSTREAM_ERROR','unknown');
     const raw=await response.text();
     if(new TextEncoder().encode(raw).byteLength>MAX_RESPONSE_BYTES)throw new RecordingTranscriptionError('转写服务返回的数据过大。','RECORDING_RESPONSE_INVALID','unknown');
     let parsed:unknown;
     try{parsed=JSON.parse(raw);}catch{throw new RecordingTranscriptionError('转写服务返回了无效数据。','RECORDING_RESPONSE_INVALID','unknown');}
-    const result=parseResponse(parsed,wav.durationSeconds);
+    const result=parseResponse(parsed,wav.durationSeconds,input.allowChunkTimingFallback);
     recordUsage(reservation.id,eventKey,'transcription',{type:'duration',seconds:wav.durationSeconds},requestId);
+    recordUsageCompletion(reservation.id,'settled');
     completeUsage(reservation.id,'settled');
     return result;
   }catch(error){
     if(requestStarted)settleAfterFailure(reservation.id,wav.durationSeconds,eventKey,safeRequestId(response?.headers.get('x-request-id')??null));
-    else completeUsage(reservation.id,'released');
+    else {recordUsageCompletion(reservation.id,'released');completeUsage(reservation.id,'released');}
     if(error instanceof UsageBudgetError||error instanceof RecordingTranscriptionError)throw error;
     throw new RecordingTranscriptionError('OpenAI 录音转写未完成。','RECORDING_UPSTREAM_ERROR',requestStarted?'unknown':'released');
   }

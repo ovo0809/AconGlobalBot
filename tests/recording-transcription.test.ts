@@ -62,6 +62,7 @@ test('Whisper multipart transcription settles trusted duration usage',async(t)=>
   assert.equal(result.durationSeconds,10);assert.equal(result.segments[0].text,'客户计划明年开始。');assert.equal(network.mock.callCount(),1);
   const record=getUsageSummary('org-demo','case-1',true).records[0];
   assert.equal(record.operation,'transcription');assert.equal(record.model,'whisper-1');assert.equal(record.status,'settled');assert.equal(record.transcriptionSeconds,10);assert.equal(record.costMicros,1_000);assert.equal(record.reservedMicros,1_100);
+  const {db}=await import('../lib/db');assert.equal(db().prepare('SELECT outcome FROM ai_usage_completion_receipts WHERE call_id=?').get(record.id)?.outcome,'settled');
 });
 
 test('transcription budget is checked before the OpenAI request',async(t)=>{
@@ -97,4 +98,30 @@ test('malformed or duration-mismatched responses fail closed and remain unknown'
 
   network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:1,text:'长'.repeat(4_001),segments:[]}),{status:200}));
   await assert.rejects(provider.transcribeRecordingChunk({audio,context:{caseId:'case-5',sessionId:'recording-unsegmented'},provider:'openai'}),(error:unknown)=>error instanceof provider.RecordingTranscriptionError&&error.code==='RECORDING_RESPONSE_INVALID');
+});
+
+test('material timing fallback preserves the full chunk source without fabricated sentence timestamps',async t=>{
+  restoreEnv(t,['RECORDING_PROVIDER','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL']);
+  Object.assign(process.env,{RECORDING_PROVIDER:'openai',OPENAI_API_KEY:'synthetic-test-key',RECORDING_TRANSCRIPTION_MODEL:'whisper-1'});
+  const provider=await providerPromise,{getUsageSummary}=await usagePromise,audio=await wav(30);
+  const payload={duration:30,text:'合成完整转写',segments:[{start:0,end:30.64,text:'合成'},{start:30.64,end:32.64,text:'完整转写'}]};
+  const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify(payload)));
+  await assert.rejects(provider.transcribeRecordingChunk({audio,context:{caseId:'case-6',sessionId:'strict-timing'},provider:'openai'}),(e:unknown)=>e instanceof provider.RecordingTranscriptionError&&e.message.includes('32.640s')&&!e.message.includes('完整转写'));
+  const result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-7',sessionId:'material-timing'},provider:'openai',allowChunkTimingFallback:true});
+  assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:30,text:'合成完整转写'}]);assert.match(result.timingWarning!,/整段音轨/);
+  assert.equal(getUsageSummary('org-demo','case-7',true).records[0].status,'settled');
+  for(const invalid of [{...payload,duration:90},{...payload,text:''},{...payload,text:'长'.repeat(4001)},{...payload,segments:[{start:-1,end:2,text:'bad'}]},{...payload,segments:[{start:2,end:1,text:'bad'}]}]){
+    network.mock.mockImplementation(async()=>new Response(JSON.stringify(invalid)));
+    await assert.rejects(provider.transcribeRecordingChunk({audio,context:{caseId:'case-6',sessionId:'invalid-fallback'},provider:'openai',allowChunkTimingFallback:true}));
+  }
+});
+
+test('Whisper empty segments are ignored and optional segments retain full-chunk provenance',async t=>{
+  restoreEnv(t,['RECORDING_PROVIDER','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL']);
+  Object.assign(process.env,{RECORDING_PROVIDER:'openai',OPENAI_API_KEY:'synthetic-test-key',RECORDING_TRANSCRIPTION_MODEL:'whisper-1'});
+  const provider=await providerPromise,audio=await wav();
+  const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({duration:1,text:'合成',segments:[{start:0,end:0,text:' '},{start:0,end:1,text:'合成'}]})));
+  let result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'empty-segment'},provider:'openai'});assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:1,text:'合成'}]);
+  network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:1,text:'合成'})));
+  result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'optional-segments'},provider:'openai'});assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:1,text:'合成'}]);
 });

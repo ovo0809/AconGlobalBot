@@ -125,6 +125,38 @@ async function createCase(session: BrowserSession, suffix: string): Promise<stri
   return String(result.data.caseId);
 }
 
+test('focused mock interview handles progress and goodbye without facts, defers unclear budget, and offers an early finish', async () => {
+  const advisor = new BrowserSession();
+  await advisor.login('advisor1@aeconn.example');
+  const caseId = await createCase(advisor, 'focused-intake');
+  await advisor.action({ action: 'enterClient', caseId });
+  await advisor.action({ action: 'chooseEntry', caseId, entry: 'ltc' });
+  for (const [eventId, text] of [
+    ['progress', '还有多少问题？'],
+    ['goal', '我想安排退休后的长期照护'],
+    ['care', '希望在家由家人协助'],
+    ['coverage', '不知道'],
+    ['budget-unclear', '五千左右'],
+    ['budget-still-unclear', '刚才说的'],
+    ['time', '明年'],
+    ['goodbye', '先到这里'],
+  ]) {
+    const response = await advisor.action({ action: 'message', caseId, text, eventId: `focused-${eventId}` });
+    assert.equal(response.response.status, 200, JSON.stringify(response.data));
+  }
+  const { db } = await import('../lib/db');
+  const messages = db().prepare('SELECT doc FROM messages WHERE case_id=? ORDER BY rowid').all(caseId).map(row => JSON.parse(String(row.doc)) as Message);
+  const answers = messages.filter(message => message.role === 'assistant');
+  assert(answers.some(message => message.text.includes('这轮可以先到这里')));
+  assert.match(answers.at(-1)?.text ?? '', /点击.*结束对话/);
+  assert(answers.filter(message => /[？?]/.test(message.text)).length <= 6);
+  const fields = db().prepare('SELECT doc FROM profile_fields WHERE case_id=?').all(caseId).map(row => JSON.parse(String(row.doc)) as {key:string;sourceMessageIds:string[]});
+  assert.deepEqual(fields.map(field => field.key).sort(), ['care', 'existing_ltc', 'goal', 'horizon']);
+  const controls = new Set(messages.filter(message => ['focused-progress', 'focused-goodbye'].includes(message.eventId)).map(message => message.id));
+  assert(!fields.some(field => field.sourceMessageIds.some(ref => controls.has(ref))));
+  await advisor.action({ action: 'end', caseId });
+});
+
 test('anonymous sessions, login integrity, CSRF/origin and role data boundaries', async () => {
   const anonymous = new BrowserSession();
   const first = await anonymous.bootstrap();
@@ -185,12 +217,18 @@ test('voice diagnostics persist only fixed reason metadata and retain separate a
   service.voiceHooks.diagnostic(sessionId,{code:'spending_limit',stage:'preflight'});
   service.voiceHooks.diagnostic(sessionId,{code:'spending_limit',stage:'preflight'});
   service.voiceHooks.diagnostic(sessionId,{code:'voice_usage_unverified',stage:'runtime'});
+  service.voiceHooks.diagnostic(sessionId,{code:'response_token_limit',stage:'response'});
+  service.voiceHooks.persist(sessionId,{role:'assistant',text:'合成未完整回复',eventId:'limited-response',turnId:'limited-response',final:true,responseStatus:'incomplete'});
+  const partial=((await advisor.bootstrap()).data as Bootstrap).messages.find(message=>message.eventId==='limited-response');
+  assert.equal(partial?.responseStatus,'incomplete');
+  assert.equal(partial?.final,true,'a finalized stream may contain an incomplete model response');
   const {db,unpack}=await import('../lib/db');
-  const rows=db().prepare("SELECT action,metadata FROM audit_events WHERE case_id=? AND action IN ('voice.start_failed','voice.stopped') ORDER BY rowid").all(caseId) as {action:string;metadata:string}[];
+  const rows=db().prepare("SELECT action,metadata FROM audit_events WHERE case_id=? AND action LIKE 'voice.%' ORDER BY rowid").all(caseId) as {action:string;metadata:string}[];
   assert.deepEqual(rows.map(row=>({action:row.action,metadata:unpack(row.metadata)})),[
     {action:'voice.start_failed',metadata:{code:'spending_limit',stage:'preflight',sessionId}},
     {action:'voice.start_failed',metadata:{code:'spending_limit',stage:'preflight',sessionId}},
     {action:'voice.stopped',metadata:{code:'voice_usage_unverified',stage:'runtime',sessionId}},
+    {action:'voice.response_ended',metadata:{code:'response_token_limit',stage:'response',sessionId}},
   ]);
   assert.doesNotMatch(JSON.stringify(rows),/语音诊断|OPENAI|sk-|客户/);
   await advisor.action({action:'end',caseId});
@@ -262,7 +300,7 @@ test('permanent deletion requires ownership, explicit confirmation and atomicall
   const {db,id,now,pack}=await import('../lib/db');
   const interview=db().prepare('SELECT id,auth_id FROM interviews WHERE case_id=?').get(caseId) as {id:string;auth_id:string};
   const reviewId=id();db().prepare('INSERT INTO reviews VALUES(?,?,?)').run(reviewId,caseId,pack({id:reviewId,caseId,reportVersion:report.version,reviewerId:'charles',decision:'approved',reason:'合成测试',createdAt:now()}));
-  db().prepare('INSERT INTO voice_tokens VALUES(?,?,?,?)').run(`purge-token-${createdCounter}`,interview.id,interview.auth_id,Date.now()+60_000);
+  db().prepare('INSERT INTO voice_tokens(token_hash,interview_id,auth_id,expires_at) VALUES(?,?,?,?)').run(`purge-token-${createdCounter}`,interview.id,interview.auth_id,Date.now()+60_000);
   const deleted=await owner.action({action:'deleteCase',caseId});assert.equal(deleted.response.status,200,JSON.stringify(deleted.data));
   state=(await owner.bootstrap()).data as Bootstrap;assert.equal(state.deletedCases?.find(item=>item.id===caseId)?.clientName,'永久删除合成客户');
   assert.equal(state.clients.some(client=>client.id===clientId),false,'a deleted-only client profile is not returned with the recycle-bin summary');
@@ -303,7 +341,7 @@ test('permanent deletion requires ownership, explicit confirmation and atomicall
   service.voiceHooks.persist(interview.id,{role:'user',text:'永久删除后的迟到语音',eventId:'purge:late',turnId:'purge-late',final:true});
   service.voiceHooks.status(interview.id,'transcript_incomplete');
   service.voiceHooks.diagnostic(interview.id,{code:'voice_usage_unverified',stage:'runtime'});
-  assert.throws(()=>service.voiceHooks.getContext(interview.id),/访谈不存在/);
+  await assert.rejects(()=>service.voiceHooks.getContext(interview.id),/访谈不存在/);
   assert.equal(count('SELECT COUNT(*) count FROM messages WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate messages');
   assert.equal(count('SELECT COUNT(*) count FROM audit_events WHERE case_id=?',caseId),0,'late voice callbacks cannot recreate audit history');
   assert.equal((await owner.bootstrap(caseId)).response.status,404);assert.equal((await owner.report(caseId,report.version)).status,404);
@@ -416,7 +454,7 @@ test('text interview preserves unknown/declined and validates numeric currency/p
   assert.equal(byKey.get('income')?.currency, 'USD');
   assert.equal(byKey.get('income')?.period, 'month');
   assert.equal(byKey.get('income')?.sourceMessageIds.length, 1);
-  assert.ok(data.messages.some((message) => message.text.includes('请确认金额、币种')));
+  assert.ok(data.messages.some((message) => message.text.includes('关于收入') && message.text.includes('先跳过')));
 });
 
 test('report PDF, fact versions, review queue and dry-run notification snapshots are immutable', async () => {
@@ -651,7 +689,7 @@ test('real-provider interview and background voice extraction save sourced facts
   const sent=await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'cloud-goal'});assert.equal(sent.response.status,200,JSON.stringify(sent.data));
   assert.equal((await advisor.action({action:'message',caseId,text:'家庭保障',eventId:'cloud-goal'})).response.status,200);
   const client=(await advisor.bootstrap()).data as Bootstrap;const sessionId=client.clientSession!.id;
-  assert.match((await servicePromise).voiceHooks.getContext(sessionId),/家庭保障/);
+  assert.match(await (await servicePromise).voiceHooks.getContext(sessionId),/家庭保障/);
   (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'每月收入 5000 美元。',eventId:'test:voice:income',turnId:'voice-income',final:true});
   (await servicePromise).voiceHooks.persist(sessionId,{role:'user',text:'残留草稿 999999',eventId:'test:voice:partial',turnId:'voice-partial',final:false});
   (await servicePromise).voiceHooks.status(sessionId,'transcript_incomplete');
