@@ -4,9 +4,9 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import type { Bootstrap } from '../lib/domain';
+import type { Bootstrap, Case, Client, User } from '../lib/domain';
 import type { MaterialDetail } from '../lib/material-types';
-import { db, pack } from '../lib/db';
+import { db, pack, unpack } from '../lib/db';
 import { processMaterialJobs, recoverMaterialJobs, approvedMaterialDocuments, validateMaterialImage } from '../lib/materials';
 import { loadCaseKnowledge } from '../lib/material-knowledge';
 import { publicKnowledgeContext, safeMaterialSourceUrl } from '../lib/knowledge-public';
@@ -16,11 +16,34 @@ const root=mkdtempSync(join(tmpdir(),'aeconn-materials-'));
 Object.assign(process.env,{DATABASE_PATH:join(root,'test.sqlite'),KNOWLEDGE_REMOTE:'off',KNOWLEDGE_LOCAL_DIR:root,DEMO_PASSWORD:'AeconnDemo!2026',LLM_PROVIDER:'mock',VOICE_PROVIDER:'mock',RECORDING_PROVIDER:'mock',MAIL_MODE:'dry_run',AI_CASE_BUDGET_USD:'8',AI_DAILY_BUDGET_USD:'40',AI_MONTHLY_BUDGET_USD:'160'});
 const service=await import('../lib/service');
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=','base64');
+function assignReviewer(caseId:string,reviewerId:string|null='charles'){
+  const row=db().prepare('SELECT doc FROM cases WHERE id=?').get(caseId);assert(row);const record=unpack<Case>(row.doc);record.assignedReviewerId=reviewerId;
+  db().prepare('UPDATE cases SET reviewer_id=?,doc=? WHERE id=?').run(reviewerId,pack(record),caseId);
+}
+for(const caseId of ['case-1','case-2','case-4','case-6'])assignReviewer(caseId);
+function seedReviewer(id:string,email:string,orgId='org-demo'){
+  const source=db().prepare('SELECT password_hash FROM users WHERE id=?').get('charles');assert(source);
+  if(orgId!=='org-demo'){const settings=db().prepare('SELECT settings FROM organizations WHERE id=?').get('org-demo');assert(settings);db().prepare('INSERT INTO organizations VALUES(?,?)').run(orgId,settings.settings);}
+  const user:User={id,name:id,email,role:'reviewer',orgId,emailVerified:true};
+  db().prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(id,orgId,email,source.password_hash,pack(user));
+}
+seedReviewer('reviewer-other','reviewer-other@aeconn.example');
+seedReviewer('reviewer-foreign','reviewer-foreign@aeconn.example','org-foreign');
+function seedTargetCase(caseId:string,owner:User){
+  const passwordHash=db().prepare('SELECT password_hash FROM users WHERE id=?').get('charles')!.password_hash;
+  db().prepare('INSERT INTO users VALUES(?,?,?,?,?)').run(owner.id,owner.orgId,owner.email,passwordHash,pack(owner));
+  const stamp=new Date().toISOString(),clientId=`client-${caseId}`;
+  const client:Client={id:clientId,name:`${caseId} 合成客户`,birthday:'1980-01-01',gender:'不指定',phone:'+12025550999',email:`${caseId}@example.invalid`,maritalStatus:'未知',state:'CA',language:'中文',ownerAgentId:owner.id,consentStatus:'synthetic_demo',createdAt:stamp};
+  const record:Case={id:caseId,clientId,ownerAgentId:owner.id,status:'draft',entry:'ltc',createdAt:stamp,updatedAt:stamp,assignedReviewerId:null,reportVersion:0};
+  db().prepare('INSERT INTO clients VALUES(?,?,?)').run(clientId,owner.id,pack(client));db().prepare('INSERT INTO cases VALUES(?,?,?,?,?)').run(caseId,clientId,owner.id,null,pack(record));
+}
+seedTargetCase('case-foreign',{id:'advisor-foreign',name:'异组织顾问',email:'advisor-foreign@aeconn.example',role:'advisor',orgId:'org-foreign',emailVerified:true});
+seedTargetCase('case-public',{id:'advisor-public',name:'公开测试顾问',email:'advisor-public@aeconn.example',role:'advisor',orgId:'org-demo',emailVerified:true,accessScope:'public_tester',sharedRunId:'synthetic-run'});
 class Browser {
   cookie='';csrf='';
   async refresh(){const r=service.bootstrap(new Request('http://localhost/api/bootstrap',{headers:{cookie:this.cookie}}));this.cookie=r.headers.get('set-cookie')?.split(';')[0]??this.cookie;const data=await r.json() as Bootstrap;this.csrf=data.csrf;return data;}
   async action(input:Record<string,unknown>){let r:Response;try{r=await service.action(new Request('http://localhost/api/action',{method:'POST',headers:{cookie:this.cookie,origin:'http://localhost','content-type':'application/json','x-csrf-token':this.csrf},body:JSON.stringify(input)}));}catch(e){r=service.errorResponse(e);}this.cookie=r.headers.get('set-cookie')?.split(';')[0]??this.cookie;return r;}
-  async login(email='advisor1@aeconn.example'){await this.refresh();assert.equal((await this.action({action:'login',email,password:'AeconnDemo!2026'})).status,200);await this.refresh();return this;}
+  async login(email='charles@aeconn.example'){await this.refresh();assert.equal((await this.action({action:'login',email,password:'AeconnDemo!2026'})).status,200);await this.refresh();return this;}
   async request(body?:FormData|Record<string,unknown>,query='',headers:Record<string,string>={}){const multipart=body instanceof FormData;try{return await service.materialsRequest(new Request(`http://localhost/api/materials${query}`,{method:body?'POST':'GET',headers:{cookie:this.cookie,origin:'http://localhost','x-csrf-token':this.csrf,...(body&&!multipart?{'content-type':'application/json'}:{}),...headers},body:body?(multipart?body:JSON.stringify(body)):undefined}));}catch(e){return service.errorResponse(e);}}
 }
 function imageForm(requestId=randomUUID(),caseId='case-1'){const form=new FormData();form.set('caseId',caseId);form.set('title','长期护理合成培训资料');form.set('sourceNote','合成示例，非保险产品条款');form.set('consent','true');form.set('requestId',requestId);form.set('file',new Blob([png],{type:'image/png'}),'poster.png');return form;}
@@ -31,30 +54,45 @@ async function approve(browser:Browser,doc:MaterialDetail,extra:Record<string,un
 test('upload idempotency, review gate, revision conflicts, scope isolation, immutable snapshot, and withdrawal',async()=>{
   const browser=await new Browser().login();const requestId=randomUUID();const upload=await create(browser,imageForm(requestId));assert.equal(upload.state,'queued');
   assert.equal((await browser.request(imageForm(requestId))).status,200);assert.equal((await browser.request(imageForm(requestId,'case-2'))).status,409);
+  const uploadEvents=JSON.stringify((await detail(browser,upload.id)).events);db().prepare('UPDATE material_documents SET owner_id=? WHERE id=?').run('advisor-1',upload.id);
+  assert.equal(db().prepare('SELECT owner_id FROM material_documents WHERE id=?').get(upload.id)!.owner_id,'advisor-1');assert.equal(JSON.stringify((await detail(browser,upload.id)).events),uploadEvents,'changing role access preserves original history');
   assert.equal(approvedMaterialDocuments('case-1').length,0);await processMaterialJobs();const pending=await detail(browser,upload.id);assert.equal(pending.state,'needs_review');assert.match(pending.originalText,/模拟/);
   assert.equal((await browser.request({action:'approve',id:pending.id,version:pending.version,reviewedText:'长期护理',confirmed:false})).status,400);
-  let approved=await approve(browser,pending);assert.equal(approved.scope,'case');
+  let approved=await approve(browser,pending,{scope:'organization',approvedOrgId:'org-foreign',approvedBy:'reviewer-foreign'});assert.equal(approved.scope,'case');
   const knowledge=await loadCaseKnowledge('case-1','长期护理照护');assert(knowledge.sources.some(source=>source.path.startsWith('uploads/')));const source=knowledge.sources[0];assert(safeMaterialSourceUrl(source));assert.equal(publicKnowledgeContext(knowledge),undefined);
+  const caseSnapshot=await (await browser.request(undefined,`?id=${upload.id}&revision=${source.revision}`)).json();assert.equal(caseSnapshot.scope,'case');assert.equal(caseSnapshot.approvedOrgId,'org-demo');assert.equal(caseSnapshot.approvedBy,'charles');
   assert.equal(approvedMaterialDocuments('case-2').length,0);assert.equal(approvedMaterialDocuments('case-7').length,0);
   const originalVersion=await (await browser.request(undefined,`?id=${upload.id}&revision=${source.revision}`)).json();
   assert.equal((await browser.request({action:'save',id:upload.id,version:pending.version,reviewedText:'stale'})).status,409);
   let r=await browser.request({action:'save',id:upload.id,version:approved.version,reviewedText:'长期护理更新稿'});assert.equal(r.status,200);assert.equal(approvedMaterialDocuments('case-1').length,0);
-  approved=await approve(browser,await r.json() as MaterialDetail,{allowAcrossCases:true});assert.equal(approved.scope,'library');assert.equal(approvedMaterialDocuments('case-2').length,1);assert.equal(approvedMaterialDocuments('case-7').length,0);
+  assignReviewer('case-2',null);
+  approved=await approve(browser,await r.json() as MaterialDetail,{allowAcrossCases:true,scope:'case',approvedOrgId:'org-foreign',approvedBy:'reviewer-foreign'});assert.equal(approved.scope,'organization');assert.equal(approvedMaterialDocuments('case-2').length,1);assert.equal(approvedMaterialDocuments('case-7').length,1,'organization material reaches another advisor in the same organization');
+  const organizationSource=approvedMaterialDocuments('case-7').find(doc=>doc.path.includes(upload.id))!;const organizationSnapshot=await (await browser.request(undefined,`?id=${upload.id}&revision=${organizationSource.revision}`)).json();assert.equal(organizationSnapshot.scope,'organization');assert.equal(organizationSnapshot.approvedOrgId,'org-demo');assert.equal(organizationSnapshot.approvedBy,'charles');
+  assert.equal(approvedMaterialDocuments('case-foreign').length,0);assert.equal(approvedMaterialDocuments('case-public').length,0);
+  const legacyId=randomUUID(),legacyDoc={...approved,id:legacyId,title:'旧版顾问个人通用资料',scope:'library' as const,state:'approved' as const,events:[...approved.events]};
+  db().prepare('INSERT INTO material_documents VALUES(?,?,?,?,?,?,?,?,?)').run(legacyId,'advisor-1','case-1',randomUUID(),randomUUID().replaceAll('-',''),legacyDoc.state,pack(legacyDoc),'image/png',png);
+  const legacyRevision=randomUUID().replaceAll('-','').padEnd(64,'0');db().prepare('INSERT INTO material_versions VALUES(?,?,?)').run(legacyId,legacyRevision,pack({title:legacyDoc.title,content:'旧版个人通用正文',sourceNote:'旧版范围',coverage:'合成',provider:'mock',scope:'library',approvedBy:'advisor-1',approvedAt:new Date().toISOString(),filename:'legacy.png'}));
+  assert(approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(legacyId)));assert(!approvedMaterialDocuments('case-7').some(doc=>doc.path.includes(legacyId)),'legacy advisor library scope is not widened to the organization');db().prepare('DELETE FROM material_documents WHERE id=?').run(legacyId);
   assert.deepEqual(await (await browser.request(undefined,`?id=${upload.id}&revision=${source.revision}`)).json(),originalVersion);
   r=await browser.request({action:'withdraw',id:approved.id,version:approved.version});assert.equal(r.status,200);assert.equal(approvedMaterialDocuments('case-1').length,0);assert.equal(approvedMaterialDocuments('case-2').length,0);
   assert.equal(getUsageSummary('org-demo','case-1',true).records.length,0,'mock never creates paid usage');
 });
 
-test('local advisor auth, CSRF, role, other owner, case ownership, raw media and client isolation',async()=>{
-  const owner=await new Browser().login();const upload=await create(owner);
+test('only the assigned local reviewer can list, upload, inspect and mutate materials',async()=>{
+  const owner=await new Browser().login();const upload=await create(owner);await processMaterialJobs();const pending=await detail(owner,upload.id);const approved=await approve(owner,pending);const revision=approvedMaterialDocuments('case-1').find(doc=>doc.path.includes(upload.id))!.revision;
   assert.equal((await new Browser().request()).status,401);
-  for(const email of ['admin@aeconn.example','charles@aeconn.example'])assert.equal((await (await new Browser().login(email)).request()).status,403);
-  const other=await new Browser().login('advisor2@aeconn.example');assert.equal((await other.request(undefined,`?id=${upload.id}`)).status,404);assert.equal((await other.request(undefined,`?id=${upload.id}&original=1`)).status,404);
+  for(const email of ['admin@aeconn.example','advisor1@aeconn.example','advisor2@aeconn.example']){
+    const denied=await new Browser().login(email);assert.equal((await denied.request()).status,403);assert.equal((await denied.request(imageForm())).status,403);
+    for(const query of [`?id=${upload.id}`,`?id=${upload.id}&original=1`,`?id=${upload.id}&revision=${revision}`])assert.equal((await denied.request(undefined,query)).status,403);
+    for(const action of ['save','approve','withdraw','retry'])assert.equal((await denied.request({action,id:upload.id,version:approved.version,reviewedText:'不得修改',confirmed:true})).status,403);
+  }
+  for(const email of ['reviewer-other@aeconn.example','reviewer-foreign@aeconn.example']){
+    const denied=await new Browser().login(email);assert.deepEqual((await (await denied.request()).json()).items,[]);assert.equal((await denied.request(imageForm())).status,403);
+    for(const query of [`?id=${upload.id}`,`?id=${upload.id}&original=1`,`?id=${upload.id}&revision=${revision}`])assert.equal((await denied.request(undefined,query)).status,404);
+  }
   assert.equal((await owner.request(imageForm(),'',{'x-csrf-token':'bad'})).status,403);assert.equal((await owner.request(imageForm(),'',{origin:'https://evil.example'})).status,403);assert.equal((await owner.request(imageForm(randomUUID(),'case-7'))).status,403);
   assert.equal((await owner.request(undefined,`?id=${upload.id}&original=1`)).headers.get('content-type'),'image/png');
-  assert.equal((await owner.action({action:'enterClient',caseId:'case-3'})).status,200);await owner.refresh();assert.equal((await owner.request()).status,403);assert.equal((await owner.request(undefined,`?id=${upload.id}&original=1`)).status,403);
-  assert.equal((await owner.action({action:'end'})).status,200);
-  await processMaterialJobs();
+  const advisor=await new Browser().login('advisor1@aeconn.example');assert.equal((await advisor.action({action:'enterClient',caseId:'case-3'})).status,200);await advisor.refresh();assert.equal((await advisor.request()).status,403);assert.equal((await advisor.request(undefined,`?id=${upload.id}&original=1`)).status,403);assert.equal((await advisor.action({action:'end'})).status,200);
 });
 
 test('server bounds media types, dimensions, duration and rejects gaps in video audio',async()=>{
@@ -95,9 +133,9 @@ test('video retry retains completed images, records safe failures and flags coar
 
 test('deleted cases stop references; withdrawal remains possible; purge clears materials and snapshots',async()=>{
   const browser=await new Browser().login();const uploaded=await create(browser,imageForm(randomUUID(),'case-4'));await processMaterialJobs();const approved=await approve(browser,await detail(browser,uploaded.id),{allowAcrossCases:true});assert(approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(uploaded.id)));
-  assert.equal((await browser.action({action:'deleteCase',caseId:'case-4'})).status,200);assert(!approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(uploaded.id)));
+  const advisor=await new Browser().login('advisor1@aeconn.example');assert.equal((await advisor.action({action:'deleteCase',caseId:'case-4'})).status,200);assert(!approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(uploaded.id)));
   assert.equal((await browser.request({action:'withdraw',id:approved.id,version:approved.version})).status,200);
-  assert.equal((await browser.action({action:'purgeCase',caseId:'case-4',confirmation:'永久删除'})).status,200);
+  assert.equal((await advisor.action({action:'purgeCase',caseId:'case-4',confirmation:'永久删除'})).status,200);
   assert.equal((await browser.request(undefined,`?id=${uploaded.id}`)).status,404);assert.equal(db().prepare('SELECT count(*) n FROM material_parts WHERE material_id=?').get(uploaded.id)!.n,0);assert.equal(db().prepare('SELECT count(*) n FROM material_versions WHERE material_id=?').get(uploaded.id)!.n,0);
 });
 
@@ -110,10 +148,10 @@ test('approved mock materials never become real cloud references after provider 
 test('approved private references reach voice context and report PDF without becoming customer facts',async()=>{
   const browser=await new Browser().login();const uploaded=await create(browser,imageForm(randomUUID(),'case-6'));await processMaterialJobs();await approve(browser,await detail(browser,uploaded.id));
   const beforeFacts=db().prepare('SELECT doc FROM profile_fields WHERE case_id=? ORDER BY field_key').all('case-6');
-  const sessionId=randomUUID(),auth=db().prepare('SELECT id FROM auth_sessions WHERE user_id=? ORDER BY rowid DESC LIMIT 1').get('advisor-1')!;
+  const advisor=await new Browser().login('advisor1@aeconn.example');const sessionId=randomUUID(),auth=db().prepare('SELECT id FROM auth_sessions WHERE user_id=? ORDER BY rowid DESC LIMIT 1').get('advisor-1')!;
   db().prepare("INSERT INTO interviews(id,case_id,auth_id,state,entry,created_at) VALUES(?,?,?,'ended','ltc',?)").run(sessionId,'case-6',String(auth.id),new Date().toISOString());
   const voice=JSON.parse(await service.voiceHooks.getContext(sessionId));assert(voice.referenceKnowledge.sources.some((source:{path:string})=>source.path.includes(uploaded.id)));
-  const generated=await browser.action({action:'generateReport',caseId:'case-6'});assert.equal(generated.status,200,JSON.stringify(await generated.clone().json()));
+  const generated=await advisor.action({action:'generateReport',caseId:'case-6'});assert.equal(generated.status,200,JSON.stringify(await generated.clone().json()));
   const report=db().prepare('SELECT doc,pdf FROM reports WHERE case_id=? ORDER BY version DESC LIMIT 1').get('case-6')!;
   assert(JSON.parse(String(report.doc)).knowledge.sources.some((source:{path:string})=>source.path.includes(uploaded.id)));
   assert.equal(Buffer.from(report.pdf as Uint8Array).subarray(0,4).toString(),'%PDF');

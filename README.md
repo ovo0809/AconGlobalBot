@@ -2,7 +2,7 @@
 
 快速查看：[当前进度与未验收项目](docs/progress.md) · [给 Charles 的资料投喂入门](docs/materials-quickstart.md)。
 
-资料库：顾问可在“设置”下方的“资料库”上传图片／短视频，自动提取后复核，批准后供 AI 参考；原文件保存在本机。[操作与限制](docs/materials.md)。既有 GitHub `main/knowledge` 仍支持 UTF-8 Markdown、TXT、CSV；公开的长期护理海报已有单独[提取文本与处理记录](knowledge/资料处理记录/README.md)，其他图片／PDF／Word 仍需先转文本。[资料检索说明](docs/knowledge.md)。
+资料库：仅 Charles 复核账号可在“设置”下方上传图片／短视频，自动提取、修订和批准后供 AI 参考；顾问、管理员、客户及外部共享账号均不能访问资料库。Charles 只能管理已分配给自己的来源案例资料；默认仅该案例可参考，明确勾选不含客户个人信息的通用资料后，同一组织内除公共测试账号外的顾问案例可由 AI 检索，但其他顾问仍不能查看资料库或原件。原文件保存在本机。[操作与限制](docs/materials.md)。既有 GitHub `main/knowledge` 仍支持 UTF-8 Markdown、TXT、CSV；公开的长期护理海报已有单独[提取文本与处理记录](knowledge/资料处理记录/README.md)，其他图片／PDF／Word 仍需先转文本。[资料检索说明](docs/knowledge.md)。
 
 真实语音分享：本机生产服务运行时执行 `npm run share:live`。专用测试账号与本机共用费用账本和 $8／$40／$160 保护；密钥仅留在原服务，详情见 [真实语音共享说明](docs/sharing-live.md)。
 

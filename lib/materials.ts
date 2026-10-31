@@ -40,8 +40,13 @@ export function materialProviderConfig():{provider:MaterialProvider;configured:b
   try {const config=requireAnalysisConfig();return {provider:config?'openai':'mock',configured:!config||config.provider==='openai'};}
   catch {return {provider:process.env.LLM_PROVIDER==='mock'?'mock':'openai',configured:false};}
 }
+// Upload ownership is provenance; review access follows current case assignment.
+// Keep original uploader IDs and immutable approval snapshots when roles change.
+const materialAccessFrom='FROM material_documents m JOIN cases c ON c.id=m.case_id JOIN users owner ON owner.id=c.owner_id JOIN users uploader ON uploader.id=m.owner_id';
+function requireReviewer(user:User){requireMaterial(user.role==='reviewer'&&user.accessScope!=='public_tester',403,'仅复核账号可上传和管理资料。');}
 function ownerDocument(materialId:string,user:User):StoredMaterial {
-  const row=db().prepare('SELECT doc FROM material_documents WHERE id=? AND owner_id=?').get(materialId,user.id);
+  requireReviewer(user);
+  const row=db().prepare(`SELECT m.doc ${materialAccessFrom} WHERE m.id=? AND c.reviewer_id=? AND owner.org_id=? AND uploader.org_id=?`).get(materialId,user.id,user.orgId,user.orgId);
   requireMaterial(row,404,'资料不存在或无权访问。');return unpack<StoredMaterial>(row.doc);
 }
 function partsFor(materialId:string){return docs<StoredPart>('SELECT doc FROM material_parts WHERE material_id=? ORDER BY position',materialId);}
@@ -49,7 +54,7 @@ export function materialDetail(materialId:string,user:User):MaterialDetail {retu
 function saveDocument(doc:StoredMaterial){doc.updatedAt=now();doc.version++;db().prepare('UPDATE material_documents SET state=?,doc=? WHERE id=?').run(doc.state,pack(doc),doc.id);}
 function event(doc:StoredMaterial,action:string,detail:string){doc.events.push({at:now(),action,detail});}
 function summary(doc:StoredMaterial):MaterialSummary {const {id,title,filename,kind,state,provider,caseId,createdAt,updatedAt,version,error,scope}=doc;return {id,title,filename,kind,state,provider,caseId,createdAt,updatedAt,version,error,scope:scope??'case'};}
-export function listMaterials(user:User){return {items:docs<StoredMaterial>('SELECT doc FROM material_documents WHERE owner_id=? ORDER BY rowid DESC LIMIT 60',user.id).map(summary),...materialProviderConfig()};}
+export function listMaterials(user:User){requireReviewer(user);return {items:docs<StoredMaterial>(`SELECT m.doc ${materialAccessFrom} WHERE c.reviewer_id=? AND owner.org_id=? AND uploader.org_id=? ORDER BY m.rowid DESC LIMIT 60`,user.id,user.orgId,user.orgId).map(summary),...materialProviderConfig()};}
 
 async function readBounded(request:Request,max:number){
   const length=Number(request.headers.get('content-length')||0);requireMaterial(Number.isFinite(length)&&length<=max,413,'上传内容超过大小限制。');
@@ -128,9 +133,9 @@ function editMaterial(user:User,input:Record<string,unknown>){
       document.reviewedText=text;
       if(action==='approve'){
         requireMaterial(input.confirmed===true,400,'请确认已核对原资料和提取覆盖范围。');
-        document.scope=input.allowAcrossCases===true?'library':'case';
-        const snapshot={title:document.title,content:text,sourceNote:document.sourceNote,coverage:document.coverage,provider:document.provider,scope:document.scope,approvedBy:user.id,approvedAt:now(),filename:document.filename};const revision=hash(pack(snapshot));
-        db().prepare('INSERT INTO material_versions VALUES(?,?,?)').run(document.id,revision,pack(snapshot));document.state='approved';event(document,'approved',`由 ${user.name} 复核；${document.scope==='library'?'已明确确认为不含客户个人信息的本人通用资料':'仅关联案例可参考'}。${note}`);
+        document.scope=input.allowAcrossCases===true?'organization':'case';
+        const snapshot={title:document.title,content:text,sourceNote:document.sourceNote,coverage:document.coverage,provider:document.provider,scope:document.scope,approvedBy:user.id,approvedOrgId:user.orgId,approvedAt:now(),filename:document.filename};const revision=hash(pack(snapshot));
+        db().prepare('INSERT INTO material_versions VALUES(?,?,?)').run(document.id,revision,pack(snapshot));document.state='approved';event(document,'approved',`由 ${user.name} 复核；${document.scope==='organization'?'已明确确认为不含客户个人信息的通用资料，供本公司所有顾问案例参考（不含外部共享测试账号）':'仅关联案例可参考'}。${note}`);
       } else {document.state='needs_review';event(document,'saved',`已保存修订，须重新复核后才能参考。${note}`);}
     } else throw new MaterialError(400,'不支持的资料操作。');
     saveDocument(document);audit(user.id,document.caseId,`material.${String(action)}`,{materialId:document.id,version:document.version});return materialDetail(document.id,user);
@@ -138,6 +143,7 @@ function editMaterial(user:User,input:Record<string,unknown>){
 }
 
 export async function handleMaterialRequest(request:Request,user:User,checkCase:(caseId:string)=>void):Promise<Response>{
+  requireReviewer(user);
   if(request.method==='GET'){
     const params=new URL(request.url).searchParams,materialId=params.get('id');if(!materialId)return json(listMaterials(user));
     ownerDocument(materialId,user);
@@ -182,7 +188,14 @@ export function purgeCaseMaterials(caseId:string){db().prepare('DELETE FROM mate
 export function approvedMaterialDocuments(caseId:string){
   const identity=db().prepare('SELECT owner_id,doc FROM cases WHERE id=?').get(caseId);if(!identity||unpack<Case>(identity.doc).deletedAt)return [];
   const owner=docs<User>('SELECT doc FROM users WHERE id=?',String(identity.owner_id))[0];if(!owner||owner.accessScope==='public_tester')return [];
-  const rows=db().prepare("SELECT m.id,m.case_id,m.doc,c.doc case_doc,v.revision,v.doc snapshot FROM material_documents m JOIN cases c ON c.id=m.case_id JOIN material_versions v ON v.material_id=m.id WHERE m.owner_id=? AND m.state='approved' AND v.rowid=(SELECT MAX(v2.rowid) FROM material_versions v2 WHERE v2.material_id=m.id) ORDER BY m.rowid DESC LIMIT 60").all(owner.id);
+  const rows=db().prepare(`SELECT m.id,m.owner_id,m.case_id,c.doc case_doc,v.revision,v.doc snapshot ${materialAccessFrom} JOIN material_versions v ON v.material_id=m.id WHERE owner.org_id=? AND uploader.org_id=? AND m.state='approved' AND v.rowid=(SELECT MAX(v2.rowid) FROM material_versions v2 WHERE v2.material_id=m.id) AND (m.case_id=? OR (json_extract(v.doc,'$.scope')='library' AND m.owner_id=?) OR (json_extract(v.doc,'$.scope')='organization' AND json_extract(v.doc,'$.approvedOrgId')=?)) ORDER BY m.rowid DESC LIMIT 60`).all(owner.orgId,owner.orgId,caseId,owner.id,owner.orgId);
   let bytes=0;const provider=materialProviderConfig().provider;
-  return rows.flatMap(row=>{const snapshot=unpack<{title:string;content:string;sourceNote:string;coverage:string;provider:MaterialProvider;scope?:string}>(row.snapshot);if(unpack<Case>(row.case_doc).deletedAt||row.case_id!==caseId&&snapshot.scope!=='library'||snapshot.provider==='mock'&&provider!=='mock')return [];const content=`来源：${snapshot.sourceNote||'上传者未补充外部来源'}\n覆盖范围：${snapshot.coverage}\n\n${snapshot.content}`;bytes+=textBytes(content);if(bytes>512_000)return [];return [{title:snapshot.title,path:`uploads/${String(row.id)}/${snapshot.title}`,url:`/api/materials?id=${encodeURIComponent(String(row.id))}&revision=${String(row.revision)}`,revision:String(row.revision),content,reviewStatus:snapshot.provider==='mock'?'demo_unapproved' as const:'reference_only' as const}];});
+  return rows.flatMap(row=>{
+    const snapshot=unpack<{title:string;content:string;sourceNote:string;coverage:string;provider:MaterialProvider;scope?:string;approvedOrgId?:string}>(row.snapshot);
+    const legacyLibrary=snapshot.scope==='library'&&row.owner_id===owner.id;
+    const organizationLibrary=snapshot.scope==='organization'&&snapshot.approvedOrgId===owner.orgId;
+    if(unpack<Case>(row.case_doc).deletedAt||row.case_id!==caseId&&!legacyLibrary&&!organizationLibrary||snapshot.provider==='mock'&&provider!=='mock')return [];
+    const content=`来源：${snapshot.sourceNote||'上传者未补充外部来源'}\n覆盖范围：${snapshot.coverage}\n\n${snapshot.content}`;bytes+=textBytes(content);if(bytes>512_000)return [];
+    return [{title:snapshot.title,path:`uploads/${String(row.id)}/${snapshot.title}`,url:`/api/materials?id=${encodeURIComponent(String(row.id))}&revision=${String(row.revision)}`,revision:String(row.revision),content,reviewStatus:snapshot.provider==='mock'?'demo_unapproved' as const:'reference_only' as const}];
+  });
 }

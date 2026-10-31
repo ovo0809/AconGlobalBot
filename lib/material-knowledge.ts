@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { loadKnowledge, rankKnowledgeSources, selectKnowledgeSources, type KnowledgeContext } from './knowledge';
 import { approvedMaterialDocuments } from './materials';
 
-/** Private uploads are selected fresh for the authorized case owner, never put in the shared cache. */
+/** Approved uploads follow their saved case/review scope, never the shared GitHub cache. */
 export async function loadCaseKnowledge(caseId:string,query:string):Promise<KnowledgeContext>{
   const remote=await loadKnowledge(query);
   const documents=approvedMaterialDocuments(caseId);

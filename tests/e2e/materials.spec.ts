@@ -3,16 +3,16 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const createdAt='2026-10-30T20:00:00.000Z';
-const advisor={id:'advisor-material',name:'林顾问',email:'advisor-material@example.invalid',role:'advisor' as const,orgId:'org-material',emailVerified:true};
-const caseRecord={id:'case-material',clientId:'client-material',ownerAgentId:advisor.id,status:'draft',entry:'ltc' as const,createdAt,updatedAt:createdAt,assignedReviewerId:null,reportVersion:0,clientName:'资料测试客户',caseNumber:1};
+const reviewer={id:'reviewer-material',name:'Charles',email:'reviewer-material@example.invalid',role:'reviewer' as const,orgId:'org-material',emailVerified:true};
+const caseRecord={id:'case-material',clientId:'client-material',ownerAgentId:'advisor-material',status:'pending_review',entry:'ltc' as const,createdAt,updatedAt:createdAt,assignedReviewerId:reviewer.id,reportVersion:1,clientName:'资料测试客户',caseNumber:1};
 const screenshotDirectory=join(process.cwd(),'tmp','validation','materials');
 const png=readFileSync(join(process.cwd(),'docs','screenshots','client-mobile-390x844.png'));
 const syntheticVideoFixture=join(process.cwd(),'tests','fixtures','materials','synthetic-audio-video.webm');
 test.beforeAll(()=>mkdirSync(screenshotDirectory,{recursive:true}));
 
-function bootstrap(){return{csrf:'material-csrf',mode:'advisor',user:advisor,clients:[],cases:[caseRecord],deletedCases:[],activeCase:caseRecord,messages:[],facts:[],reports:[],notifications:[],reviews:[],settings:{companyEmail:'company@example.invalid',companyVerified:true,unreviewedSendPolicy:'pending',mailMode:'dry_run'},capabilities:{analysis:'mock',interview:'mock',voice:'mock',voiceConfigured:false,mail:'dry-run'},demo:true,publicAccess:false,sharedDemo:false};}
+function bootstrap(){return{csrf:'material-csrf',mode:'advisor',user:reviewer,clients:[],cases:[caseRecord],deletedCases:[],activeCase:caseRecord,messages:[],facts:[],reports:[],notifications:[],reviews:[],settings:{companyEmail:'company@example.invalid',companyVerified:true,unreviewedSendPolicy:'pending',mailMode:'dry_run'},capabilities:{analysis:'mock',interview:'mock',voice:'mock',voiceConfigured:false,mail:'dry-run'},demo:true,publicAccess:false,sharedDemo:false};}
 
-test('advisor uploads, reviews, approves and withdraws extracted image material',async({page})=>{
+test('Charles uploads, reviews, approves and withdraws extracted image material',async({page})=>{
   let state:'none'|'needs_review'|'approved'|'withdrawn'='none',version=1;
   const summary=()=>({id:'material-1',title:'长期护理海报',filename:'poster.png',kind:'image',state:state==='none'?'needs_review':state,provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version,error:null,scope:'case'});
   const detail=()=>({...summary(),sourceNote:'公开合成示例',originalText:'【模拟提取】长期护理资料待人工核对。',reviewedText:'长期护理资料待人工核对。',coverage:'图片完整画面；模拟模式不代表真实 OCR。',events:[{at:createdAt,action:'extracted',detail:'模拟提取完成'}],parts:[{kind:'image',position:0,startSeconds:0,endSeconds:0,state:'done',text:'长期护理资料待人工核对。'}]});
@@ -88,12 +88,27 @@ test('browser prepares a synthetic video with real audio before upload',async({p
   await expect(page.getByText('资料已上传，提取完成后需要人工复核。')).toBeVisible({timeout:20_000});expect(uploaded).toBe(true);
 });
 
-test('real isolated materials API processes and approves a generated image in mock mode',async({page})=>{
-  await page.goto('/');await page.getByRole('button',{name:'登录工作台'}).click();await expect(page.getByRole('heading',{name:/我的客户/})).toBeVisible();await page.getByRole('button',{name:'资料库'}).click();
+test('real isolated materials API allows Charles but hides the library from advisors',async({page})=>{
+  await page.goto('/');await page.getByLabel('工作邮箱').fill('advisor1@aeconn.example');await page.getByLabel('密码').fill('AeconnDemo!2026');await page.getByRole('button',{name:'登录工作台'}).click();
+  await expect(page.getByRole('button',{name:'退出'})).toBeVisible();
+  await expect(page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'资料库'})).toHaveCount(0);
+  const submittedCaseId=await page.evaluate(async()=>{
+    const boot=await fetch('/api/bootstrap',{cache:'no-store'}).then(response=>response.json()) as {csrf:string;cases:Array<{id:string}>};
+    const caseId=boot.cases.find(record=>record.id==='case-6')?.id??boot.cases[0]?.id;if(!caseId)throw new Error('缺少顾问测试案例');
+    for(const action of ['generateReport','submitReview']){const response=await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json','x-csrf-token':boot.csrf},body:JSON.stringify({action,caseId})});if(!response.ok)throw new Error((await response.json()).error);}
+    return caseId;
+  });
+  await page.getByRole('button',{name:'退出'}).click();await page.getByLabel('工作邮箱').fill('charles@aeconn.example');await page.getByLabel('密码').fill('AeconnDemo!2026');await page.getByRole('button',{name:'登录工作台'}).click();
+  await expect(page.getByRole('heading',{name:/待我复核/})).toBeVisible();await page.getByRole('button',{name:'资料库'}).click();
+  await page.getByLabel('关联复核案例').selectOption(submittedCaseId);await expect(page.getByLabel('关联复核案例')).toHaveValue(submittedCaseId);
   await page.getByLabel('资料名称').fill('真实路由合成海报');await page.getByLabel('来源说明').fill('Playwright 生成的隔离合成图片');
   await page.getByLabel('图片或视频').evaluate(async(input:HTMLInputElement)=>{const canvas=document.createElement('canvas');canvas.width=320;canvas.height=180;const context=canvas.getContext('2d')!;context.fillStyle='#203b34';context.fillRect(0,0,320,180);context.fillStyle='#f3ead7';context.font='24px sans-serif';context.fillText('Synthetic Aeconn material',20,90);const blob=await new Promise<Blob>((resolve,reject)=>canvas.toBlob(value=>value?resolve(value):reject(new Error('fixture image failed')),'image/png'));const transfer=new DataTransfer();transfer.items.add(new File([blob],'synthetic-material.png',{type:'image/png'}));input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));});
   await page.getByText('我确认有权处理这份资料').click();await page.getByRole('button',{name:'上传并自动提取'}).click();
   await expect(page.getByRole('heading',{name:'真实路由合成海报'})).toBeVisible();await expect(page.getByText('待复核',{exact:true}).first()).toBeVisible({timeout:15_000});
-  const review=page.getByLabel('人工复核稿');await expect(review).toHaveValue(/模拟[\s\S]*提取/);await page.getByText('已核对原资料及提取范围').click();await page.getByRole('button',{name:'复核通过并允许 AI 参考'}).click();
-  await expect(page.getByText('资料已复核，之后可供 AI 参考。')).toBeVisible();await expect(page.getByText('仅关联案例',{exact:true})).toBeVisible();await page.getByText('查看处理记录').click();await expect(page.getByText(/画面 0\.0–0\.0 秒/)).toBeVisible();
+  const review=page.getByLabel('人工复核稿');await expect(review).toHaveValue(/模拟[\s\S]*提取/);await page.getByText('已核对原资料及提取范围').click();await page.getByText('这是通用参考资料，不含客户个人信息，可供公司内所有顾问的案例参考').click();await page.getByRole('button',{name:'复核通过并允许 AI 参考'}).click();
+  await expect(page.getByText('资料已复核，之后可供 AI 参考。')).toBeVisible();await expect(page.getByText('公司通用资料',{exact:true})).toBeVisible();await page.getByText('查看处理记录').click();await expect(page.getByText(/画面 0\.0–0\.0 秒/)).toBeVisible();
+  await page.getByRole('button',{name:'退出'}).click();await page.getByLabel('工作邮箱').fill('advisor1@aeconn.example');await page.getByLabel('密码').fill('AeconnDemo!2026');await page.getByRole('button',{name:'登录工作台'}).click();
+  await expect(page.getByRole('button',{name:'退出'})).toBeVisible();
+  await expect(page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'资料库'})).toHaveCount(0);
+  await expect(page.getByRole('heading',{name:'真实路由合成海报'})).toHaveCount(0);
 });

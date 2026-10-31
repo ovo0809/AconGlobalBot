@@ -235,13 +235,13 @@ function verifyMutationRequest(request:Request,auth:Auth){
   requireThat(request.headers.get('origin')===expectedOrigin,403,'请求来源校验失败。');
 }
 
-/** Private owner library: no client, admin, reviewer or shared-link access. */
+/** Reviewer-only library; case assignment, CSRF and local access remain required. */
 export async function materialsRequest(request:Request):Promise<Response>{
-  requireThat(!publicRequestConfig(request)&&!isSharedDemo(),403,'资料上传和复核仅在本机顾问工作区开放。');
+  requireThat(!publicRequestConfig(request)&&!isSharedDemo(),403,'资料上传和复核仅在本机复核工作区开放。');
   const auth=readAuth(request);requireThat(auth,401,'请先登录。');const user=requireAdvisorMode(auth);
-  requireThat(user.role==='advisor'&&user.accessScope!=='public_tester',403,'仅本机顾问可管理本人的资料。');
+  requireThat(user.role==='reviewer'&&user.accessScope!=='public_tester',403,'仅复核账号可上传和管理资料。');
   if(request.method!=='GET')verifyMutationRequest(request,auth);
-  return handleMaterialRequest(request,user,caseId=>{caseFor(user,caseId,true);});
+  return handleMaterialRequest(request,user,caseId=>{caseFor(user,caseId);});
 }
 
 /** Owner-only recording endpoint. Raw audio and unreviewed transcripts never enter bootstrap. */

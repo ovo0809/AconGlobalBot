@@ -3,7 +3,7 @@ export type MaterialProvider = 'mock'|'openai';
 export interface MaterialSummary {
   id:string; title:string; filename:string; kind:'image'|'video'; state:MaterialState;
   provider:MaterialProvider; caseId:string; createdAt:string; updatedAt:string; version:number; error:string|null;
-  scope?:'case'|'library';
+  scope?:'case'|'library'|'organization';
 }
 export interface MaterialEvent {at:string;action:string;detail:string}
 export interface MaterialPart {kind:'image'|'audio';position:number;startSeconds:number;endSeconds:number;state:'queued'|'done';text:string}

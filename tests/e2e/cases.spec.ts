@@ -65,7 +65,7 @@ test('案例回收站支持还原、确认彻底删除、失败重试和稳定�
   await expect(page.getByRole('status')).toContainText('案例已从列表移除，历史资料仍然保留。');
 
   const nav=page.getByRole('navigation',{name:'主导航'});
-  await expect(nav.getByRole('button')).toHaveText(['客户','复核','设置','资料库','已删除案例']);
+  await expect(nav.getByRole('button')).toHaveText(['客户','复核','设置','已删除案例']);
   await nav.getByRole('button',{name:'已删除案例'}).click();
   let trashCard=page.getByRole('article',{name:thirdCaseName,exact:true});
   await expect(trashCard).toBeVisible();
