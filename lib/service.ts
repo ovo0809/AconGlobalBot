@@ -273,7 +273,7 @@ export async function recordingRequest(request:Request):Promise<Response>{
   const caseId=str(input,'caseId',100)||queryCaseId;requireThat(caseId,400,'缺少案例。');const record=caseFor(user,caseId,true);const name=str(input,'action',40),sessionId=str(input,'sessionId',100);
   if(name==='start'){requireThat(!locks.has(record.id)&&!['queued','generating'].includes(reportJobFor(record.id)?.status??''),409,'报告正在生成，暂时不能开始录音。');return json(startRecording(record,user,auth.id,input.consent===true));}
   requireThat(sessionId,400,'缺少录音会话。');
-  if(name==='pause')return json(pauseRecording(record.id,user,sessionId,str(input,'leaseToken',100)||undefined));
+  if(name==='pause')return json(pauseRecording(record.id,user,sessionId,str(input,'leaseToken',100)||undefined,input.incomplete===true));
   if(name==='resume')return json(resumeRecording(record.id,user,sessionId));
   if(name==='finish')return json(finishRecording(record.id,user,sessionId,Number(input.expectedChunks),str(input,'leaseToken',100)||undefined));
   if(name==='retry')return json(retryRecording(record.id,user,sessionId));

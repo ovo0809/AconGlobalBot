@@ -166,6 +166,12 @@ export class BrowserRecordingClient {
     if(!this.disposed)this.options.onDetail?.(detail as RecordingControlResult);
   }
 
+  private adoptPause(detail:RecordingControlResult,requestedLease:string|null){
+    if(this.leaseToken!==requestedLease)return;
+    this.adopt(detail);
+    if(this.leaseToken===requestedLease)this.leaseToken=null;
+  }
+
   private async startCapture(generation:number){
     const hostname=typeof location==='undefined'?'localhost':location.hostname||location.host.split(':')[0];
     if(!globalThis.isSecureContext&&hostname!=='localhost'&&hostname!=='127.0.0.1')throw new Error('当前页面不是安全连接，麦克风需要通过 HTTPS 访问。');
@@ -251,8 +257,9 @@ export class BrowserRecordingClient {
 
   private async pauseServer(incomplete:boolean){
     if(!this.sessionId)return;
-    const detail=await controlRecording(this.options.csrf,{action:'pause',caseId:this.options.caseId,sessionId:this.sessionId,leaseToken:this.leaseToken??undefined,expectedChunks:this.nextIndex,incomplete});
-    this.adopt(detail);
+    const requestedLease=this.leaseToken;
+    const detail=await controlRecording(this.options.csrf,{action:'pause',caseId:this.options.caseId,sessionId:this.sessionId,leaseToken:requestedLease??undefined,expectedChunks:this.nextIndex,incomplete});
+    this.adoptPause(detail,requestedLease);
   }
 
   async finish(){
@@ -271,7 +278,9 @@ export class BrowserRecordingClient {
     this.assembler.discardBuffered();this.options.onDuration?.(this.assembler.durationSeconds);this.setState('paused');
     void this.releaseMedia();
     if(!this.sessionId)return;
-    void fetch('/api/recording',{method:'POST',cache:'no-store',credentials:'same-origin',keepalive:true,headers:{'content-type':'application/json','x-csrf-token':this.options.csrf},body:JSON.stringify({action:'pause',caseId:this.options.caseId,sessionId:this.sessionId,leaseToken:this.leaseToken,expectedChunks:this.nextIndex,incomplete:true})}).catch(()=>undefined);
+    const requestedLease=this.leaseToken;
+    void fetch('/api/recording',{method:'POST',cache:'no-store',credentials:'same-origin',keepalive:true,headers:{'content-type':'application/json','x-csrf-token':this.options.csrf},body:JSON.stringify({action:'pause',caseId:this.options.caseId,sessionId:this.sessionId,leaseToken:requestedLease,expectedChunks:this.nextIndex,incomplete:true})})
+      .then(responseJson).then(detail=>this.adoptPause(detail,requestedLease)).catch(()=>undefined);
   }
 
   private async releaseMedia(){

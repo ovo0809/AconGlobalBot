@@ -60,6 +60,23 @@ test('accelerated synthetic audio persists more than one hour as independently v
   const state=(await advisor.recording(caseId)).data as RecordingDetail;assert.equal(state.session?.durationSeconds,3_660);assert.equal(state.session?.chunkCount,61);assert.equal(state.chunks.length,61);
 });
 
+test('page-hide pause persists an incomplete marker and later controls cannot clear it',async()=>{
+  const advisor=new Session();await advisor.login('advisor1@aeconn.example');const caseId=await createCase(advisor);
+  const started=await advisor.recording(caseId,{action:'start',consent:true});const sessionId=started.data.session!.id,lease=String(started.data.leaseToken),wav=encodeRecordingWav(new Int16Array(16_000));
+  assert.equal((await advisor.upload(caseId,sessionId,0,lease,wav)).response.status,200);
+  const interrupted=await advisor.recording(caseId,{action:'pause',sessionId,leaseToken:lease,incomplete:true});assert.equal(interrupted.response.status,200);assert.equal(interrupted.data.session?.incomplete,true);
+  const resumed=await advisor.recording(caseId,{action:'resume',sessionId});assert.equal(resumed.response.status,200);assert.equal(resumed.data.session?.incomplete,true);
+  const resumedLease=String(resumed.data.leaseToken);const normalPause=await advisor.recording(caseId,{action:'pause',sessionId,leaseToken:resumedLease,incomplete:false});assert.equal(normalPause.response.status,200);assert.equal(normalPause.data.session?.incomplete,true);
+  const finished=await advisor.recording(caseId,{action:'finish',sessionId,expectedChunks:1});assert.equal(finished.response.status,200);assert.equal(finished.data.session?.incomplete,true);
+  const {db,unpack}=await import('../lib/db'),{processRecordingJobs}=await import('../lib/recordings');await processRecordingJobs();await processRecordingJobs();await processRecordingJobs();
+  const review=await advisor.recording(caseId);assert.equal(review.data.session?.state,'review');const reviewed=review.data.segments.map(segment=>({id:segment.id,speaker:'customer',text:segment.text}));assert.equal((await advisor.recording(caseId,{action:'confirm',sessionId,segments:reviewed})).response.status,200);
+  await (await servicePromise).processReportJobs();const reportRow=db().prepare('SELECT doc FROM reports WHERE case_id=?').get(caseId) as {doc:string};const report=unpack<import('../lib/domain').ReportContent>(reportRow.doc);assert.match(report.fullText,/部分语音转写未完成或收尾超时/,'the generated report must expose the sticky incomplete transcript warning');
+
+  const otherCase=await createCase(advisor),otherStart=await advisor.recording(otherCase,{action:'start',consent:true}),otherSession=otherStart.data.session!.id,otherLease=String(otherStart.data.leaseToken);
+  assert.equal((await advisor.upload(otherCase,otherSession,0,otherLease,wav)).response.status,200);
+  const stringFlag=await advisor.recording(otherCase,{action:'pause',sessionId:otherSession,leaseToken:otherLease,incomplete:'true'});assert.equal(stringFlag.response.status,200);assert.equal(stringFlag.data.session?.incomplete,false,'only a strict boolean true may mark the recording incomplete');
+});
+
 test('restart recovery requires explicit retry and long reviewed transcripts persist in bounded extraction batches',async()=>{
   const advisor=new Session();await advisor.login('advisor1@aeconn.example');const recoveryCase=await createCase(advisor);const started=await advisor.recording(recoveryCase,{action:'start',consent:true});const sessionId=started.data.session!.id,lease=String(started.data.leaseToken),wav=encodeRecordingWav(new Int16Array(16_000));assert.equal((await advisor.upload(recoveryCase,sessionId,0,lease,wav)).response.status,200);assert.equal((await advisor.recording(recoveryCase,{action:'finish',sessionId,expectedChunks:1,leaseToken:lease})).response.status,200);
   const {db,id}=await import('../lib/db'),{recoverRecordingJobs}=await import('../lib/recordings');db().prepare("UPDATE recording_sessions SET state='transcribing' WHERE id=?").run(sessionId);db().prepare("UPDATE recording_chunks SET status='transcribing' WHERE session_id=?").run(sessionId);recoverRecordingJobs();let recovered=(await advisor.recording(recoveryCase)).data;assert.equal(recovered.session?.state,'failed');assert.equal(recovered.chunks[0].status,'failed');assert.match(recovered.session?.error??'',/核对用量/);assert.equal((await advisor.recording(recoveryCase,{action:'retry',sessionId})).response.status,200);recovered=(await advisor.recording(recoveryCase)).data;assert.equal(recovered.session?.state,'queued');
