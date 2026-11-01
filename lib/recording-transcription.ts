@@ -10,6 +10,7 @@ const MAX_SEGMENTS=500;
 const MAX_SEGMENT_TEXT=4_000;
 const MAX_TRANSCRIPT_TEXT=200_000;
 const WHISPER_MICROS_PER_SECOND=100;
+const WHISPER_PROMPT_MAX_BYTES=220;
 
 export type RecordingTranscriptionProvider='mock'|'openai';
 export interface RecordingTranscriptionSegment {startSeconds:number;endSeconds:number;text:string}
@@ -55,6 +56,27 @@ function finite(value:unknown,name:string){
   return value;
 }
 
+function comparableTranscript(value:string){
+  const chars=Array.from(value.normalize('NFKC'));
+  const isAsciiToken=(char:string|undefined)=>Boolean(char&&/[A-Za-z0-9]/.test(char));
+  const nextNonWhitespace=new Array<string|undefined>(chars.length);let right:string|undefined;
+  for(let index=chars.length-1;index>=0;index--){nextNonWhitespace[index]=right;if(!/\s/u.test(chars[index]))right=chars[index];}
+  const normalized:string[]=[];let left:string|undefined;
+  for(const [index,char] of chars.entries()){
+    const whitespace=/\s/u.test(char),next=nextNonWhitespace[index];
+    if(whitespace){if(isAsciiToken(left)&&isAsciiToken(next)&&normalized.at(-1)!==' ')normalized.push(' ');continue;}
+    normalized.push(/[,，。.!！?？;；:：、]/u.test(char)&&!(isAsciiToken(left)&&isAsciiToken(next))?'':char);left=char;
+  }
+  return normalized.join('');
+}
+
+function previousChunkPrompt(value:string|undefined):string|undefined {
+  const text=value?.trim();if(!text)return;
+  const chars=Array.from(text);let bytes=0,start=chars.length;
+  while(start>0){const size=new TextEncoder().encode(chars[start-1]).byteLength;if(bytes+size>WHISPER_PROMPT_MAX_BYTES)break;bytes+=size;start--;}
+  return chars.slice(start).join('');
+}
+
 function parseResponse(value:unknown,localDuration:number,allowChunkTimingFallback=false):RecordingTranscriptionResult{
   if(!value||typeof value!=='object'||Array.isArray(value))throw new RecordingTranscriptionError('转写服务返回了无效数据。','RECORDING_RESPONSE_INVALID','unknown');
   const result=value as Record<string,unknown>;
@@ -83,14 +105,27 @@ function parseResponse(value:unknown,localDuration:number,allowChunkTimingFallba
   }
   const transcript=typeof result.text==='string'?result.text.trim():'';
   if(transcript.length>MAX_TRANSCRIPT_TEXT)throw new RecordingTranscriptionError('转写服务返回的文字过长。','RECORDING_RESPONSE_INVALID','unknown');
+  const comparableFull=transcript&&segments.length?comparableTranscript(transcript):'';
+  const comparableSegments=transcript&&segments.length?comparableTranscript(segments.map(segment=>segment.text).join(' ')):'';
+  const contentDiffers=Boolean(transcript&&segments.length&&comparableFull!==comparableSegments);
+  const completeTranscriptExtendsSegments=contentDiffers&&comparableSegments.length>0&&comparableFull.length>comparableSegments.length&&comparableFull.startsWith(comparableSegments);
   if(needsChunkTiming&&allowChunkTimingFallback){
     if(!transcript||transcript.length>MAX_SEGMENT_TEXT)throw new RecordingTranscriptionError('逐句时间无法核对，且整段转写为空或过长。','RECORDING_RESPONSE_INVALID','unknown');
+    if(contentDiffers&&!completeTranscriptExtendsSegments)throw new RecordingTranscriptionError('逐句时间无法核对，且完整正文与逐句分段不一致。','RECORDING_RESPONSE_INVALID','unknown');
     // The validated upload is the source; do not invent or clamp word timings.
-    return {durationSeconds:localDuration,segments:[{startSeconds:0,endSeconds:localDuration,text:transcript}],timingWarning:'Whisper 逐句时间越界或重叠；以下文字仅定位到整段音轨，须对照原视频复核。'};
+    return {durationSeconds:localDuration,segments:[{startSeconds:0,endSeconds:localDuration,text:transcript}],timingWarning:completeTranscriptExtendsSegments?'Whisper 逐句时间越界或重叠，且完整正文延伸至逐句分段之后；以下文字使用完整正文并仅定位到整段音轨，须对照原视频复核。':'Whisper 逐句时间越界或重叠；以下文字仅定位到整段音轨，须对照原视频复核。'};
+  }
+  if(contentDiffers){
+    if(allowChunkTimingFallback&&completeTranscriptExtendsSegments){
+      if(transcript.length>MAX_SEGMENT_TEXT)throw new RecordingTranscriptionError('完整正文与逐句分段不一致，且整段转写过长。','RECORDING_RESPONSE_INVALID','unknown');
+      return {durationSeconds:localDuration,segments:[{startSeconds:0,endSeconds:localDuration,text:transcript}],timingWarning:'Whisper 完整正文与逐句分段不一致；以下文字使用完整正文并仅定位到整段音轨，须对照原视频复核。'};
+    }
+    throw new RecordingTranscriptionError('转写服务返回的完整正文与逐句分段不一致。','RECORDING_RESPONSE_INVALID','unknown');
   }
   if(!segments.length&&transcript){
     if(transcript.length>MAX_SEGMENT_TEXT)throw new RecordingTranscriptionError('缺少分段时间的转写文字过长。','RECORDING_RESPONSE_INVALID','unknown');
     segments.push({startSeconds:0,endSeconds:localDuration,text:transcript});
+    if(allowChunkTimingFallback)return {durationSeconds:localDuration,segments,timingWarning:'Whisper 未返回可核对的逐句时间；以下文字仅定位到整段音轨，须对照原视频复核。'};
   }
   return {durationSeconds:localDuration,segments};
 }
@@ -107,6 +142,7 @@ export async function transcribeRecordingChunk(input:{
   context:{caseId:string;sessionId?:string};
   provider:RecordingTranscriptionProvider;
   allowChunkTimingFallback?:boolean;
+  previousText?:string;
 }):Promise<RecordingTranscriptionResult>{
   const wav=validateRecordingWav(input.audio);
   if(selectedProvider()!==input.provider)throw new RecordingTranscriptionError('录音转写请求与显式服务配置不一致。','RECORDING_PROVIDER_MISMATCH');
@@ -122,6 +158,8 @@ export async function transcribeRecordingChunk(input:{
     form.append('model',config.model);
     form.append('response_format','verbose_json');
     form.append('timestamp_granularities[]','segment');
+    const prompt=input.allowChunkTimingFallback?previousChunkPrompt(input.previousText):undefined;
+    if(prompt)form.append('prompt',prompt);
     requestStarted=true;
     response=await fetch(OPENAI_TRANSCRIPTIONS_ENDPOINT,{method:'POST',headers:{Authorization:`Bearer ${config.apiKey}`},body:form,signal:AbortSignal.timeout(OPENAI_TIMEOUT_MS)});
     const requestId=safeRequestId(response.headers.get('x-request-id'));

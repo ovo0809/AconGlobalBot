@@ -64,7 +64,7 @@ for(const fixture of [
 test('Charles uploads, reviews, approves and withdraws extracted image material',async({page})=>{
   let state:'none'|'needs_review'|'approved'|'withdrawn'='none',version=1;
   const summary=()=>({id:'material-1',title:'长期护理海报',filename:'poster.png',kind:'image',state:state==='none'?'needs_review':state,provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version,error:null,scope:'case'});
-  const detail=()=>({...summary(),sourceNote:'公开合成示例',originalText:'【模拟提取】长期护理资料待人工核对。',reviewedText:'长期护理资料待人工核对。',coverage:'图片完整画面；模拟模式不代表真实 OCR。',events:[{at:createdAt,action:'extracted',detail:'模拟提取完成'}],parts:[{kind:'image',position:0,startSeconds:0,endSeconds:0,state:'done',text:'长期护理资料待人工核对。'}]});
+  const detail=()=>({...summary(),sourceNote:'公开合成示例',originalText:'【模拟提取】长期护理资料待人工核对。',reviewedText:'长期护理资料待人工核对。',coverage:'图片完整画面；模拟模式不代表真实 OCR。',events:[{at:createdAt,action:'extracted',detail:'模拟提取完成'}],parts:[{kind:'image',position:0,startSeconds:0,endSeconds:0,state:'done',text:'长期护理资料待人工核对。'}],autoCheck:{version:1,status:'attention',audio:[{key:'0:64.4:76.4',partPosition:0,startSeconds:64.4,endSeconds:76.4,status:'done',result:{durationSeconds:12,segments:[{startSeconds:0,endSeconds:3,text:'自动补回的演示文字'}]}}],frames:[],issues:[{startSeconds:64.4,endSeconds:79.4,message:'音轨仍有声音但缺少可靠转写，请对照原视频核对。'}]}});
   await page.route('**/api/bootstrap*',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(bootstrap())}));
   await page.route('**/api/materials*',async route=>{
     const request=route.request(),url=new URL(request.url());
@@ -79,7 +79,9 @@ test('Charles uploads, reviews, approves and withdraws extracted image material'
   await page.getByLabel('资料名称').fill('长期护理海报');await page.getByLabel('来源说明').fill('公开合成示例');
   await page.getByLabel('图片或视频').evaluate(async(input:HTMLInputElement)=>{const canvas=document.createElement('canvas');canvas.width=120;canvas.height=80;const context=canvas.getContext('2d')!;context.fillStyle='#203b34';context.fillRect(0,0,120,80);context.fillStyle='#fff';context.fillText('Aeconn',20,40);const blob=await new Promise<Blob>((resolve,reject)=>canvas.toBlob(value=>value?resolve(value):reject(new Error('fixture image failed')),'image/png'));const transfer=new DataTransfer();transfer.items.add(new File([blob],'poster.png',{type:'image/png'}));input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));});
   await page.getByText('我确认有权处理这份资料').click();await page.getByRole('button',{name:'上传并自动提取'}).click();
-  await expect(page.getByText('资料已上传，提取完成后需要人工复核。')).toBeVisible();await expect(page.getByRole('heading',{name:'长期护理海报'})).toBeVisible();await page.screenshot({path:join(screenshotDirectory,'library-desktop-1440.png'),fullPage:true});
+  await expect(page.getByText('资料已上传，提取完成后需要人工复核。')).toBeVisible();await expect(page.getByRole('heading',{name:'长期护理海报'})).toBeVisible();
+  const autoCheck=page.getByRole('region',{name:'视频自动检查'});await expect(autoCheck).toContainText('自动检查完成，有内容需重点核对');await expect(autoCheck).toContainText('已补转写 1 段');await expect(autoCheck).toContainText('64.4–79.4 秒');
+  await expect(page.getByRole('button',{name:'复核通过并允许 AI 参考'})).toBeDisabled();await page.screenshot({path:join(screenshotDirectory,'library-desktop-1440.png'),fullPage:true});
   await page.getByText('已核对原资料及提取范围').click();await page.getByRole('button',{name:'复核通过并允许 AI 参考'}).click();await expect(page.getByText('资料已复核，之后可供 AI 参考。')).toBeVisible();
   await page.getByRole('button',{name:'撤回参考资格'}).click();await expect(page.getByText('资料已撤回，不再供 AI 参考。')).toBeVisible();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
@@ -87,11 +89,11 @@ test('Charles uploads, reviews, approves and withdraws extracted image material'
 
 test('material library remains usable at 390px without horizontal overflow',async({page})=>{
   const item={id:'material-mobile',title:'手机复核资料',filename:'mobile.png',kind:'image',state:'needs_review',provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version:1,error:null,scope:'case'};
-  const detail={...item,sourceNote:'合成资料',originalText:'待复核文字',reviewedText:'待复核文字',coverage:'完整图片',events:[],parts:[{kind:'image',position:0,startSeconds:0,endSeconds:0,state:'done',text:'待复核文字'}]};
+  const detail={...item,sourceNote:'合成资料',originalText:'待复核文字',reviewedText:'待复核文字',coverage:'完整图片',events:[],parts:[{kind:'image',position:0,startSeconds:0,endSeconds:0,state:'done',text:'待复核文字'}],autoCheck:{version:1,status:'checked',audio:[],frames:[],issues:[]}};
   await page.route('**/api/bootstrap*',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(bootstrap())}));
   await page.route('**/api/materials*',route=>{const url=new URL(route.request().url());if(url.searchParams.get('original')==='1')return route.fulfill({status:200,contentType:'image/png',body:png});if(url.searchParams.get('id'))return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(detail)});return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({items:[item],provider:'mock',configured:true})});});
   await page.setViewportSize({width:390,height:844});await page.goto('/');await page.getByRole('button',{name:'资料库'}).click();
-  await expect(page.getByRole('heading',{name:'上传参考资料'})).toBeVisible();await page.getByRole('button',{name:/手机复核资料/}).click();await expect(page.getByRole('heading',{name:'手机复核资料'})).toBeVisible();expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);await page.screenshot({path:join(screenshotDirectory,'library-mobile-390.png'),fullPage:true});
+  await expect(page.getByRole('heading',{name:'上传参考资料'})).toBeVisible();await page.getByRole('button',{name:/手机复核资料/}).click();await expect(page.getByRole('heading',{name:'手机复核资料'})).toBeVisible();await expect(page.getByRole('region',{name:'视频自动检查'})).toContainText('自动检查完成，未发现明显时间缺口');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);await page.screenshot({path:join(screenshotDirectory,'library-mobile-390.png'),fullPage:true});
 });
 
 for(const viewport of [{width:1440,height:900},{width:390,height:844}]){

@@ -7,6 +7,20 @@ export const MATERIAL_VIDEO_MAX_SECONDS=10*60;
 export type MaterialPreparationStage='reading'|'inspecting'|'frames'|'audio'|'ready';
 export interface PreparedMaterial {manifest:{durationSeconds:number;audioDurationSeconds:number;frames:Array<{field:string;startSeconds:number}>;audio:Array<{field:string;startSeconds:number}>};frames:Array<{field:string;blob:Blob}>;audio:Array<{field:string;blob:Blob}>}
 
+export function materialVideoAudioRanges(duration:number){
+  if(!Number.isFinite(duration)||duration<=0||duration>MATERIAL_VIDEO_MAX_SECONDS)throw new Error('视频时长无效。');
+  return Array.from({length:Math.ceil(duration/15)},(_,index)=>({startSeconds:index*15,endSeconds:Math.min((index+1)*15,duration)}));
+}
+
+export function materialVideoFrameTimes(duration:number):number[]{
+  if(!Number.isFinite(duration)||duration<=0||duration>MATERIAL_VIDEO_MAX_SECONDS)throw new Error('视频时长无效。');
+  const tail=Math.max(0,duration-.05);
+  const starts=Array.from({length:Math.min(20,Math.max(1,Math.ceil(duration/30)))},(_,i)=>Math.min(i*30,tail));
+  // Include the ending without exceeding the existing 20-frame request bound.
+  if(tail-starts[starts.length-1]>1){if(starts.length===20)starts.pop();starts.push(tail);}
+  return starts;
+}
+
 const MEDIA_EVENT_TIMEOUT_MS=12_000;
 const aborted=()=>new DOMException('资料处理已取消。','AbortError');
 function check(signal?:AbortSignal){if(signal?.aborted)throw aborted();}
@@ -44,7 +58,7 @@ export async function prepareMaterialVideo(file:File,options:{signal?:AbortSigna
       if(Number.isFinite(duration)){const resetSeek=waitFor(video,'seeked',signal);video.currentTime=0;await resetSeek;}
     }
     if(!Number.isFinite(duration)||duration<=0)throw new Error('无法确认视频时长。');if(duration>MATERIAL_VIDEO_MAX_SECONDS)throw new Error('单个视频最长支持 10 分钟。');if(video.readyState<2)await waitFor(video,'loadeddata',signal);
-    const starts=Array.from({length:Math.min(20,Math.max(1,Math.ceil(duration/30)))},(_,i)=>Math.min(i*30,Math.max(0,duration-.05))),frames:Array<{field:string;blob:Blob}>=[];onStage?.('frames');
+    const starts=materialVideoFrameTimes(duration),frames:Array<{field:string;blob:Blob}>=[];onStage?.('frames');
     for(const [i,start]of starts.entries()){
       check(signal);
       if(Math.abs(video.currentTime-start)>.04){const seeked=waitFor(video,'seeked',signal);video.currentTime=start;await seeked;}
@@ -54,7 +68,7 @@ export async function prepareMaterialVideo(file:File,options:{signal?:AbortSigna
     try{decoded=await context.decodeAudioData(bytes.slice(0));}catch{throw new Error('无法读取视频音轨，请换用含有可识别音轨的 MP4、WebM 或 MOV 文件。');}
     const tolerance=.25;
     if(decoded.numberOfChannels<1||decoded.numberOfChannels>8||!Number.isFinite(decoded.duration)||decoded.duration<.1||decoded.sampleRate>192_000||decoded.length>decoded.sampleRate*(duration+tolerance)||Math.abs(decoded.duration-duration)>tolerance)throw new Error('视频音轨范围与画面时长不一致，无法安全提取。');
-    const audio:Array<{field:string;blob:Blob}>=[];for(let start=0,i=0;start<duration;start+=30,i+=1){check(signal);audio.push({field:`audio${i}`,blob:renderMaterialAudioChunk(decoded,start,Math.min(start+30,duration))});}if(!audio.length)throw new Error('视频没有可识别的音轨。');onStage?.('ready');return{manifest:{durationSeconds:duration,audioDurationSeconds:decoded.duration,frames:frames.map((item,i)=>({field:item.field,startSeconds:starts[i]})),audio:audio.map((item,i)=>({field:item.field,startSeconds:i*30}))},frames,audio};
+    const ranges=materialVideoAudioRanges(duration),audio:Array<{field:string;blob:Blob}>=[];for(const [i,range]of ranges.entries()){check(signal);audio.push({field:`audio${i}`,blob:renderMaterialAudioChunk(decoded,range.startSeconds,range.endSeconds)});}if(!audio.length)throw new Error('视频没有可识别的音轨。');onStage?.('ready');return{manifest:{durationSeconds:duration,audioDurationSeconds:decoded.duration,frames:frames.map((item,i)=>({field:item.field,startSeconds:starts[i]})),audio:audio.map((item,i)=>({field:item.field,startSeconds:ranges[i].startSeconds}))},frames,audio};
   }finally{video.removeAttribute('src');video.load();URL.revokeObjectURL(url);if(context)await context.close().catch(()=>undefined);}
 }
 

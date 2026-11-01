@@ -10,7 +10,7 @@ import { db, pack, unpack } from '../lib/db';
 import { processMaterialJobs, recoverMaterialJobs, approvedMaterialDocuments, validateMaterialImage } from '../lib/materials';
 import { loadCaseKnowledge } from '../lib/material-knowledge';
 import { publicKnowledgeContext, safeMaterialSourceUrl } from '../lib/knowledge-public';
-import { encodeRecordingWav } from '../lib/recording-audio';
+import { encodeRecordingWav, validateRecordingWav } from '../lib/recording-audio';
 import { getUsageSummary } from '../lib/ai-usage';
 const root=mkdtempSync(join(tmpdir(),'aeconn-materials-'));
 Object.assign(process.env,{DATABASE_PATH:join(root,'test.sqlite'),KNOWLEDGE_REMOTE:'off',KNOWLEDGE_LOCAL_DIR:root,DEMO_PASSWORD:'AeconnDemo!2026',LLM_PROVIDER:'mock',VOICE_PROVIDER:'mock',RECORDING_PROVIDER:'mock',MAIL_MODE:'dry_run',AI_CASE_BUDGET_USD:'8',AI_DAILY_BUDGET_USD:'40',AI_MONTHLY_BUDGET_USD:'160'});
@@ -127,8 +127,75 @@ test('video retry retains completed images, records safe failures and flags coar
   form.set('manifest',JSON.stringify({durationSeconds:1,frames:[{field:'frame0',startSeconds:0}],audio:[{field:'audio0',startSeconds:0}]}));
   const upload=await create(browser,form);await processMaterialJobs();const failed=await detail(browser,upload.id);
   assert.equal(failed.state,'failed');assert.match(failed.error!,/HTTP 503/);assert(!JSON.stringify(failed).includes('private upstream body'));assert.equal(failed.parts[0].state,'done');
-  failAudio=false;assert.equal((await browser.request({action:'retry',id:failed.id,version:failed.version})).status,200);await processMaterialJobs();const result=await detail(browser,upload.id);
-  assert.equal(images,1);assert.equal(audio,2);assert.equal(result.state,'needs_review');assert(result.events.some(event=>event.action==='timing_warning'));assert.match(result.originalText,/仅定位到整段音轨/);assert.match(result.originalText,/\[0\.0–1\.0s\] 合成转写/);assert(!approvedMaterialDocuments('case-1').some(doc=>doc.path.includes(upload.id)));
+  failAudio=false;assert.equal((await browser.request({action:'retry',id:failed.id,version:failed.version})).status,200);await processMaterialJobs({frames:async()=>{throw new Error('synthetic fixture has no decodable frames');}});const result=await detail(browser,upload.id);
+  assert.equal(images,1);assert.equal(audio,3,'coarse timing now gets one bounded short repair');assert.equal(result.autoCheck?.audio.length,1);assert.equal(result.autoCheck?.status,'attention');assert.equal(result.state,'needs_review');assert(result.events.some(event=>event.action==='timing_warning'));assert.match(result.originalText,/仅定位到整段音轨/);assert.match(result.originalText,/\[0\.0–1\.0s\] 合成转写/);assert(!approvedMaterialDocuments('case-1').some(doc=>doc.path.includes(upload.id)));
+});
+
+test('audible video gaps get at most four automatic retries and preserve the original extraction',async t=>{
+  const browser=await new Browser().login(),keys=['LLM_PROVIDER','RECORDING_PROVIDER','OPENAI_MODEL','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL'],previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}});
+  Object.assign(process.env,{LLM_PROVIDER:'openai',RECORDING_PROVIDER:'openai',OPENAI_MODEL:'gpt-6-luna',OPENAI_API_KEY:'fake-no-network',RECORDING_TRANSCRIPTION_MODEL:'whisper-1'});
+  let images=0,audio=0;
+  t.mock.method(globalThis,'fetch',async (url:RequestInfo|URL,options?:RequestInit)=>{
+    if(String(url).includes('/audio/transcriptions')){
+      audio++;const form=options?.body as FormData,file=form.get('file');assert(file instanceof Blob);
+      const duration=validateRecordingWav(new Uint8Array(await file.arrayBuffer())).durationSeconds;
+      return new Response(JSON.stringify(audio===1?{duration,text:'合成前段',segments:[{start:0,end:4,text:'合成前段'}]}:{duration,text:'',segments:[]}));
+    }
+    images++;return new Response(JSON.stringify({id:'resp_tail_coverage',status:'completed',usage:{input_tokens:100,output_tokens:30,input_tokens_details:{cached_tokens:0}},output:[{type:'message',content:[{type:'output_text',text:'合成画面'}]}]}));
+  });
+  const audible=new Int16Array(16_000*60);audible.fill(2_000);
+  const form=imageForm(randomUUID(),'case-1');form.set('file',new Blob([Buffer.from('0000ftypisom00000000000000000000')],{type:'video/mp4'}),'tail-warning.mp4');
+  form.set('frame0',new Blob([png]),'frame.png');form.set('audio0',new Blob([new Uint8Array(encodeRecordingWav(audible))]),'audio.wav');
+  form.set('manifest',JSON.stringify({durationSeconds:60,frames:[{field:'frame0',startSeconds:0}],audio:[{field:'audio0',startSeconds:0}]}));
+  const upload=await create(browser,form);await processMaterialJobs({frames:async()=>{throw new Error('synthetic fixture has no decodable video frames');}});const result=await detail(browser,upload.id);
+
+  assert.equal(images,1);assert.equal(audio,5,'one original transcription plus at most four repair calls');assert.equal(result.state,'needs_review');
+  assert.equal(result.autoCheck?.audio.length,4);assert.equal(result.autoCheck?.status,'attention');assert(result.autoCheck?.issues.some(issue=>issue.startSeconds===4&&issue.endSeconds===60));
+  assert.match(result.originalText,/合成前段/);assert.match(result.originalText,/自动检查仍需注意/);assert.match(result.originalText,/4\.0–60\.0s/);
+  assert(!approvedMaterialDocuments('case-1').some(doc=>doc.path.includes(upload.id)));
+  await processMaterialJobs({frames:async()=>{throw new Error('must not run again');}});assert.equal(audio,5,'completed automatic attempts are not replayed');
+});
+
+test('ten minute material accepts forty contiguous short audio chunks without widening duration or approval',async()=>{
+  const browser=await new Browser().login();
+  const form=imageForm(randomUUID(),'case-1');form.set('file',new Blob([Buffer.from('0000ftypisom00000000000000000000')],{type:'video/mp4'}),'short-chunks.mp4');
+  form.set('frame0',new Blob([png]),'frame.png');
+  const wav=new Uint8Array(encodeRecordingWav(new Int16Array(15*16000)));
+  const audio=Array.from({length:40},(_,index)=>({field:`audio${index}`,startSeconds:index*15}));
+  for(const item of audio)form.set(item.field,new Blob([wav]),'audio.wav');
+  form.set('manifest',JSON.stringify({durationSeconds:600,frames:[{field:'frame0',startSeconds:0}],audio}));
+  const upload=await create(browser,form);await processMaterialJobs();const result=await detail(browser,upload.id);
+  assert.equal(result.parts.filter(part=>part.kind==='audio').length,40);assert.equal(result.parts.at(-1)?.endSeconds,600);assert.equal(result.state,'needs_review');
+  assert(!approvedMaterialDocuments('case-1').some(doc=>doc.path.includes(upload.id)));
+});
+
+test('automatic repair through the real transcription adapter settles usage once and remains approval-gated',async t=>{
+  const browser=await new Browser().login(),keys=['LLM_PROVIDER','RECORDING_PROVIDER','OPENAI_MODEL','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL'],previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}});
+  Object.assign(process.env,{LLM_PROVIDER:'openai',RECORDING_PROVIDER:'openai',OPENAI_MODEL:'gpt-6-luna',OPENAI_API_KEY:'fake-no-network',RECORDING_TRANSCRIPTION_MODEL:'whisper-1'});
+  let images=0,audio=0;
+  t.mock.method(globalThis,'fetch',async (url:RequestInfo|URL,options?:RequestInit)=>{
+    if(String(url).includes('/audio/transcriptions')){
+      audio++;const form=options?.body as FormData,file=form.get('file');assert(file instanceof Blob);
+      const duration=validateRecordingWav(new Uint8Array(await file.arrayBuffer())).durationSeconds;
+      const text=audio===1?'原始前段':`自动补回 ${audio-1}`;
+      return new Response(JSON.stringify({duration,text,segments:[{start:0,end:audio===1?4:duration,text}]}));
+    }
+    images++;return new Response(JSON.stringify({id:'resp_repair_success',status:'completed',usage:{input_tokens:100,output_tokens:30,input_tokens_details:{cached_tokens:0}},output:[{type:'message',content:[{type:'output_text',text:'合成画面'}]}]}));
+  });
+  const audible=new Int16Array(16_000*20);audible.fill(2_000);
+  const form=imageForm(randomUUID(),'case-1');form.set('file',new Blob([Buffer.from('0000ftypisom00000000000000000000')],{type:'video/mp4'}),'repair-success.mp4');
+  form.set('frame0',new Blob([png]),'frame.png');form.set('audio0',new Blob([new Uint8Array(encodeRecordingWav(audible))]),'audio.wav');
+  form.set('manifest',JSON.stringify({durationSeconds:20,frames:[{field:'frame0',startSeconds:0}],audio:[{field:'audio0',startSeconds:0}]}));
+  const upload=await create(browser,form);await processMaterialJobs({frames:async()=>{throw new Error('frames are unnecessary after complete audio recovery');}});const result=await detail(browser,upload.id);
+
+  assert.equal(images,1);assert.equal(audio,3);assert.equal(result.state,'needs_review');assert.equal(result.autoCheck?.status,'supplemented');assert.deepEqual(result.autoCheck?.issues,[]);
+  assert.match(result.originalText,/原始前段/);assert.match(result.originalText,/自动补回 1/);assert.match(result.originalText,/自动补回 2/);
+  const usage=db().prepare("SELECT session_id,status FROM ai_usage_calls WHERE operation='transcription' AND session_id LIKE ? ORDER BY created_at").all(`material:${upload.id}:%`) as Array<{session_id:string;status:string}>;
+  assert.equal(usage.length,3);assert(usage.every(record=>record.status==='settled'));assert.equal(new Set(usage.map(record=>record.session_id)).size,3,'the original call and each repair retain a distinct ledger entry');
+  assert.equal((await browser.request({action:'approve',id:result.id,version:result.version,reviewedText:result.originalText,confirmed:false})).status,400);assert(!approvedMaterialDocuments('case-1').some(doc=>doc.path.includes(upload.id)));
+  await processMaterialJobs({frames:async()=>{throw new Error('must not run again');}});assert.equal(audio,3);assert.equal(db().prepare("SELECT count(*) n FROM ai_usage_calls WHERE operation='transcription' AND session_id LIKE ?").get(`material:${upload.id}:%`)!.n,3);
 });
 
 test('deleted cases stop references; withdrawal remains possible; purge clears materials and snapshots',async()=>{
@@ -156,6 +223,34 @@ test('approved private references reach voice context and report PDF without bec
   assert(JSON.parse(String(report.doc)).knowledge.sources.some((source:{path:string})=>source.path.includes(uploaded.id)));
   assert.equal(Buffer.from(report.pdf as Uint8Array).subarray(0,4).toString(),'%PDF');
   assert.deepEqual(db().prepare('SELECT doc FROM profile_fields WHERE case_id=? ORDER BY field_key').all('case-6'),beforeFacts);
+});
+
+test('video originals support private byte ranges, including suffixes, retries and unsatisfiable positions',async()=>{
+  const browser=await new Browser().login();assignReviewer('case-1');
+  const uploaded=await create(browser),bytes=Buffer.from('0000ftypisom00000000000000000000');
+  const usageBefore=db().prepare('SELECT count(*) n FROM ai_usage_calls').get()!.n;
+  db().prepare('UPDATE material_documents SET original=?,mime_type=?,doc=? WHERE id=?').run(bytes,'video/mp4',pack({...uploaded,kind:'video'}),uploaded.id);
+  const query=`?id=${uploaded.id}&original=1`;
+  for(const [range,start,end] of [['bytes=4-7',4,7],['bytes=8-',8,bytes.length-1],['bytes=-8',bytes.length-8,bytes.length-1],['bytes=0-99999999999999999999',0,bytes.length-1],['bytes=-99999999999999999999',0,bytes.length-1]] as const){
+    const response=await browser.request(undefined,query,{range});
+    assert.equal(response.status,206,range);assert.equal(response.headers.get('accept-ranges'),'bytes');
+    assert.equal(response.headers.get('content-range'),`bytes ${start}-${end}/${bytes.length}`);
+    assert.equal(response.headers.get('content-length'),String(end-start+1));assert.equal(response.headers.get('content-type'),'video/mp4');
+    assert.equal(response.headers.get('cache-control'),'no-store, private');assert.equal(response.headers.get('vary'),'Cookie');
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()),bytes.subarray(start,end+1));
+  }
+  for(const range of [`bytes=${bytes.length}-`,`bytes=99999999999999999999-`,'bytes=7-4','bytes=-0']){
+    const response=await browser.request(undefined,query,{range});assert.equal(response.status,416,range);
+    assert.equal(response.headers.get('content-range'),`bytes */${bytes.length}`);assert.equal((await response.arrayBuffer()).byteLength,0);
+  }
+  for(const headers of [{},{range:'bytes=0-1,4-5'},{range:'seconds=0-1'},{range:'bytes=invalid'},{range:'bytes=0-1','if-range':'"unmatched-validator"'}] as Record<string,string>[]){
+    const response=await browser.request(undefined,query,headers);assert.equal(response.status,200);
+    assert.equal(response.headers.get('content-range'),null);assert.deepEqual(Buffer.from(await response.arrayBuffer()),bytes);
+  }
+  for(const caller of [new Browser(),await new Browser().login('advisor1@aeconn.example'),await new Browser().login('reviewer-other@aeconn.example')]){
+    const response=await caller.request(undefined,query,{range:'bytes=0-1'});assert([401,403,404].includes(response.status));assert.equal(response.headers.get('content-range'),null);
+  }
+  assert.equal(db().prepare('SELECT count(*) n FROM ai_usage_calls').get()!.n,usageBefore);
 });
 
 test('a prepared source segment is idempotent even when a lost response requires different derived frames',async()=>{

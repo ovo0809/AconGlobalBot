@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { audit, db, docs, id, now, pack, transaction, unpack } from './db';
 import type { Case, User } from './domain';
 import { requireAnalysisConfig } from './provider-config';
-import { RecordingTranscriptionError, recordingProviderConfig, transcribeRecordingChunk } from './recording-transcription';
+import { RecordingTranscriptionError, recordingProviderConfig, transcribeRecordingChunk, type RecordingTranscriptionResult } from './recording-transcription';
 import { validateRecordingWav } from './recording-audio';
+import { materialAudioTailWarning } from './material-audio-coverage';
+import { recoverMaterialCoverage, materialRecoveryText, type MaterialRecoveryAudio } from './material-recovery';
 import { MaterialExtractionError, extractMaterialImage } from './material-extractor';
 import { MATERIAL_MAX_ORIGINAL_BYTES, MATERIAL_MAX_REQUEST_BYTES, MATERIAL_MAX_STORAGE_BYTES, MATERIAL_MAX_TEXT_BYTES, MATERIAL_MAX_VIDEO_SECONDS, type MaterialDetail, type MaterialPart, type MaterialProvider, type MaterialSummary } from './material-types';
 import { validateMaterialImportSource } from './material-imports';
@@ -13,7 +15,7 @@ function requireMaterial(value:unknown,status:number,message:string):asserts val
 const hash=(value:Uint8Array|string)=>createHash('sha256').update(value).digest('hex');
 const json=(value:unknown,status=200)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json','Cache-Control':'no-store, private','Vary':'Cookie'}});
 type StoredMaterial=Omit<MaterialDetail,'parts'>;
-type StoredPart=MaterialPart & {mimeType:string};
+type StoredPart=MaterialPart & {mimeType:string;transcription?:RecordingTranscriptionResult};
 type PreparedPart={doc:StoredPart;bytes:Uint8Array};
 const state=globalThis as typeof globalThis & {aeconnMaterialBusy?:boolean};
 function cleanText(value:unknown,max:number,label:string){requireMaterial(typeof value==='string'&&value.trim().length<=max,400,`${label}格式或长度无效。`);return value.trim();}
@@ -92,7 +94,7 @@ async function parseUpload(request:Request,user:User){
     const duration=numeric(manifest.durationSeconds,'视频时长');
     requireMaterial(!importSource||Math.abs(duration-(importSource.endSeconds-importSource.startSeconds))<=0.5,400,'视频分段时长与准备记录不一致。');
     if(manifest.audioDurationSeconds!==undefined){const audioDuration=numeric(manifest.audioDurationSeconds,'原音轨时长');requireMaterial(kind==='image'?audioDuration===0:Math.abs(audioDuration-duration)<=0.25,400,'视频和原音轨长度差异过大，请拆分或转换后上传。');}
-    requireMaterial(kind==='image'?duration===0&&manifest.frames.length===1&&manifest.audio.length===0:duration>0&&duration<=MATERIAL_MAX_VIDEO_SECONDS&&manifest.frames.length>=1&&manifest.frames.length<=20&&manifest.audio.length>=1&&manifest.audio.length<=21,400,'视频最多 10 分钟，须包含声音及抽样画面。');
+    requireMaterial(kind==='image'?duration===0&&manifest.frames.length===1&&manifest.audio.length===0:duration>0&&duration<=MATERIAL_MAX_VIDEO_SECONDS&&manifest.frames.length>=1&&manifest.frames.length<=20&&manifest.audio.length>=1&&manifest.audio.length<=41,400,'视频最多 10 分钟，须包含声音及抽样画面。');
     const seen=new Set<string>();let previousFrame=-1;
     for(const raw of manifest.frames){requireMaterial(raw&&typeof raw==='object',400,'画面清单无效。');const field=cleanText(raw.field,30,'画面编号'),start=numeric(raw.startSeconds,'画面时间');requireMaterial(/^frame\d+$/.test(field)&&!seen.has(field)&&start>previousFrame&&start<=duration,400,'画面时间或编号无效。');seen.add(field);previousFrame=start;const item=formFile(form,field);requireMaterial(item.size<=8*1024*1024,413,'画面文件过大。');const bytes=new Uint8Array(await item.arrayBuffer());parts.push({bytes,doc:{kind:'image',position:parts.length,startSeconds:start,endSeconds:start,state:'queued',text:'',mimeType:validateMaterialImage(bytes)}});}
     let audioEnd=0;
@@ -163,12 +165,33 @@ function editMaterial(user:User,input:Record<string,unknown>){
   });
 }
 
+function originalResponse(request:Request,bytes:Uint8Array<ArrayBuffer>,mimeType:string){
+  const size=bytes.byteLength;
+  const headers=new Headers({'Content-Type':mimeType,'Content-Length':String(size),'Accept-Ranges':'bytes','Cache-Control':'no-store, private','Vary':'Cookie','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox"});
+  const range=request.headers.get('range');
+  // No validators are published for private originals. Ignore conditional,
+  // malformed or multipart ranges and return the complete representation.
+  const match=!request.headers.has('if-range')&&range&&range.length<=256?/^bytes=(\d*)-(\d*)$/i.exec(range.trim()):null;
+  if(!match||(!match[1]&&!match[2]))return new Response(bytes,{headers});
+  const total=BigInt(size),suffix=!match[1],amount=suffix?BigInt(match[2]):0n;
+  const start=suffix?(amount>=total?0n:total-amount):BigInt(match[1]);
+  const requestedEnd=suffix||!match[2]?total-1n:BigInt(match[2]);
+  if(!size||(suffix&&amount===0n)||start>=total||requestedEnd<start){
+    headers.set('Content-Range',`bytes */${size}`);headers.set('Content-Length','0');
+    return new Response(null,{status:416,headers});
+  }
+  const end=requestedEnd>=total?total-1n:requestedEnd;
+  headers.set('Content-Range',`bytes ${start}-${end}/${size}`);
+  headers.set('Content-Length',String(end-start+1n));
+  return new Response(bytes.subarray(Number(start),Number(end)+1),{status:206,headers});
+}
+
 export async function handleMaterialRequest(request:Request,user:User,checkCase:(caseId:string)=>void):Promise<Response>{
   requireReviewer(user);
   if(request.method==='GET'){
     const params=new URL(request.url).searchParams,materialId=params.get('id');if(!materialId)return json(listMaterials(user));
     ownerDocument(materialId,user);
-    if(params.get('original')==='1') {const row=db().prepare('SELECT original,mime_type FROM material_documents WHERE id=?').get(materialId)!;return new Response(new Uint8Array(row.original as Uint8Array),{headers:{'Content-Type':String(row.mime_type),'Content-Length':String((row.original as Uint8Array).byteLength),'Cache-Control':'no-store, private','Vary':'Cookie','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox"}});}
+    if(params.get('original')==='1') {const row=db().prepare('SELECT original,mime_type FROM material_documents WHERE id=?').get(materialId)!;return originalResponse(request,new Uint8Array(row.original as Uint8Array),String(row.mime_type));}
     const revision=params.get('revision');if(revision){requireMaterial(/^[a-f0-9]{64}$/.test(revision),400,'版本编号无效。');const row=db().prepare('SELECT doc FROM material_versions WHERE material_id=? AND revision=?').get(materialId,revision);requireMaterial(row,404,'资料版本不存在。');return json(unpack(row.doc));}
     return json(materialDetail(materialId,user));
   }
@@ -180,7 +203,7 @@ export async function handleMaterialRequest(request:Request,user:User,checkCase:
 
 /** Never replay an uncertain network request automatically on restart. */
 export function recoverMaterialJobs(){for(const doc of docs<StoredMaterial>("SELECT doc FROM material_documents WHERE state='processing'")){doc.state='failed';doc.error='处理因服务重启中断；已完成分段保留，请核对后重试。';event(doc,'interrupted',doc.error);saveDocument(doc);}}
-export async function processMaterialJobs(){
+export async function processMaterialJobs(recoveryDependencies?:Parameters<typeof recoverMaterialCoverage>[1]){
   if(state.aeconnMaterialBusy)return;state.aeconnMaterialBusy=true;
   try {
     const document=transaction(()=>{const doc=docs<StoredMaterial>("SELECT doc FROM material_documents WHERE state='queued' ORDER BY rowid LIMIT 1")[0];if(doc){doc.state='processing';event(doc,'processing','开始自动提取，结果仍须人工复核。');saveDocument(doc);}return doc;});if(!document)return;
@@ -192,11 +215,33 @@ export async function processMaterialJobs(){
         db().prepare("UPDATE material_parts SET state='processing' WHERE material_id=? AND position=?").run(document.id,part.position);
         const context={caseId:document.caseId,sessionId:`material:${document.id}:${part.position}`};
         if(part.kind==='image')part.text=(await extractMaterialImage({image:new Uint8Array(row.bytes as Uint8Array),mimeType:part.mimeType as 'image/png'|'image/jpeg'|'image/webp',context,provider:document.provider})).text;
-        else {const result=await transcribeRecordingChunk({audio:new Uint8Array(row.bytes as Uint8Array),context,provider:document.provider,allowChunkTimingFallback:true});part.text=result.segments.map(segment=>`[${(part.startSeconds+segment.startSeconds).toFixed(1)}–${(part.startSeconds+segment.endSeconds).toFixed(1)}s] ${segment.text}`).join('\n')||'【该分段未识别到可辨认语音，请核对原音轨】';if(result.timingWarning){part.text=`【${result.timingWarning}】\n${part.text}`;event(document,'timing_warning',`音轨 ${part.startSeconds.toFixed(1)}s：${result.timingWarning}`);}}
+        else {
+          const audio=new Uint8Array(row.bytes as Uint8Array);
+          const previous=partsFor(document.id).find(candidate=>candidate.kind==='audio'&&candidate.state==='done'&&Math.abs(candidate.endSeconds-part.startSeconds)<.1);
+          const result=await transcribeRecordingChunk({audio,context,provider:document.provider,allowChunkTimingFallback:true,previousText:previous?.transcription?.segments.map(segment=>segment.text).join(' ')});
+          part.transcription=result;
+          part.text=result.segments.map(segment=>`[${(part.startSeconds+segment.startSeconds).toFixed(1)}–${(part.startSeconds+segment.endSeconds).toFixed(1)}s] ${segment.text}`).join('\n')||'【该分段未识别到可辨认语音，请核对原音轨】';
+          if(result.timingWarning){part.text=`【${result.timingWarning}】\n${part.text}`;event(document,'timing_warning',`音轨 ${part.startSeconds.toFixed(1)}s：${result.timingWarning}`);}
+          const warning=materialAudioTailWarning(audio,result,part.startSeconds);
+          if(warning){part.text=`【覆盖待核对：${warning}】\n${part.text}`;event(document,'coverage_warning',warning);}
+        }
         part.state='done';db().prepare("UPDATE material_parts SET state='done',doc=? WHERE material_id=? AND position=?").run(pack(part),document.id,part.position);
         event(document,'part_completed',`${part.kind==='image'?'画面':'音轨'} ${part.startSeconds.toFixed(1)}s 已处理。`);saveDocument(document);
       }
       document.originalText=partsFor(document.id).sort((a,b)=>a.startSeconds-b.startSeconds||a.kind.localeCompare(b.kind)).map(part=>`## ${part.kind==='image'?'画面':'音轨'} ${part.startSeconds.toFixed(1)}s\n${part.text}`).join('\n\n');
+      if(document.kind==='video'){
+        const audio:MaterialRecoveryAudio[]=partsFor(document.id).filter(part=>part.kind==='audio').map(part=>({...part,audio:new Uint8Array(db().prepare('SELECT bytes FROM material_parts WHERE material_id=? AND position=?').get(document.id,part.position)!.bytes as Uint8Array)}));
+        document.autoCheck=await recoverMaterialCoverage({materialId:document.id,caseId:document.caseId,provider:document.provider,audio,state:document.autoCheck,
+          loadVideo:()=>{const source=db().prepare('SELECT original,mime_type FROM material_documents WHERE id=?').get(document.id)!;return {video:new Uint8Array(source.original as Uint8Array),mimeType:String(source.mime_type)};},
+          checkpoint:(check,action,detail)=>{document.autoCheck=check;event(document,action,detail);saveDocument(document);},
+        },recoveryDependencies);
+        const supplement=materialRecoveryText(document.autoCheck,audio);
+        if(textBytes(document.originalText+supplement)<=MATERIAL_MAX_TEXT_BYTES)document.originalText+=supplement;
+        else {
+          const message='自动补提取文字较多，完整补充保留在处理记录中；请整理复核稿后再允许参考。';
+          document.autoCheck.status='attention';document.autoCheck.issues.push({startSeconds:0,endSeconds:Math.max(...audio.map(part=>part.endSeconds)),message});event(document,'recovery_text_limit',message);
+        }
+      }
       requireMaterial(textBytes(document.originalText)<=MATERIAL_MAX_TEXT_BYTES,422,'提取文字超过 64 KB，请拆分视频后上传；已完成分段可查看。');
       document.reviewedText=document.originalText;document.state='needs_review';document.error=null;event(document,'extracted','提取完成，尚未允许 AI 参考。请核对金额、条件、例外和画面覆盖。');saveDocument(document);
     } catch(error){document.state='failed';document.error=error instanceof MaterialError||error instanceof RecordingTranscriptionError||error instanceof MaterialExtractionError?error.message:(error instanceof Error&&'code' in error&&error.code==='AI_BUDGET_LIMIT'?'关联案例或组织的调用额度不足，请核对后重试。':'自动提取未完成，请检查媒体格式、云端配置或额度后重试。');event(document,'failed',document.error);saveDocument(document);}

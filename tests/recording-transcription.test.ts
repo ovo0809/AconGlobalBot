@@ -65,6 +65,19 @@ test('Whisper multipart transcription settles trusted duration usage',async(t)=>
   const {db}=await import('../lib/db');assert.equal(db().prepare('SELECT outcome FROM ai_usage_completion_receipts WHERE call_id=?').get(record.id)?.outcome,'settled');
 });
 
+test('material transcription carries a bounded Unicode-safe suffix as Whisper context only',async(t)=>{
+  restoreEnv(t,['RECORDING_PROVIDER','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL']);
+  process.env.RECORDING_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-test-key';process.env.RECORDING_TRANSCRIPTION_MODEL='whisper-1';
+  const provider=await providerPromise,audio=await wav(1);const previousText=`应被丢弃 ${'长'.repeat(100)} 上一段结尾🛡️`;
+  const prompts:Array<FormDataEntryValue|null>=[];
+  const network=t.mock.method(globalThis,'fetch',async(_url:unknown,options?:RequestInit)=>{prompts.push((options?.body as FormData).get('prompt'));return openAIResponse();});
+  await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'material-context'},provider:'openai',allowChunkTimingFallback:true,previousText});
+  await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'material-context-empty'},provider:'openai',allowChunkTimingFallback:true,previousText:'   '});
+  await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'strict-context'},provider:'openai',previousText});
+  assert.equal(network.mock.callCount(),3);assert.equal(typeof prompts[0],'string');assert(Buffer.byteLength(String(prompts[0]),'utf8')<=220);assert.match(String(prompts[0]),/上一段结尾🛡️$/);assert(!String(prompts[0]).includes('应被丢弃'));
+  assert.equal(prompts[1],null);assert.equal(prompts[2],null,'strict recording transcription never sends material context');
+});
+
 test('transcription budget is checked before the OpenAI request',async(t)=>{
   restoreEnv(t,['RECORDING_PROVIDER','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL','AI_CASE_BUDGET_USD']);
   process.env.RECORDING_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-test-key';process.env.RECORDING_TRANSCRIPTION_MODEL='whisper-1';process.env.AI_CASE_BUDGET_USD='0.00005';
@@ -109,11 +122,65 @@ test('material timing fallback preserves the full chunk source without fabricate
   await assert.rejects(provider.transcribeRecordingChunk({audio,context:{caseId:'case-6',sessionId:'strict-timing'},provider:'openai'}),(e:unknown)=>e instanceof provider.RecordingTranscriptionError&&e.message.includes('32.640s')&&!e.message.includes('完整转写'));
   const result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-7',sessionId:'material-timing'},provider:'openai',allowChunkTimingFallback:true});
   assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:30,text:'合成完整转写'}]);assert.match(result.timingWarning!,/整段音轨/);
-  assert.equal(getUsageSummary('org-demo','case-7',true).records[0].status,'settled');
+  network.mock.mockImplementation(async()=>new Response(JSON.stringify({...payload,text:'合成完整转写补充'})));
+  const extended=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-7',sessionId:'material-timing-extended'},provider:'openai',allowChunkTimingFallback:true});
+  assert.deepEqual(extended.segments,[{startSeconds:0,endSeconds:30,text:'合成完整转写补充'}]);assert.match(extended.timingWarning!,/完整正文延伸.*整段音轨/);
+  for(const conflict of [
+    {...payload,text:'合成',segments:[{start:0,end:32.64,text:'合成完整转写'}]},
+    {...payload,text:'合成全文',segments:[{start:0,end:32.64,text:'另一份分段'}]},
+  ]){
+    network.mock.mockImplementation(async()=>new Response(JSON.stringify(conflict)));
+    await assert.rejects(
+      provider.transcribeRecordingChunk({audio,context:{caseId:'case-7',sessionId:`invalid-content-${conflict.text}`},provider:'openai',allowChunkTimingFallback:true}),
+      (error:unknown)=>error instanceof provider.RecordingTranscriptionError&&error.code==='RECORDING_RESPONSE_INVALID'&&/完整正文与逐句分段不一致/.test(error.message),
+    );
+  }
+  assert(getUsageSummary('org-demo','case-7',true).records.some(record=>record.status==='settled'));
   for(const invalid of [{...payload,duration:90},{...payload,text:''},{...payload,text:'长'.repeat(4001)},{...payload,segments:[{start:-1,end:2,text:'bad'}]},{...payload,segments:[{start:2,end:1,text:'bad'}]}]){
     network.mock.mockImplementation(async()=>new Response(JSON.stringify(invalid)));
     await assert.rejects(provider.transcribeRecordingChunk({audio,context:{caseId:'case-6',sessionId:'invalid-fallback'},provider:'openai',allowChunkTimingFallback:true}));
   }
+});
+
+test('partial Whisper segments cannot silently discard the complete transcript',async t=>{
+  restoreEnv(t,['RECORDING_PROVIDER','OPENAI_API_KEY','RECORDING_TRANSCRIPTION_MODEL']);
+  Object.assign(process.env,{RECORDING_PROVIDER:'openai',OPENAI_API_KEY:'synthetic-test-key',RECORDING_TRANSCRIPTION_MODEL:'whisper-1'});
+  const provider=await providerPromise,audio=await wav(10);
+  const partial={duration:10,text:'前半段，后半段。',segments:[{start:0,end:4,text:'前半段'}]};
+  const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify(partial)));
+
+  await assert.rejects(
+    provider.transcribeRecordingChunk({audio,context:{caseId:'case-8',sessionId:'partial-strict'},provider:'openai'}),
+    (error:unknown)=>error instanceof provider.RecordingTranscriptionError&&error.code==='RECORDING_RESPONSE_INVALID',
+  );
+
+  const materialResult=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-9',sessionId:'partial-material'},provider:'openai',allowChunkTimingFallback:true});
+  assert.deepEqual(materialResult.segments,[{startSeconds:0,endSeconds:10,text:'前半段，后半段。'}]);
+  assert.match(materialResult.timingWarning!,/完整正文.*逐句分段.*整段音轨/);
+
+  network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:10,text:'前半段， 后半段。',segments:[{start:0,end:4,text:'前半段'},{start:4,end:9,text:'后半段'}]})));
+  const formattingOnly=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-10',sessionId:'format-equivalent'},provider:'openai'});
+  assert.equal(formattingOnly.timingWarning,undefined);
+  assert.deepEqual(formattingOnly.segments,[{startSeconds:0,endSeconds:4,text:'前半段'},{startSeconds:4,endSeconds:9,text:'后半段'}]);
+
+  for(const [text,segmentText] of [['金额 1.5 万','金额 15 万'],['开始时间 12:30','开始时间 1230'],['编号 1 2','编号 12']]){
+    network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:10,text,segments:[{start:0,end:9,text:segmentText}]})));
+    await assert.rejects(
+      provider.transcribeRecordingChunk({audio,context:{caseId:'case-12',sessionId:`numeric-${text}`},provider:'openai',allowChunkTimingFallback:true}),
+      (error:unknown)=>error instanceof provider.RecordingTranscriptionError&&error.code==='RECORDING_RESPONSE_INVALID',
+    );
+  }
+
+  network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:10,text:'另一份正文',segments:[{start:0,end:4,text:'逐句正文'}]})));
+  await assert.rejects(
+    provider.transcribeRecordingChunk({audio,context:{caseId:'case-11',sessionId:'conflicting-material'},provider:'openai',allowChunkTimingFallback:true}),
+    (error:unknown)=>error instanceof provider.RecordingTranscriptionError&&error.code==='RECORDING_RESPONSE_INVALID',
+  );
+
+  const longWhitespace=`前${' '.repeat(190_000)}后`;
+  network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:10,text:longWhitespace,segments:[{start:0,end:9,text:'前后'}]})));
+  const longFormattingOnly=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-12',sessionId:'long-whitespace'},provider:'openai'});
+  assert.deepEqual(longFormattingOnly.segments,[{startSeconds:0,endSeconds:9,text:'前后'}]);
 });
 
 test('Whisper empty segments are ignored and optional segments retain full-chunk provenance',async t=>{
@@ -123,5 +190,6 @@ test('Whisper empty segments are ignored and optional segments retain full-chunk
   const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({duration:1,text:'合成',segments:[{start:0,end:0,text:' '},{start:0,end:1,text:'合成'}]})));
   let result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'empty-segment'},provider:'openai'});assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:1,text:'合成'}]);
   network.mock.mockImplementation(async()=>new Response(JSON.stringify({duration:1,text:'合成'})));
-  result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'optional-segments'},provider:'openai'});assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:1,text:'合成'}]);
+  result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'optional-segments'},provider:'openai'});assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:1,text:'合成'}]);assert.equal(result.timingWarning,undefined);
+  result=await provider.transcribeRecordingChunk({audio,context:{caseId:'case-1',sessionId:'optional-segments-material'},provider:'openai',allowChunkTimingFallback:true});assert.deepEqual(result.segments,[{startSeconds:0,endSeconds:1,text:'合成'}]);assert.match(result.timingWarning!,/仅定位到整段音轨/);
 });

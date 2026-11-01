@@ -57,6 +57,13 @@ test('invalid completed output still settles provider usage before rejecting the
   const row=calls().at(-1)!;assert.equal(row.status,'settled');assert(row.actual_micros>0);
 });
 
+test('video recovery image requests distinguish visible subtitles from inferred speech',async t=>{
+  let body='';
+  t.mock.method(globalThis,'fetch',async(_url:unknown,options?:RequestInit)=>{body=String(options?.body);return response();});
+  await extractMaterialImage({image,mimeType:'image/png',context,provider:'openai',purpose:'video_gap'});
+  assert.match(body,/字幕/);assert.match(body,/不要推测前后句/);assert.match(body,/不要声称识别了声音/);
+});
+
 test('incomplete final response settles known usage but does not return partial text',async t=>{
   t.mock.method(globalThis,'fetch',async()=>response({status:'incomplete'}));
   await assert.rejects(()=>extractMaterialImage({image,mimeType:'image/png',context,provider:'openai'}),/没有完整完成/);
