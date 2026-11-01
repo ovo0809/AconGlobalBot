@@ -3,6 +3,7 @@ import { messageSource } from './domain';
 import { analysisProviderConfig, requireAnalysisConfig, realtimeVoiceConfig, type CloudModelConfig } from './provider-config';
 import { INTERVIEW_SCHEMA, interviewSystemPrompt, validateInterviewTurn, type InterviewInput, type InterviewTurn } from './interview';
 import { beginUsage, completeUsage, recordUsage, type UsageContext } from './ai-usage';
+import { recordUsageCompletion } from './usage-reconciliation';
 import { formatKnowledgePrompt, validateKnowledgeRefs, type KnowledgeContext } from './knowledge';
 
 export interface ProviderAnalysisInput {
@@ -252,6 +253,8 @@ async function structuredRequest(config:CloudModelConfig,prompt:string,schema:un
         if(!response.ok)throw new Error(`OpenAI request failed with HTTP ${response.status}.`);
         payload=await response.json();
         recordUsage(reservation.id,payload.id||reservation.id,'responses',payload.usage,payload.id);
+        if(!['completed','incomplete','failed','cancelled'].includes(payload.status??''))throw new Error('OpenAI response has no final usage boundary.');
+        recordUsageCompletion(reservation.id,'settled');
         completeUsage(reservation.id,'settled');
         metered=true;
       }finally{
@@ -308,7 +311,7 @@ function extractionValidationCategory(error:unknown):ExtractionValidationCategor
 export async function interviewWithProvider(input:InterviewInput,finalize=false):Promise<InterviewTurn|null>{
   const config=requireAnalysisConfig();
   if(!config) return null;
-  const purpose=finalize?'The conversation is ended. Extract only newly supported facts from the final transcript. Do not ask another question. Set reply to "访谈已保存。". Do not change existing facts except a sourced contradiction or its new explicit clarification.':'Respond to the latest customer turn. Extract only new explicitly supported facts and choose the next single relevant question, considering all known facts and conversation context.';
+  const purpose=finalize?'The conversation is ended. Extract only newly supported facts from the final transcript. Do not ask another question. Set reply to "访谈已保存。". Do not change existing facts except a sourced contradiction or its new explicit clarification.':'Understand the latest answer across all supported topics before replying. Extract all newly supported facts, then briefly acknowledge its meaning and ask only the single most useful missing question OR summarize and offer to finish under the conversation policy. Never ask a new question merely because a field is empty. Preserve approximate answers and unanswered issues for advisor review.';
   // Final fact extraction never receives reference files: only the customer's final transcript.
   const extractionInput=finalize?{...input,knowledge:undefined}:input;
   const prompt=`${interviewSystemPrompt(extractionInput)}\n\n${purpose}\nFor numeric facts, the cited statement must contain exactly one plain Arabic numeric value, plus an unambiguous currency and period for money. Do not convert Chinese number words, magnitude abbreviations, or statements with several numbers; omit an unsupported numeric fact and preserve its original transcript for clarification. Copy string values verbatim, including the original simplified/traditional characters; do not paraphrase. unknown/declined require an explicit matching statement, not merely an omitted amount or undecided budget. If a strict validation fails, do not guess or add facts.`;

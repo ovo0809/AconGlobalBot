@@ -26,6 +26,7 @@ export default defineConfig({
       MAIL_MODE: 'dry_run',
       LLM_PROVIDER: 'mock',
       VOICE_PROVIDER: 'mock',
+      RECORDING_PROVIDER: 'mock',
       KNOWLEDGE_REMOTE: 'off',
       KNOWLEDGE_LOCAL_DIR: './tests/fixtures/knowledge',
     },

@@ -1,5 +1,6 @@
 'use client';
 import type { KnowledgeContext } from './knowledge';
+import type { Message } from './domain';
 
 export type BrowserVoiceState = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'reconnecting' | 'paused' | 'ended' | 'error';
 
@@ -7,7 +8,7 @@ export interface BrowserVoiceOptions {
   csrf: string;
   onState?: (state: BrowserVoiceState) => void;
   onInterim?: (event: { role: 'user' | 'assistant'; text: string }) => void;
-  onFinal?: (event: { role: 'user' | 'assistant'; text: string; interrupted: boolean; knowledge?:KnowledgeContext }) => void;
+  onFinal?: (event: { role: 'user' | 'assistant'; text: string; interrupted: boolean; knowledge?:KnowledgeContext; responseStatus?:Message['responseStatus'] }) => void;
   onError?: (message: string) => void;
   onInterrupted?: () => void;
   onMicPermission?: (granted: boolean) => void;
@@ -16,10 +17,11 @@ export interface BrowserVoiceOptions {
 
 type ServerEvent =
   | { type: 'ready'; inputSampleRate?: number; outputSampleRate?: number }
-  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean; knowledge?:KnowledgeContext }
-  | { type: 'audio'; data: string; mimeType: string; itemId?: string }
+  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean; knowledge?:KnowledgeContext; responseStatus?:Message['responseStatus'] }
+  | { type: 'audio'; data: string; mimeType: string; itemId?: string; responseId?: string }
   | { type: 'interrupted'; itemId?: string }
-  | { type: 'turnComplete' | 'ending' | 'reconnecting' }
+  | { type: 'turnComplete'; responseId?: string }
+  | { type: 'ending' | 'reconnecting' }
   | { type: 'closed'; retryable?: boolean }
   | { type: 'unavailable' | 'error'; message: string; code?: string; retryable?: boolean };
 
@@ -61,10 +63,12 @@ export class BrowserVoiceClient {
   private playbackCursor = 0;
   private playbackQueue:Promise<void>=Promise.resolve();
   private playbackGeneration=0;
+  private pendingPlaybackChunks=0;
+  private outputComplete=false;
   private inputSampleRate = 16_000;
   private outputSampleRate = 24_000;
   private outputItemId: string | null = null;
-  private outputStartedAt = 0;
+  private outputResponseId: string | null = null;
   private outputStartedAtContext:number|null=null;
   private outputReceivedMs = 0;
   private currentAudio: string[] = [];
@@ -224,27 +228,47 @@ export class BrowserVoiceClient {
       this.setState('listening');
     }
     else if (event.type === 'transcript') {
-      if (event.final) this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted),...(event.role==='assistant'&&event.knowledge?{knowledge:event.knowledge}:{}) });
+      if (event.final) this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted),...(event.role==='assistant'&&event.knowledge?{knowledge:event.knowledge}:{}),...(event.role==='assistant'&&event.responseStatus?{responseStatus:event.responseStatus}:{}) });
       else this.options.onInterim?.({ role: event.role, text: event.text });
-      if (event.role === 'user') this.setState(event.final ? 'thinking' : 'listening');
+      if (event.role === 'user' && !this.pendingPlaybackChunks && !this.playbackSources.size) this.setState(event.final ? 'thinking' : 'listening');
     } else if (event.type === 'audio') {
       if (!this.intentionallyClosed) {
-        if(event.itemId&&event.itemId!==this.outputItemId){this.outputItemId=event.itemId;this.outputStartedAt=Date.now();this.outputStartedAtContext=null;this.outputReceivedMs=0;}
+        if(event.responseId&&this.outputResponseId&&event.responseId!==this.outputResponseId)this.currentAudio=[];
+        if(event.itemId&&event.itemId!==this.outputItemId){this.outputItemId=event.itemId;this.outputResponseId=event.responseId??null;this.outputStartedAtContext=null;this.outputReceivedMs=0;}
+        if(event.responseId)this.outputResponseId=event.responseId;
+        this.outputComplete=false;
         this.outputReceivedMs+=this.pcmDurationMs(event.data);
         this.currentAudio.push(event.data); this.setState('speaking');
         const generation=this.playbackGeneration;
-        this.playbackQueue=this.playbackQueue.then(()=>this.playPcm(event.data,generation));
+        const itemId=this.outputItemId;
+        this.pendingPlaybackChunks+=1;
+        this.playbackQueue=this.playbackQueue.then(()=>this.playPcm(event.data,generation,itemId)).catch(()=>{
+          if(generation===this.playbackGeneration)this.terminalError('音频播放未完成，请重新开始语音或使用文字继续。');
+        }).finally(()=>{
+          if(generation!==this.playbackGeneration)return;
+          this.pendingPlaybackChunks-=1;
+          this.finishPlaybackIfReady();
+        });
       }
     }
     else if (event.type === 'interrupted') {
+      // A delayed interruption for an older item must not discard a newer reply.
+      if(event.itemId&&event.itemId!==this.outputItemId)return;
       const itemId=event.itemId||this.outputItemId;
-      const contextPlayed=this.playbackContext&&this.outputStartedAtContext!==null?(this.playbackContext.currentTime-this.outputStartedAtContext)*1_000:Date.now()-this.outputStartedAt;
+      const contextPlayed=this.playbackContext&&this.outputStartedAtContext!==null?(this.playbackContext.currentTime-this.outputStartedAtContext)*1_000:0;
       const playedMs=Math.max(0,Math.min(this.outputReceivedMs,contextPlayed));
       this.stopPlayback();this.currentAudio=[];
       if(itemId&&this.socket?.readyState===WebSocket.OPEN)this.socket.send(JSON.stringify({truncate:{itemId,audioEndMs:Math.round(playedMs)}}));
       this.outputItemId=null;this.outputReceivedMs=0;this.options.onInterrupted?.();this.setState('listening');
     }
-    else if (event.type === 'turnComplete') { if (this.currentAudio.length) this.lastAudio = [...this.currentAudio]; this.currentAudio = []; this.outputItemId=null;this.outputStartedAtContext=null;this.outputReceivedMs=0;this.setState('listening'); }
+    else if (event.type === 'turnComplete') {
+      if(event.responseId&&this.outputResponseId&&event.responseId!==this.outputResponseId)return;
+      if (this.currentAudio.length) this.lastAudio = [...this.currentAudio];
+      this.currentAudio = [];
+      // The provider has finished sending. Queued PCM can still be audible.
+      this.outputComplete=true;
+      this.finishPlaybackIfReady();
+    }
     else if (event.type === 'reconnecting') { this.stopPlayback(); this.setState('reconnecting'); }
     else if (event.type === 'ending' && !this.intentionallyClosed) void this.stopAll();
     else if (event.type === 'unavailable' || event.type === 'error') {
@@ -252,11 +276,20 @@ export class BrowserVoiceClient {
     }
   }
 
-  private async playPcm(encoded: string,generation=this.playbackGeneration) {
+  private finishPlaybackIfReady() {
+    if(!this.outputComplete||this.pendingPlaybackChunks||this.playbackSources.size)return;
+    this.outputComplete=false;
+    this.outputItemId=null;this.outputResponseId=null;this.outputStartedAtContext=null;this.outputReceivedMs=0;
+    if(['speaking','thinking','listening'].includes(this.voiceState))this.setState('listening');
+  }
+
+  private async playPcm(encoded: string,generation=this.playbackGeneration,itemId=this.outputItemId) {
+    if(generation!==this.playbackGeneration)return;
     if (!this.playbackContext) this.playbackContext = new AudioContext({ sampleRate: this.outputSampleRate, latencyHint: 'interactive' });
     await this.playbackContext.resume();
     if(generation!==this.playbackGeneration)return;
     const pcm = base64ToInt16(encoded);
+    if(!pcm.length)return;
     const buffer = this.playbackContext.createBuffer(1, pcm.length, this.outputSampleRate);
     const output = buffer.getChannelData(0);
     for (let index = 0; index < pcm.length; index += 1) output[index] = pcm[index] / (pcm[index] < 0 ? 0x8000 : 0x7fff);
@@ -264,11 +297,15 @@ export class BrowserVoiceClient {
     source.buffer = buffer;
     source.connect(this.playbackContext.destination);
     this.playbackCursor = Math.max(this.playbackContext.currentTime, this.playbackCursor);
-    if(this.outputStartedAtContext===null)this.outputStartedAtContext=this.playbackCursor;
+    if(itemId===this.outputItemId&&this.outputStartedAtContext===null)this.outputStartedAtContext=this.playbackCursor;
     source.start(this.playbackCursor);
     this.playbackCursor += buffer.duration;
     this.playbackSources.add(source);
-    source.onended = () => this.playbackSources.delete(source);
+    source.onended = () => {
+      this.playbackSources.delete(source);
+      source.disconnect();
+      if(generation===this.playbackGeneration)this.finishPlaybackIfReady();
+    };
   }
 
   private pcmDurationMs(encoded:string){
@@ -285,7 +322,12 @@ export class BrowserVoiceClient {
     return true;
   }
   setMuted(muted: boolean) { this.isMuted = muted; for (const track of this.stream?.getAudioTracks() || []) track.enabled = !muted; }
-  stopPlayback() { this.playbackGeneration+=1;this.playbackQueue=Promise.resolve();for (const source of this.playbackSources) { try { source.stop(); } catch {} } this.playbackSources.clear(); this.playbackCursor = this.playbackContext?.currentTime || 0; }
+  stopPlayback() {
+    this.playbackGeneration+=1;this.playbackQueue=Promise.resolve();this.pendingPlaybackChunks=0;this.outputComplete=false;
+    for (const source of this.playbackSources) { try { source.stop(); } catch {} }
+    this.playbackSources.clear();this.playbackCursor=this.playbackContext?.currentTime||0;
+    this.currentAudio=[];this.outputItemId=null;this.outputResponseId=null;this.outputStartedAtContext=null;this.outputReceivedMs=0;
+  }
   async replayLast() { this.stopPlayback();const generation=this.playbackGeneration;for (const chunk of this.lastAudio) await this.playPcm(chunk,generation); }
   async pause() { if (this.voiceState === 'paused' || this.voiceState === 'ended') return; this.paused = true; await this.closeResources(false); this.setState('paused'); }
   async resume() {

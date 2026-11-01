@@ -1,5 +1,13 @@
 import type { KnowledgeContext, KnowledgeSource } from './knowledge';
 
+/** Internal views only. The endpoint separately checks the signed-in owner. */
+export function safeMaterialSourceUrl(source:KnowledgeSource):string|null {
+  if(!/^[a-f0-9]{64}$/.test(source.revision))return null;
+  const id=source.path.match(/^uploads\/([a-f0-9-]{36})\//)?.[1];if(!id)return null;
+  const expected=`/api/materials?id=${id}&revision=${source.revision}`;
+  return source.url===expected||source.url.startsWith(`${expected}#L`)?expected:null;
+}
+
 /** Public customer responses may expose only this repository's pinned public files. */
 export function safeKnowledgeUrl(source: KnowledgeSource): string | null {
   try {

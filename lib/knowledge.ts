@@ -383,9 +383,13 @@ function chunks(document: KnowledgeDocument): KnowledgeSource[] {
 }
 
 export function selectKnowledgeSources(documents: KnowledgeDocument[], query: string): KnowledgeSource[] {
+  return rankKnowledgeSources(documents.flatMap(chunks),query);
+}
+
+export function rankKnowledgeSources(sources:KnowledgeSource[],query:string):KnowledgeSource[] {
   const queryTerms = terms(query);
   if (!queryTerms.size) return [];
-  const ranked = documents.flatMap(chunks).map((source) => {
+  const ranked = sources.map((source) => {
     const bodyTerms = terms(`${source.title} ${source.path} ${source.excerpt}`);
     let matches = 0;
     for (const term of queryTerms) if (bodyTerms.has(term)) matches += term.length > 2 ? 2 : 1;

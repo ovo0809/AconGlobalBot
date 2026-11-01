@@ -95,7 +95,8 @@ test('deterministic turn prioritizes contradictions, naturally rephrases unheard
   const unheard = nextInterviewTurn(input('life', [], [message('assistant-goal', 'assistant', INTERVIEW_QUESTIONS.goal)]));
   assert.equal(unheard.targetKey, 'goal');
   assert.equal(unheard.reason, 'clarify');
-  assert.match(unheard.reply, /可能没有听清/);
+  assert.match(unheard.reply, /主要目标/);
+  assert.doesNotMatch(unheard.reply, /goal|可能没有听清/);
 
   const completeFacts = Object.keys(INTERVIEW_QUESTIONS).map((key, index) => fact(key, null, index % 2 ? 'unknown' : 'declined', [`source-${key}`]));
   const completeMessages = completeFacts.map((item) => message(item.sourceMessageIds[0], 'user', item.factStatus === 'unknown' ? '不知道' : '不愿提供'));
@@ -141,7 +142,7 @@ test('accepts explicit traditional unknown and declined evidence but rejects uns
   const messages = [
     message('traditional-unknown', 'user', '這個我不曉得，需要補充資料'),
     message('traditional-declined', 'user', '這項我不願提供，先跳過'),
-    message('no-status-evidence', 'user', '預算還沒有決定'),
+    message('no-status-evidence', 'user', '預算希望再討論'),
   ];
   const accepted = validateInterviewTurn({
     reply: '谢谢。接下来想了解您的退休计划。',

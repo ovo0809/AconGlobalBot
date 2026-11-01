@@ -12,6 +12,8 @@
     "lint": "eslint .",
     "test": "tsx --test tests/*.test.ts",
     "test:e2e": "playwright test",
+    "share:demo": "tsx scripts/share-demo.ts",
+    "share:live": "tsx scripts/share-live.ts",
     "backup": "tsx scripts/backup.ts",
     "restore": "tsx scripts/restore.ts"
   },

@@ -29,12 +29,12 @@ async function expectUsageHidden(page:Page) {
   await expect(page.getByText(/总 token|其中音频|占用 \$0\.76/)).toHaveCount(0);
 }
 
-test('顾问桌面案例只显示四个业务标签，不展示费用账本',async({page})=>{
+test('顾问桌面案例显示会谈录音业务标签，不展示费用账本',async({page})=>{
   await stubBootstrap(page,advisorBootstrap());
   await page.goto('/');
   const tabs=page.getByRole('navigation',{name:'案例详情'}).getByRole('button');
-  await expect(tabs).toHaveCount(4);
-  await expect(tabs).toHaveText(['访谈记录','画像与来源','内部报告','通知预览']);
+  await expect(tabs).toHaveCount(5);
+  await expect(tabs).toHaveText(['访谈记录','画像与来源','内部报告','通知预览','会谈录音']);
   await expectUsageHidden(page);
 });
 
@@ -43,7 +43,7 @@ test('390px 顾问案例不展示费用入口或 token 明细',async({page})=>{
   await page.setViewportSize({width:390,height:844});
   await page.goto('/');
   await page.getByRole('button',{name:/王芳 · 合成客户/}).click();
-  await expect(page.getByRole('navigation',{name:'案例详情'}).getByRole('button')).toHaveCount(4);
+  await expect(page.getByRole('navigation',{name:'案例详情'}).getByRole('button')).toHaveCount(5);
   await expectUsageHidden(page);
 });
 

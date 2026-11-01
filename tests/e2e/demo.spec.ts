@@ -65,7 +65,7 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   expect(restricted).toEqual({ mode: 'client', user: null, clients: 0, facts: 0, reports: 0, reportStatus: 403 });
 
   await page.getByRole('button', { name: /人寿/ }).click();
-  await expect(page.getByText('您最希望解决什么问题？大约计划什么时候开始？')).toBeVisible();
+  await expect(page.getByText('这次最想先解决哪件事？您可以从最在意的地方说起。')).toBeVisible();
   await expect(page.getByText('模拟界面 · 未调用实时语音服务')).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
@@ -92,7 +92,7 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   await expect(page.getByText('回答已保存，云端回复未完成')).toHaveCount(0);
   expect(messageEventIds).toHaveLength(2);
   expect(messageEventIds[1]).toBe(messageEventIds[0]);
-  await expect(page.getByText('哪些家人依赖您的收入？如果收入停止，家庭有哪些责任？')).toBeVisible();
+  await expect(page.getByText('如果您的收入暂时停下来，家里最需要照顾的是谁、哪些开销？')).toBeVisible();
   await page.getByRole('button', { name: '暂停访谈' }).click();
   await expect(page.getByText('访谈已暂停', { exact: true })).toBeVisible();
   await page.reload();
