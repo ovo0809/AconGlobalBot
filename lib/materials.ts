@@ -50,14 +50,16 @@ function requireReviewer(user:User){requireMaterial(user.role==='reviewer'&&user
 function ownerDocument(materialId:string,user:User):StoredMaterial {
   requireReviewer(user);
   const row=db().prepare(`SELECT m.doc ${materialAccessFrom} WHERE m.id=? AND c.reviewer_id=? AND owner.org_id=? AND uploader.org_id=?`).get(materialId,user.id,user.orgId,user.orgId);
-  requireMaterial(row,404,'资料不存在或无权访问。');return unpack<StoredMaterial>(row.doc);
+  requireMaterial(row,404,'资料不存在或无权访问。');const document=unpack<StoredMaterial>(row.doc);
+  requireMaterial(document.state!=='deleted',404,'资料已删除。');return document;
 }
 function partsFor(materialId:string){return docs<StoredPart>('SELECT doc FROM material_parts WHERE material_id=? ORDER BY position',materialId);}
-export function materialDetail(materialId:string,user:User):MaterialDetail {return {...ownerDocument(materialId,user),parts:partsFor(materialId).map(part=>({kind:part.kind,position:part.position,startSeconds:part.startSeconds,endSeconds:part.endSeconds,state:part.state,text:part.text}))};}
+function detailFromDocument(document:StoredMaterial):MaterialDetail {return {...document,parts:partsFor(document.id).map(part=>({kind:part.kind,position:part.position,startSeconds:part.startSeconds,endSeconds:part.endSeconds,state:part.state,text:part.text}))};}
+export function materialDetail(materialId:string,user:User):MaterialDetail {return detailFromDocument(ownerDocument(materialId,user));}
 function saveDocument(doc:StoredMaterial){doc.updatedAt=now();doc.version++;db().prepare('UPDATE material_documents SET state=?,doc=? WHERE id=?').run(doc.state,pack(doc),doc.id);}
 function event(doc:StoredMaterial,action:string,detail:string){doc.events.push({at:now(),action,detail});}
 function summary(doc:StoredMaterial):MaterialSummary {const {id,title,filename,kind,state,provider,caseId,createdAt,updatedAt,version,error,scope}=doc;return {id,title,filename,kind,state,provider,caseId,createdAt,updatedAt,version,error,scope:scope??'case'};}
-export function listMaterials(user:User){requireReviewer(user);return {items:docs<StoredMaterial>(`SELECT m.doc ${materialAccessFrom} WHERE c.reviewer_id=? AND owner.org_id=? AND uploader.org_id=? ORDER BY m.rowid DESC LIMIT 60`,user.id,user.orgId,user.orgId).map(summary),...materialProviderConfig()};}
+export function listMaterials(user:User){requireReviewer(user);return {items:docs<StoredMaterial>(`SELECT m.doc ${materialAccessFrom} WHERE c.reviewer_id=? AND owner.org_id=? AND uploader.org_id=? AND m.state!='deleted' ORDER BY m.rowid DESC LIMIT 60`,user.id,user.orgId,user.orgId).map(summary),...materialProviderConfig()};}
 
 async function readBounded(request:Request,max:number){
   const length=Number(request.headers.get('content-length')||0);requireMaterial(Number.isFinite(length)&&length<=max,413,'上传内容超过大小限制。');
@@ -115,14 +117,15 @@ async function upload(request:Request,user:User,checkCase:(caseId:string)=>void)
     const previous=db().prepare("SELECT id,owner_id,case_id,original,doc FROM material_documents WHERE json_extract(doc,'$.importSource.jobId')=? AND json_extract(doc,'$.importSource.index')=?").get(source.jobId,source.index);
     if(previous){
       const prior=unpack<StoredMaterial>(previous.doc);
+      requireMaterial(prior.state!=='deleted',409,'该视频分段资料已删除，请新建大视频任务后重新上传。');
       requireMaterial(previous.owner_id===user.id&&previous.case_id===input.caseId&&hash(new Uint8Array(previous.original as Uint8Array))===hash(input.original)&&prior.importSource?.sourceHash===source.sourceHash,409,'已提交的视频来源不一致，请核对原任务。');
       // A lost response may require preparing JPEG/WAV again. The verified source
       // segment identifies the existing material; derived bytes must not requeue it.
       return json(materialDetail(String(previous.id),user));
     }
   }
-  const existing=db().prepare('SELECT id,fingerprint FROM material_documents WHERE owner_id=? AND request_id=?').get(user.id,input.requestId);
-  if(existing){requireMaterial(existing.fingerprint===input.fingerprint,409,'同一上传编号的内容已改变，请重新上传。');return json(materialDetail(String(existing.id),user));}
+  const existing=db().prepare('SELECT id,fingerprint,state FROM material_documents WHERE owner_id=? AND request_id=?').get(user.id,input.requestId);
+  if(existing){requireMaterial(existing.state!=='deleted',409,'该上传编号对应的资料已删除，请重新选择文件后上传。');requireMaterial(existing.fingerprint===input.fingerprint,409,'同一上传编号的内容已改变，请重新上传。');return json(materialDetail(String(existing.id),user));}
   const config=materialProviderConfig();requireMaterial(config.configured,409,'资料识别需要完整的 OpenAI 配置，或明确选择模拟模式。');
   if(input.kind==='video'){const audio=recordingProviderConfig();requireMaterial(audio.configured&&audio.provider===config.provider,409,'视频声音转写与图片识别的服务配置不一致。');}
   const stamp=now(),document:StoredMaterial={id:id(),title:input.title,filename:input.filename,kind:input.kind,state:'queued',provider:config.provider,caseId:input.caseId,createdAt:stamp,updatedAt:stamp,version:1,error:null,sourceNote:input.sourceNote,originalText:'',reviewedText:'',coverage:input.coverage,events:[{at:stamp,action:'uploaded',detail:`已上传；${config.provider==='mock'?'模拟处理，不代表真实识别':'使用已配置的 OpenAI 云端处理'}；未复核，不供 AI 参考。`}]};
@@ -142,8 +145,16 @@ function editMaterial(user:User,input:Record<string,unknown>){
   return transaction(()=>{
     const document=ownerDocument(cleanText(input.id,100,'资料编号'),user);requireMaterial(input.version===document.version,409,'资料已更新，请刷新后再操作。');
     const action=input.action,note=cleanText(input.note??'',2000,'复核备注');
-    requireMaterial(!['queued','processing'].includes(document.state),409,'资料仍在处理，请等待完成。');
-    if(action==='retry'){
+    if(action!=='delete')requireMaterial(!['queued','processing'].includes(document.state),409,'资料仍在处理，请等待完成。');
+    if(action==='delete'){
+      requireMaterial(document.state!=='processing',409,'资料正在提取，请等待完成后再删除。');
+      requireMaterial(input.confirmed===true,400,'请确认删除这份资料。');
+      if(document.importSource?.jobId){
+        const row=db().prepare('SELECT state FROM material_import_jobs WHERE id=?').get(document.importSource.jobId);
+        requireMaterial(!row||!['uploading','queued','preparing','ready'].includes(String(row.state)),409,'关联的大视频任务尚未结束，请先停止或完成任务。');
+      }
+      document.state='deleted';event(document,'deleted',`已从资料处理列表移除，停止后续 AI 检索；原文件、处理记录、历史报告和费用记录保留。${note}`);
+    } else if(action==='retry'){
       requireMaterial(document.state==='failed',409,'仅失败的资料可以重试。');requireMaterial(document.events.filter(row=>row.action==='retry').length<3,409,'已达到重试次数，请核对失败原因。');
       requireMaterial(materialProviderConfig().configured&&materialProviderConfig().provider===document.provider,409,'处理服务配置已改变，请恢复原配置。');
       db().prepare("UPDATE material_parts SET state='queued' WHERE material_id=? AND state='processing'").run(document.id);document.state='queued';document.error=null;event(document,'retry','人工重试未完成分段，已完成结果保留；不清除历史用量或未确认预留。');
@@ -161,7 +172,7 @@ function editMaterial(user:User,input:Record<string,unknown>){
         db().prepare('INSERT INTO material_versions VALUES(?,?,?)').run(document.id,revision,pack(snapshot));document.state='approved';event(document,'approved',`由 ${user.name} 复核；${document.scope==='organization'?'已明确确认为不含客户个人信息的通用资料，供本公司所有顾问案例参考（不含外部共享测试账号）':'仅关联案例可参考'}。${note}`);
       } else {document.state='needs_review';event(document,'saved',`已保存修订，须重新复核后才能参考。${note}`);}
     } else throw new MaterialError(400,'不支持的资料操作。');
-    saveDocument(document);audit(user.id,document.caseId,`material.${String(action)}`,{materialId:document.id,version:document.version});return materialDetail(document.id,user);
+    saveDocument(document);audit(user.id,document.caseId,`material.${String(action)}`,{materialId:document.id,version:document.version});return action==='delete'?detailFromDocument(document):materialDetail(document.id,user);
   });
 }
 
@@ -198,7 +209,7 @@ export async function handleMaterialRequest(request:Request,user:User,checkCase:
   requireMaterial(request.method==='POST',405,'请求方法不支持。');
   if(request.headers.get('content-type')?.startsWith('multipart/form-data'))return upload(request,user,checkCase);
   const body=await readBounded(request,100_000);let input:Record<string,unknown>;try{input=JSON.parse(body.toString('utf8'));}catch{throw new MaterialError(400,'请求内容无效。');}requireMaterial(input&&typeof input==='object'&&!Array.isArray(input),400,'请求内容无效。');
-  const document=ownerDocument(cleanText(input.id,100,'资料编号'),user);if(input.action!=='withdraw')checkCase(document.caseId);return json(editMaterial(user,input));
+  const document=ownerDocument(cleanText(input.id,100,'资料编号'),user);if(input.action!=='withdraw'&&input.action!=='delete')checkCase(document.caseId);return json(editMaterial(user,input));
 }
 
 /** Never replay an uncertain network request automatically on restart. */

@@ -1,5 +1,5 @@
 import type { MaterialImportSource } from './material-import-types';
-export type MaterialState = 'queued'|'processing'|'needs_review'|'approved'|'failed'|'withdrawn';
+export type MaterialState = 'queued'|'processing'|'needs_review'|'approved'|'failed'|'withdrawn'|'deleted';
 export type MaterialProvider = 'mock'|'openai';
 export interface MaterialSummary {
   id:string; title:string; filename:string; kind:'image'|'video'; state:MaterialState;

@@ -12,6 +12,54 @@ test.beforeAll(()=>mkdirSync(screenshotDirectory,{recursive:true}));
 
 function bootstrap(){return{csrf:'material-csrf',mode:'advisor',user:reviewer,clients:[],cases:[caseRecord],deletedCases:[],activeCase:caseRecord,messages:[],facts:[],reports:[],notifications:[],reviews:[],settings:{companyEmail:'company@example.invalid',companyVerified:true,unreviewedSendPolicy:'pending',mailMode:'dry_run'},capabilities:{analysis:'mock',interview:'mock',voice:'mock',voiceConfigured:false,mail:'dry-run'},demo:true,publicAccess:false,sharedDemo:false};}
 
+for(const width of [1440,390]){
+  test(`material deletion confirms, cancels, clears selection and stays removed at ${width}px`,async({page})=>{
+    const item={id:'delete-material',title:'不再需要的长期护理培训资料',filename:'poster.png',kind:'image',state:'approved',provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version:3,error:null,scope:'organization'};
+    const processing={...item,id:'processing-material',title:'正在提取的视频',state:'processing',kind:'video'};
+    const detail={...item,sourceNote:'合成测试',originalText:'合成提取稿',reviewedText:'合成复核稿',coverage:'图片',events:[],parts:[]};
+    let deleted=false,deleteCalls=0;
+    await page.route('**/api/bootstrap*',route=>route.fulfill({json:bootstrap()}));
+    await page.route('**/api/material-imports*',route=>route.fulfill({json:{available:true,items:[]}}));
+    await page.route('**/api/materials*',route=>{
+      const request=route.request(),url=new URL(request.url());
+      if(request.method()==='POST'){
+        expect(request.postDataJSON()).toEqual({action:'delete',id:item.id,version:3,confirmed:true});
+        expect(request.headers()['x-csrf-token']).toBe('material-csrf');
+        deleted=true;deleteCalls++;return route.fulfill({json:{id:item.id,state:'deleted'}});
+      }
+      if(url.searchParams.get('original')==='1')return route.fulfill({contentType:'image/png',body:png});
+      if(url.searchParams.has('id'))return route.fulfill({json:detail});
+      return route.fulfill({json:{items:deleted?[processing]:[item,processing],provider:'mock',configured:true}});
+    });
+    await page.setViewportSize({width,height:900});await page.goto('/');await page.getByRole('button',{name:'资料库',exact:true}).click();
+    const list=page.getByRole('region',{name:'资料处理列表'}),remove=page.getByRole('button',{name:`删除资料：${item.title}`,exact:true});
+    await expect(page.getByRole('button',{name:`删除资料：${processing.title}`,exact:true})).toBeDisabled();
+    await page.locator('.material-list-open').filter({hasText:item.title}).click();
+    await expect(page.getByRole('heading',{name:item.title,exact:true})).toBeVisible();
+    await remove.click();const dialog=page.getByRole('alertdialog',{name:'删除这份资料？'});
+    await expect(dialog).toContainText('原文件、提取稿和处理记录保留');await expect(dialog.getByRole('button',{name:'取消',exact:true})).toBeFocused();
+    await dialog.getByRole('button',{name:'取消',exact:true}).press('Shift+Tab');await expect(dialog.getByRole('button',{name:'确认删除',exact:true})).toBeFocused();
+    await page.screenshot({path:join(screenshotDirectory,`material-delete-${width}.png`),fullPage:true});
+    await dialog.getByRole('button',{name:'取消',exact:true}).click();expect(deleteCalls).toBe(0);await expect(remove).toBeFocused();
+    await remove.click();await dialog.getByRole('button',{name:'确认删除',exact:true}).click();
+    await expect(dialog).toHaveCount(0);await expect(list).toContainText('1 项');await expect(remove).toHaveCount(0);
+    await expect(page.getByRole('heading',{name:item.title,exact:true})).toHaveCount(0);await expect(page.getByRole('heading',{name:'选择一份资料',exact:true})).toBeVisible();
+    await expect(page.getByRole('status')).toContainText('不再供 AI 后续检索');expect(deleteCalls).toBe(1);
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    await page.reload();await page.getByRole('button',{name:'资料库',exact:true}).click();await expect(remove).toHaveCount(0);await expect(list).toContainText('1 项');
+  });
+}
+
+test('failed material deletion stays visible and displays the server reason in its dialog',async({page})=>{
+  const item={id:'delete-conflict',title:'版本冲突资料',filename:'poster.png',kind:'image',state:'needs_review',provider:'mock',caseId:caseRecord.id,createdAt,updatedAt:createdAt,version:2,error:null};
+  await page.route('**/api/bootstrap*',route=>route.fulfill({json:bootstrap()}));
+  await page.route('**/api/material-imports*',route=>route.fulfill({json:{available:true,items:[]}}));
+  await page.route('**/api/materials*',route=>route.request().method()==='POST'?route.fulfill({status:409,json:{error:'资料已更新，请刷新后再操作。'}}):route.fulfill({json:{items:[item],provider:'mock',configured:true}}));
+  await page.goto('/');await page.getByRole('button',{name:'资料库',exact:true}).click();await page.getByRole('button',{name:'删除资料：版本冲突资料',exact:true}).click();
+  const dialog=page.getByRole('alertdialog');await dialog.getByRole('button',{name:'确认删除',exact:true}).click();await expect(dialog.getByRole('alert')).toHaveText('资料已更新，请刷新后再操作。');
+  await expect(page.getByRole('region',{name:'资料处理列表'})).toContainText('1 项');await dialog.press('Escape');await expect(dialog).toHaveCount(0);await expect(page.getByRole('button',{name:'删除资料：版本冲突资料',exact:true})).toBeEnabled();
+});
+
 for(const fixture of [
   {label:'image',title:'窗口恢复图片草稿',source:'图片来源草稿',name:'focus-poster.png',files:{name:'focus-poster.png',mimeType:'image/png',buffer:png}},
   {label:'video',title:'窗口恢复视频草稿',source:'视频来源草稿',name:'synthetic-audio-video.webm',files:syntheticVideoFixture},
@@ -93,7 +141,7 @@ test('material library remains usable at 390px without horizontal overflow',asyn
   await page.route('**/api/bootstrap*',route=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(bootstrap())}));
   await page.route('**/api/materials*',route=>{const url=new URL(route.request().url());if(url.searchParams.get('original')==='1')return route.fulfill({status:200,contentType:'image/png',body:png});if(url.searchParams.get('id'))return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(detail)});return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({items:[item],provider:'mock',configured:true})});});
   await page.setViewportSize({width:390,height:844});await page.goto('/');await page.getByRole('button',{name:'资料库'}).click();
-  await expect(page.getByRole('heading',{name:'上传参考资料'})).toBeVisible();await page.getByRole('button',{name:/手机复核资料/}).click();await expect(page.getByRole('heading',{name:'手机复核资料'})).toBeVisible();await expect(page.getByRole('region',{name:'视频自动检查'})).toContainText('自动检查完成，未发现明显时间缺口');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);await page.screenshot({path:join(screenshotDirectory,'library-mobile-390.png'),fullPage:true});
+  await expect(page.getByRole('heading',{name:'上传参考资料'})).toBeVisible();await page.locator('.material-list-open').filter({hasText:'手机复核资料'}).click();await expect(page.getByRole('heading',{name:'手机复核资料'})).toBeVisible();await expect(page.getByRole('region',{name:'视频自动检查'})).toContainText('自动检查完成，未发现明显时间缺口');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);await page.screenshot({path:join(screenshotDirectory,'library-mobile-390.png'),fullPage:true});
 });
 
 for(const viewport of [{width:1440,height:900},{width:390,height:844}]){
@@ -102,7 +150,7 @@ for(const viewport of [{width:1440,height:900},{width:390,height:844}]){
     const detail={...item,sourceNote:'合成滚动检查',originalText:'待核对文字',reviewedText:'待核对文字',coverage:'合成图片',events:[{at:createdAt,action:'extracted',detail:'滚动检查记录末尾'}],parts:[]};
     await page.route('**/api/bootstrap*',route=>route.fulfill({json:bootstrap()}));
     await page.route('**/api/materials*',route=>{const url=new URL(route.request().url());if(url.searchParams.get('original')==='1')return route.fulfill({contentType:'image/png',body:png});return route.fulfill({json:url.searchParams.get('id')?detail:{items:[item],provider:'mock',configured:true}});});
-    await page.setViewportSize(viewport);await page.goto('/');await page.getByRole('button',{name:'资料库',exact:true}).click();await page.getByRole('button',{name:/滚动检查资料/}).click();
+    await page.setViewportSize(viewport);await page.goto('/');await page.getByRole('button',{name:'资料库',exact:true}).click();await page.locator('.material-list-open').filter({hasText:'滚动检查资料'}).click();
     const scrollArea=page.locator('.material-scroll, .workspace:not(:has(.material-scroll))');
     const bounds=(await scrollArea.boundingBox())!;
     // Stay in the outer padding so the wheel does not target a textarea.
@@ -158,6 +206,9 @@ test('real isolated materials API allows Charles but hides the library from advi
   await expect(page.getByRole('heading',{name:'真实路由合成海报'})).toBeVisible();await expect(page.getByText('待复核',{exact:true}).first()).toBeVisible({timeout:15_000});
   const review=page.getByLabel('人工复核稿');await expect(review).toHaveValue(/模拟[\s\S]*提取/);await page.getByText('已核对原资料及提取范围').click();await page.getByText('这是通用参考资料，不含客户个人信息，可供公司内所有顾问的案例参考').click();await page.getByRole('button',{name:'复核通过并允许 AI 参考'}).click();
   await expect(page.getByText('资料已复核，之后可供 AI 参考。')).toBeVisible();await expect(page.getByText('公司通用资料',{exact:true})).toBeVisible();await page.getByText('查看处理记录').click();await expect(page.getByText(/画面 0\.0–0\.0 秒/)).toBeVisible();
+  await page.getByRole('button',{name:'删除资料：真实路由合成海报',exact:true}).click();await page.getByRole('alertdialog').getByRole('button',{name:'确认删除',exact:true}).click();
+  await expect(page.getByRole('status')).toContainText('不再供 AI 后续检索');await expect(page.getByRole('heading',{name:'真实路由合成海报'})).toHaveCount(0);
+  await page.reload();await page.getByRole('button',{name:'资料库',exact:true}).click();await expect(page.getByRole('button',{name:'删除资料：真实路由合成海报',exact:true})).toHaveCount(0);
   await page.getByRole('button',{name:'退出'}).click();await page.getByLabel('工作邮箱').fill('advisor1@aeconn.example');await page.getByLabel('密码').fill('AeconnDemo!2026');await page.getByRole('button',{name:'登录工作台'}).click();
   await expect(page.getByRole('button',{name:'退出'})).toBeVisible();
   await expect(page.getByRole('navigation',{name:'主导航'}).getByRole('button',{name:'资料库'})).toHaveCount(0);
