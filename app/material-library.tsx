@@ -11,7 +11,7 @@ import { isSupportedMaterialVideoFile, matchesMaterialImportFile, materialImport
 
 type ListResponse={items:MaterialSummary[];provider:'mock'|'openai';configured:boolean};
 type ImportListResponse={available:boolean;items:MaterialImportJob[]};
-const stateLabels:Record<MaterialSummary['state'],string>={queued:'等待处理',processing:'正在提取',needs_review:'待复核',approved:'已允许参考',failed:'处理失败',withdrawn:'已撤回'};
+const stateLabels:Record<MaterialSummary['state'],string>={queued:'等待处理',processing:'正在提取',needs_review:'待复核',approved:'已允许参考',failed:'处理失败',withdrawn:'已撤回',deleted:'已删除'};
 const stageLabels:Record<MaterialPreparationStage,string>={reading:'正在读取文件',inspecting:'正在检查视频',frames:'正在提取关键画面',audio:'正在整理音轨',ready:'正在上传'};
 const scopeLabels:Record<string,string>={case:'仅关联案例',library:'原顾问通用范围',organization:'公司通用资料'};
 
@@ -33,12 +33,14 @@ export function MaterialLibrary({csrf,cases,activeCaseId}:{csrf:string;cases:Cas
   const [loading,setLoading]=useState(true),[busy,setBusy]=useState(''),[message,setMessage]=useState<{kind:'error'|'success'|'info';text:string}|null>(null);
   const [title,setTitle]=useState(''),[sourceNote,setSourceNote]=useState(''),[caseId,setCaseId]=useState(activeCaseId||cases[0]?.id||''),[consent,setConsent]=useState(false),[file,setFile]=useState<File|null>(null);
   const [reviewedText,setReviewedText]=useState(''),[reviewNote,setReviewNote]=useState(''),[confirmed,setConfirmed]=useState(false),[allowAcrossCases,setAllowAcrossCases]=useState(false);
+  const [deleteTarget,setDeleteTarget]=useState<MaterialSummary|null>(null),[deleteError,setDeleteError]=useState('');
+  const removedIds=useRef(new Set<string>()),deleteDialog=useRef<HTMLElement>(null);
   const fileInput=useRef<HTMLInputElement>(null),uploadAbort=useRef<AbortController|null>(null),uploadRequestId=useRef(''),importRequestId=useRef(''),activeImportId=useRef('');
 
-  const load=useCallback(async()=>{const response=await fetch('/api/materials',{credentials:'same-origin',cache:'no-store'});const result=await responseJson<ListResponse>(response);setLibrary(result);return result;},[]);
+  const load=useCallback(async()=>{const response=await fetch('/api/materials',{credentials:'same-origin',cache:'no-store'});const result=await responseJson<ListResponse>(response);result.items=result.items.filter(item=>!removedIds.current.has(item.id));setLibrary(result);return result;},[]);
   const loadImports=useCallback(async()=>{try{const response=await fetch('/api/material-imports',{credentials:'same-origin',cache:'no-store'});const result=await responseJson<ImportListResponse>(response);setImports(result);setImportLoadError('');return result;}catch(error){setImportLoadError(error instanceof Error?error.message:'无法读取大视频任务，请重试。');throw error;}},[]);
   const importAction=useCallback(async(body:Record<string,unknown>,signal?:AbortSignal)=>{const response=await fetch('/api/material-imports',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify(body),signal});return responseJson<MaterialImportJob>(response);},[csrf]);
-  const open=useCallback(async(id:string)=>{setBusy('detail');try{const response=await fetch(`/api/materials?id=${encodeURIComponent(id)}`,{credentials:'same-origin',cache:'no-store'}),detail=await responseJson<MaterialDetail>(response);setSelected(detail);setReviewedText(detail.reviewedText||detail.originalText);setReviewNote('');setConfirmed(false);setAllowAcrossCases(false);}catch(error){setMessage({kind:'error',text:error instanceof Error?error.message:'无法读取资料。'});}finally{setBusy('');}},[]);
+  const open=useCallback(async(id:string)=>{setBusy('detail');try{const response=await fetch(`/api/materials?id=${encodeURIComponent(id)}`,{credentials:'same-origin',cache:'no-store'}),detail=await responseJson<MaterialDetail>(response);if(removedIds.current.has(id))return;setSelected(detail);setReviewedText(detail.reviewedText||detail.originalText);setReviewNote('');setConfirmed(false);setAllowAcrossCases(false);}catch(error){setMessage({kind:'error',text:error instanceof Error?error.message:'无法读取资料。'});}finally{setBusy('');}},[]);
   useEffect(()=>{void Promise.all([load(),loadImports().catch(()=>({available:false,items:[]}))]).catch(error=>setMessage({kind:'error',text:error instanceof Error?error.message:'无法读取资料库。'})).finally(()=>setLoading(false));},[load,loadImports]);
   useEffect(()=>{
     if(!library.items.some(item=>item.state==='queued'||item.state==='processing'))return;
@@ -48,6 +50,31 @@ export function MaterialLibrary({csrf,cases,activeCaseId}:{csrf:string;cases:Cas
   useEffect(()=>{if(!imports.items.some(item=>item.state==='queued'||item.state==='preparing'))return;const timer=window.setTimeout(()=>void loadImports().catch(()=>undefined),1000);return()=>window.clearTimeout(timer);},[imports.items,loadImports]);
   useEffect(()=>()=>uploadAbort.current?.abort(),[]);
   useEffect(()=>{uploadRequestId.current='';importRequestId.current='';},[caseId,file,sourceNote,title]);
+  useEffect(()=>{
+    if(!deleteTarget)return;
+    const previous=document.activeElement as HTMLElement|null;
+    deleteDialog.current?.querySelector<HTMLButtonElement>('button')?.focus();
+    return()=>{if(previous?.isConnected)previous.focus();};
+  },[deleteTarget]);
+  useEffect(()=>{
+    const dialog=deleteDialog.current;
+    if(deleteTarget&&dialog&&!dialog.contains(document.activeElement)){
+      (dialog.querySelector<HTMLButtonElement>('button:not(:disabled)')??dialog).focus();
+    }
+  },[busy,deleteTarget]);
+
+  async function deleteMaterial(){
+    if(!deleteTarget||busy)return;
+    const target=deleteTarget;setBusy('delete');setDeleteError('');
+    try{
+      await responseJson(await fetch('/api/materials',{method:'POST',credentials:'same-origin',cache:'no-store',headers:{'content-type':'application/json','x-csrf-token':csrf},body:JSON.stringify({action:'delete',id:target.id,version:target.version,confirmed:true})}));
+      removedIds.current.add(target.id);
+      setLibrary(value=>({...value,items:value.items.filter(item=>item.id!==target.id)}));
+      if(selected?.id===target.id){setSelected(null);setReviewedText('');setReviewNote('');setConfirmed(false);setAllowAcrossCases(false);}
+      setDeleteTarget(null);setMessage({kind:'success',text:`已删除“${target.title}”，不再供 AI 后续检索。历史资料和费用记录保留。`});
+    }catch(error){setDeleteError(error instanceof Error?error.message:'删除未完成，请重试。');}
+    finally{setBusy('');}
+  }
 
   function updateImport(job:MaterialImportJob){setImports(value=>({...value,items:[job,...value.items.filter(item=>item.id!==job.id)]}));setMessage({kind:'info',text:materialImportProgress(job)});}
 
@@ -150,8 +177,17 @@ export function MaterialLibrary({csrf,cases,activeCaseId}:{csrf:string;cases:Cas
     </section>
     {message&&<p role="status" className={`material-message ${message.kind}`}>{message.text}</p>}
     <div className="material-workspace">
-      <section className="material-list panel" aria-label="资料处理列表"><header><div><span className="eyebrow">PROCESSING LOG</span><h2>资料处理列表</h2></div><span>{library.items.length} 项</span></header>{library.items.length?<div>{library.items.map(item=><button key={item.id} disabled={Boolean(busy)} className={selected?.id===item.id?'selected':''} onClick={()=>void open(item.id)}><span className="material-kind" aria-hidden="true">{item.kind==='image'?'图':'影'}</span><span><b>{item.title}</b><small>{item.filename}</small></span><span className={`status material-state-${item.state}`}>{stateLabels[item.state]}</span></button>)}</div>:<p className="material-empty">还没有上传资料。</p>}</section>
+      <section className="material-list panel" aria-label="资料处理列表"><header><div><span className="eyebrow">PROCESSING LOG</span><h2>资料处理列表</h2></div><span>{library.items.length} 项</span></header>{library.items.length?<div>{library.items.map(item=><div key={item.id} className={`material-list-row${selected?.id===item.id?' selected':''}`}><button type="button" className="material-list-open" disabled={Boolean(busy)} onClick={()=>void open(item.id)}><span className="material-kind" aria-hidden="true">{item.kind==='image'?'图':'影'}</span><span><b>{item.title}</b><small>{item.filename}</small></span><span className={`status material-state-${item.state}`}>{stateLabels[item.state]}</span></button><button type="button" className="button button-danger material-delete" aria-label={`删除资料：${item.title}`} title={item.state==='processing'?'正在提取，请等待完成后删除':'从资料库移除并停止后续 AI 检索'} disabled={Boolean(busy)||item.state==='processing'} onClick={()=>{setDeleteError('');setDeleteTarget(item);}}>删除</button></div>)}</div>:<p className="material-empty">暂无资料，可以在上方上传。</p>}</section>
       <section className="material-detail panel" aria-label="资料复核">{selected?<><header><div><span className="eyebrow">SOURCE REVIEW</span><h2>{selected.title}</h2><p>{selected.filename} · {stateLabels[selected.state]}</p></div>{selected.state==='failed'&&<button className="button button-secondary" disabled={Boolean(busy)} onClick={()=>void act('retry')}>重新处理</button>}</header>{selected.error&&<p className="material-message error">{selected.error}</p>}<div className="material-preview">{selected.kind==='image'?<img src={`/api/materials?id=${encodeURIComponent(selected.id)}&original=1`} alt={`${selected.title} 原始图片`}/>:<video key={selected.id} aria-label="资料视频预览" src={`/api/materials?id=${encodeURIComponent(selected.id)}&original=1`} controls preload="metadata" playsInline/>}</div><dl className="material-meta"><div><dt>来源说明</dt><dd>{selected.sourceNote||'未填写'}</dd></div><div><dt>提取覆盖</dt><dd>{selected.coverage}</dd></div><div><dt>参考范围</dt><dd>{scopeLabels[selected.scope??'case']??'仅关联案例'}</dd></div></dl>{selected.autoCheck&&<AutoCheckSummary check={selected.autoCheck}/>}{!selected.autoCheck&&selected.state!=='approved'&&selected.events.filter(event=>event.action==='coverage_warning').map((event,i)=><p key={i} className="material-warning" role="status">提取覆盖待核对：{event.detail}</p>)}<label>AI 原始提取<textarea value={selected.originalText} readOnly rows={8}/></label><label>人工复核稿<textarea value={reviewedText} onChange={event=>setReviewedText(event.target.value)} rows={12} maxLength={64_000}/><small>{textBytes(reviewedText).toLocaleString()} / 64,000 bytes</small></label><label>复核备注<textarea value={reviewNote} onChange={event=>setReviewNote(event.target.value)} rows={3} maxLength={1000}/></label>{selected.state==='approved'&&reviewedText!==selected.reviewedText&&<p className="material-warning">修改已批准资料后，保存会先撤回 AI 参考资格，待重新复核。</p>}<label className="check-label material-review-check"><input type="checkbox" checked={confirmed} onChange={event=>setConfirmed(event.target.checked)}/><span>已核对原资料及提取范围</span></label><label className="check-label material-review-check"><input type="checkbox" checked={allowAcrossCases} onChange={event=>setAllowAcrossCases(event.target.checked)}/><span>这是通用参考资料，不含客户个人信息，可供公司内所有顾问的案例参考</span></label><div className="material-review-actions"><button className="button button-secondary" disabled={Boolean(busy)||selected.state==='queued'||selected.state==='processing'||selected.state==='failed'} onClick={()=>void act('save')}>保存复核稿</button><button className="button button-primary" disabled={Boolean(busy)||!confirmed||selected.state==='queued'||selected.state==='processing'||selected.state==='failed'} onClick={()=>void act('approve')}>复核通过并允许 AI 参考</button>{selected.state==='approved'&&<button className="button button-danger" disabled={Boolean(busy)} onClick={()=>void act('withdraw')}>撤回参考资格</button>}</div><details className="material-events"><summary>查看处理记录</summary>{selected.parts.map((part,index)=><div key={`${part.kind}-${part.position}-${index}`}><p>{part.kind==='image'?'画面':'音频'} {part.startSeconds.toFixed(1)}–{part.endSeconds.toFixed(1)} 秒 · {part.state==='done'?'已完成':'等待处理'}</p>{part.text&&<pre>{part.text}</pre>}</div>)}{selected.autoCheck?.audio.map(attempt=><div key={attempt.key}><p>自动补转写 · {attempt.status}</p>{attempt.result&&<pre>{attempt.result.segments.map(segment=>segment.text).join('\n')}</pre>}{attempt.error&&<p>{attempt.error}</p>}</div>)}{selected.autoCheck?.frames.map((attempt,index)=><div key={index}><p>自动补画面约 {attempt.timeSeconds.toFixed(1)} 秒 · {attempt.status}</p>{attempt.text&&<pre>{attempt.text}</pre>}{attempt.error&&<p>{attempt.error}</p>}</div>)}{selected.events.map((event,index)=><p key={`${event.at}-${index}`}><time>{new Date(event.at).toLocaleString('zh-CN')}</time> · {event.action} · {event.detail}</p>)}</details></>:<div className="material-empty material-empty-detail"><h2>选择一份资料</h2><p>查看原文件、提取结果、覆盖范围和处理记录。</p></div>}</section>
     </div>
-  </div></div>;
+  </div>{deleteTarget&&<div className="modal-backdrop" role="presentation" onMouseDown={event=>{if(!busy&&event.target===event.currentTarget)setDeleteTarget(null);}}><section ref={deleteDialog} tabIndex={-1} className="modal material-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-material-title" aria-describedby="delete-material-description" onKeyDown={event=>{
+    if(event.key==='Escape'&&!busy){event.preventDefault();setDeleteTarget(null);}
+    if(event.key==='Tab'){
+      const buttons=deleteDialog.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)');
+      if(!buttons?.length){event.preventDefault();return;}
+      const first=buttons[0],last=buttons[buttons.length-1];
+      if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+      else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
+    }
+  }}><h2 id="delete-material-title">删除这份资料？</h2><p id="delete-material-description">“{deleteTarget.title}”将从资料处理列表移除，并停止供 AI 后续检索。原文件、提取稿和处理记录保留，已有对话、报告及费用记录不变。</p>{deleteError&&<p className="material-message error" role="alert">{deleteError}</p>}<div className="modal-actions"><button type="button" className="button button-secondary" disabled={Boolean(busy)} onClick={()=>setDeleteTarget(null)}>取消</button><button type="button" className="button button-danger button-danger-solid" disabled={Boolean(busy)} onClick={()=>void deleteMaterial()}>{busy==='delete'?'正在删除…':'确认删除'}</button></div></section></div>}</div>;
 }

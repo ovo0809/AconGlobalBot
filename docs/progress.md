@@ -2,11 +2,13 @@
 
 更新日期：2026-10-31（America/Los_Angeles）。本页便于查看当前实现；详细证据以[工程验证](verification.md)和[验收账本](acceptance.md)为准。
 
+最新增量：资料处理列表逐项“删除”，复核账号确认后隐藏并停止后续检索；原件、处理历史、旧报告及费用保留。284/284 单测、16/16 资料相关浏览器回归、类型检查、lint 和生产构建通过，原用户数据未删除。发布分支为 `codex/material-delete`，自动检查与合并状态见 [GitHub PR 记录](https://github.com/ovo0809/AconGlobalBot/pulls?q=is%3Apr+head%3Acodex%2Fmaterial-delete)；基线 PR #3 已合并 main。
+
 合并前审查补修：会谈录音暂停后可在同页直接结束；中断丢失尾段的不完整提示持续保留到报告。两条 GitHub 审查问题已先复现后补回归，旧页面租约和费用保护仍保留。
 
 最新进展：已修复视频进度条无法跳转；新视频音轨采用 15 秒连续分段及有限相邻前文，自动检查遗漏并限次补转写／补画面。当前约 79 秒示例的 30–79 秒内容已重新识别并保存为待复核稿，原始提取与媒体保留。60–75 秒逐句时间仍不可靠，片尾字幕另列来源，未宣称全片准确。
 
-最近工程验证：**283/283 单测、54/54 浏览器流程、类型检查、lint、生产构建通过**。这是 Windows 本机及隔离 mock／假上游结果；真实 API 和目标手机分开记录。源码沿用 [`codex/recording-transcription`／PR #3](https://github.com/ovo0809/AconGlobalBot/pull/3)，合并和 GitHub Actions 结果以该 PR 实时状态为准。
+上一轮合并基线验证：**283/283 单测、54/54 浏览器流程、类型检查、lint、生产构建通过**。这是 Windows 本机及隔离 mock／假上游结果；真实 API 和目标手机分开记录。[PR #3](https://github.com/ovo0809/AconGlobalBot/pull/3) 最新提交两组 GitHub 自动检查通过后，已合并 main（`f50fc8d`）。本轮资料删除的验证范围见上方增量。
 
 | 功能 | 当前状态 | 仍需实际验证 |
 | --- | --- | --- |

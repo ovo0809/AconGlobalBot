@@ -84,15 +84,53 @@ test('only the assigned local reviewer can list, upload, inspect and mutate mate
   for(const email of ['admin@aeconn.example','advisor1@aeconn.example','advisor2@aeconn.example']){
     const denied=await new Browser().login(email);assert.equal((await denied.request()).status,403);assert.equal((await denied.request(imageForm())).status,403);
     for(const query of [`?id=${upload.id}`,`?id=${upload.id}&original=1`,`?id=${upload.id}&revision=${revision}`])assert.equal((await denied.request(undefined,query)).status,403);
-    for(const action of ['save','approve','withdraw','retry'])assert.equal((await denied.request({action,id:upload.id,version:approved.version,reviewedText:'不得修改',confirmed:true})).status,403);
+    for(const action of ['save','approve','withdraw','retry','delete'])assert.equal((await denied.request({action,id:upload.id,version:approved.version,reviewedText:'不得修改',confirmed:true})).status,403);
   }
   for(const email of ['reviewer-other@aeconn.example','reviewer-foreign@aeconn.example']){
     const denied=await new Browser().login(email);assert.deepEqual((await (await denied.request()).json()).items,[]);assert.equal((await denied.request(imageForm())).status,403);
     for(const query of [`?id=${upload.id}`,`?id=${upload.id}&original=1`,`?id=${upload.id}&revision=${revision}`])assert.equal((await denied.request(undefined,query)).status,404);
+    assert.equal((await denied.request({action:'delete',id:upload.id,version:approved.version,confirmed:true})).status,404);
   }
   assert.equal((await owner.request(imageForm(),'',{'x-csrf-token':'bad'})).status,403);assert.equal((await owner.request(imageForm(),'',{origin:'https://evil.example'})).status,403);assert.equal((await owner.request(imageForm(randomUUID(),'case-7'))).status,403);
+  assert.equal((await owner.request({action:'delete',id:upload.id,version:approved.version,confirmed:true},'',{'x-csrf-token':'bad'})).status,403);
+  assert.equal((await owner.request({action:'delete',id:upload.id,version:approved.version,confirmed:true},'',{origin:'https://evil.example'})).status,403);
   assert.equal((await owner.request(undefined,`?id=${upload.id}&original=1`)).headers.get('content-type'),'image/png');
   const advisor=await new Browser().login('advisor1@aeconn.example');assert.equal((await advisor.action({action:'enterClient',caseId:'case-3'})).status,200);await advisor.refresh();assert.equal((await advisor.request()).status,403);assert.equal((await advisor.request(undefined,`?id=${upload.id}&original=1`)).status,403);assert.equal((await advisor.action({action:'end'})).status,200);
+});
+
+test('material deletion hides the item, stops future retrieval and preserves history and usage',async()=>{
+  const browser=await new Browser().login(),requestId=randomUUID();
+  const upload=await create(browser,imageForm(requestId));await processMaterialJobs();
+  let approved=await approve(browser,await detail(browser,upload.id),{allowAcrossCases:true});
+  const reference=approvedMaterialDocuments('case-2').find(doc=>doc.path.includes(upload.id));assert(reference);
+  const preserved={
+    parts:db().prepare('SELECT count(*) n FROM material_parts WHERE material_id=?').get(upload.id)!.n,
+    versions:db().prepare('SELECT count(*) n FROM material_versions WHERE material_id=?').get(upload.id)!.n,
+  };
+  assert.equal((await browser.request({action:'delete',id:upload.id,version:approved.version,confirmed:false})).status,400);
+  assert.equal((await browser.request({action:'delete',id:upload.id,version:approved.version-1,confirmed:true})).status,409);
+
+  const jobId=randomUUID(),stamp=new Date().toISOString();
+  const job={id:jobId,requestId:randomUUID(),title:'仍在整理的大视频',sourceNote:'合成',caseId:'case-1',filename:'source.mp4',size:1,lastModified:1,state:'ready',receivedChunks:1,totalChunks:1,durationSeconds:1,sourceHash:'a'.repeat(64),segments:[],error:null,createdAt:stamp,updatedAt:stamp,receivedBytes:1,chunkHashes:['a'.repeat(64)]};
+  db().prepare('INSERT INTO material_import_jobs VALUES(?,?,?,?,?)').run(jobId,'charles','case-1','ready',pack(job));
+  approved={...approved,importSource:{jobId,index:0,filename:'source.mp4',sourceHash:'a'.repeat(64),startSeconds:0,endSeconds:1}};
+  db().prepare('UPDATE material_documents SET doc=? WHERE id=?').run(pack(approved),approved.id);
+  assert.equal((await browser.request({action:'delete',id:upload.id,version:approved.version,confirmed:true})).status,409,'an active large-video job blocks deletion');
+  db().prepare("UPDATE material_import_jobs SET state='completed',doc=? WHERE id=?").run(pack({...job,state:'completed'}),jobId);
+
+  const deletedResponse=await browser.request({action:'delete',id:upload.id,version:approved.version,confirmed:true});assert.equal(deletedResponse.status,200);
+  const deleted=await deletedResponse.json() as MaterialDetail;assert.equal(deleted.state,'deleted');assert(deleted.events.some(event=>event.action==='deleted'));
+  assert(!approvedMaterialDocuments('case-1').some(doc=>doc.path.includes(upload.id)));assert(!approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(upload.id)));
+  const items=(await (await browser.request()).json()).items as MaterialDetail[];assert(!items.some(item=>item.id===upload.id));
+  for(const query of [`?id=${upload.id}`,`?id=${upload.id}&original=1`,`?id=${upload.id}&revision=${reference.revision}`])assert.equal((await browser.request(undefined,query)).status,404);
+  assert.equal((await browser.request({action:'save',id:upload.id,version:deleted.version,reviewedText:'不得恢复'})).status,404);
+  assert.equal((await browser.request(imageForm(requestId))).status,409,'the old request ID cannot revive a deleted material');
+  assert.equal(db().prepare('SELECT count(*) n FROM material_parts WHERE material_id=?').get(upload.id)!.n,preserved.parts);
+  assert.equal(db().prepare('SELECT count(*) n FROM material_versions WHERE material_id=?').get(upload.id)!.n,preserved.versions);
+
+  const queued=await create(browser);const queuedDeleted=await browser.request({action:'delete',id:queued.id,version:queued.version,confirmed:true});assert.equal(queuedDeleted.status,200,'queued materials may be removed before processing');
+  const processing=await create(browser),processingDoc={...processing,state:'processing' as const};db().prepare("UPDATE material_documents SET state='processing',doc=? WHERE id=?").run(pack(processingDoc),processing.id);
+  assert.equal((await browser.request({action:'delete',id:processing.id,version:processing.version,confirmed:true})).status,409,'processing materials cannot be deleted');
 });
 
 test('server bounds media types, dimensions, duration and rejects gaps in video audio',async()=>{
@@ -111,6 +149,12 @@ test('budget rejects before paid fetch, failure retains state, manual retry and 
   const created=await create(browser);await processMaterialJobs();let failed=await detail(browser,created.id);assert.equal(failed.state,'failed');assert.equal(calls,0);assert.equal(getUsageSummary('org-demo','case-1',true).records.length,0);
   process.env.AI_CASE_BUDGET_USD='8';let r=await browser.request({action:'retry',id:failed.id,version:failed.version});assert.equal(r.status,200);await processMaterialJobs();const completed=await detail(browser,created.id);assert.equal(completed.state,'needs_review');assert.equal(calls,1);assert.equal(getUsageSummary('org-demo','case-1',true).records[0].status,'settled');
   const stored={...completed,state:'processing'};db().prepare("UPDATE material_documents SET state='processing',doc=? WHERE id=?").run(pack(stored),stored.id);recoverMaterialJobs();failed=await detail(browser,created.id);assert.equal(failed.state,'failed');r=await browser.request({action:'retry',id:failed.id,version:failed.version});assert.equal(r.status,200);await processMaterialJobs();assert.equal(calls,1,'completed segments are not charged twice after restart');
+  const final=await detail(browser,created.id),callsBefore=db().prepare('SELECT * FROM ai_usage_calls ORDER BY rowid').all(),eventsBefore=db().prepare('SELECT * FROM ai_usage_events ORDER BY rowid').all(),summaryBefore=getUsageSummary('org-demo','case-1',true);
+  assert(summaryBefore.records.length>0&&summaryBefore.records.every(record=>record.status==='settled'));
+  assert.equal((await browser.request({action:'delete',id:final.id,version:final.version,confirmed:true})).status,200);
+  assert.deepEqual(db().prepare('SELECT * FROM ai_usage_calls ORDER BY rowid').all(),callsBefore,'material deletion preserves every usage call');
+  assert.deepEqual(db().prepare('SELECT * FROM ai_usage_events ORDER BY rowid').all(),eventsBefore,'material deletion preserves every usage event');
+  assert.deepEqual(getUsageSummary('org-demo','case-1',true),summaryBefore,'costs, held amounts, records and configured limits remain unchanged');
 });
 
 test('video retry retains completed images, records safe failures and flags coarse audio timing for review',async t=>{
@@ -201,7 +245,8 @@ test('automatic repair through the real transcription adapter settles usage once
 test('deleted cases stop references; withdrawal remains possible; purge clears materials and snapshots',async()=>{
   const browser=await new Browser().login();const uploaded=await create(browser,imageForm(randomUUID(),'case-4'));await processMaterialJobs();const approved=await approve(browser,await detail(browser,uploaded.id),{allowAcrossCases:true});assert(approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(uploaded.id)));
   const advisor=await new Browser().login('advisor1@aeconn.example');assert.equal((await advisor.action({action:'deleteCase',caseId:'case-4'})).status,200);assert(!approvedMaterialDocuments('case-2').some(doc=>doc.path.includes(uploaded.id)));
-  assert.equal((await browser.request({action:'withdraw',id:approved.id,version:approved.version})).status,200);
+  const withdrawn=await browser.request({action:'withdraw',id:approved.id,version:approved.version});assert.equal(withdrawn.status,200);
+  const withdrawnDoc=await withdrawn.json() as MaterialDetail;assert.equal((await browser.request({action:'delete',id:approved.id,version:withdrawnDoc.version,confirmed:true})).status,200,'deletion remains available after the case is removed from the active list');
   assert.equal((await advisor.action({action:'purgeCase',caseId:'case-4',confirmation:'永久删除'})).status,200);
   assert.equal((await browser.request(undefined,`?id=${uploaded.id}`)).status,404);assert.equal(db().prepare('SELECT count(*) n FROM material_parts WHERE material_id=?').get(uploaded.id)!.n,0);assert.equal(db().prepare('SELECT count(*) n FROM material_versions WHERE material_id=?').get(uploaded.id)!.n,0);
 });
@@ -213,7 +258,7 @@ test('approved mock materials never become real cloud references after provider 
 });
 
 test('approved private references reach voice context and report PDF without becoming customer facts',async()=>{
-  const browser=await new Browser().login();const uploaded=await create(browser,imageForm(randomUUID(),'case-6'));await processMaterialJobs();await approve(browser,await detail(browser,uploaded.id));
+  const browser=await new Browser().login();const uploaded=await create(browser,imageForm(randomUUID(),'case-6'));await processMaterialJobs();const approved=await approve(browser,await detail(browser,uploaded.id));
   const beforeFacts=db().prepare('SELECT doc FROM profile_fields WHERE case_id=? ORDER BY field_key').all('case-6');
   const advisor=await new Browser().login('advisor1@aeconn.example');const sessionId=randomUUID(),auth=db().prepare('SELECT id FROM auth_sessions WHERE user_id=? ORDER BY rowid DESC LIMIT 1').get('advisor-1')!;
   db().prepare("INSERT INTO interviews(id,case_id,auth_id,state,entry,created_at) VALUES(?,?,?,'ended','ltc',?)").run(sessionId,'case-6',String(auth.id),new Date().toISOString());
@@ -223,6 +268,12 @@ test('approved private references reach voice context and report PDF without bec
   assert(JSON.parse(String(report.doc)).knowledge.sources.some((source:{path:string})=>source.path.includes(uploaded.id)));
   assert.equal(Buffer.from(report.pdf as Uint8Array).subarray(0,4).toString(),'%PDF');
   assert.deepEqual(db().prepare('SELECT doc FROM profile_fields WHERE case_id=? ORDER BY field_key').all('case-6'),beforeFacts);
+  const reportDoc=String(report.doc),reportPdf=Buffer.from(report.pdf as Uint8Array);
+  assert.equal((await browser.request({action:'delete',id:approved.id,version:approved.version,confirmed:true})).status,200);
+  assert(!approvedMaterialDocuments('case-6').some(source=>source.path.includes(uploaded.id)));
+  const preserved=db().prepare('SELECT doc,pdf FROM reports WHERE case_id=? ORDER BY version DESC LIMIT 1').get('case-6')!;
+  assert.equal(String(preserved.doc),reportDoc,'the already-generated report keeps its cited material snapshot');
+  assert.deepEqual(Buffer.from(preserved.pdf as Uint8Array),reportPdf,'the already-generated PDF remains byte-for-byte unchanged');
 });
 
 test('video originals support private byte ranges, including suffixes, retries and unsatisfiable positions',async()=>{
@@ -276,4 +327,8 @@ test('a prepared source segment is idempotent even when a lost response requires
     assert.equal(retried.id,first.id);assert.equal(retried.state,'needs_review');
   }
   assert.equal(db().prepare("SELECT count(*) n FROM material_documents WHERE json_extract(doc,'$.importSource.jobId')=?").get(jobId)!.n,1);
+  const completedJob={...job,state:'completed',segments:[{...job.segments[0],materialId:first.id}]};db().prepare("UPDATE material_import_jobs SET state='completed',doc=? WHERE id=?").run(pack(completedJob),jobId);
+  const current=await detail(browser,first.id);assert.equal((await browser.request({action:'delete',id:first.id,version:current.version,confirmed:true})).status,200);
+  const replay=await browser.request(preparedForm(randomUUID(),Buffer.concat([png,Buffer.from([0])])));assert.equal(replay.status,409,'a completed large-video segment cannot be replayed after deletion');
+  assert.equal(db().prepare('SELECT state FROM material_documents WHERE id=?').get(first.id)!.state,'deleted');
 });

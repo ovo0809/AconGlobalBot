@@ -48,7 +48,7 @@ test('reviewer can drag or seek an uploaded video and switching sources resets p
   expect(range).toEqual({status:206,acceptRanges:'bytes',contentRange:`bytes 24-63/${video.length}`,length:'40',bytes:Array.from(video.subarray(24,64))});
 
   await page.getByRole('button',{name:'资料库',exact:true}).click();
-  await page.getByRole('button',{name:/可拖动视频 1/}).click();
+  await page.locator('.material-list-open').filter({hasText:'可拖动视频 1'}).click();
   const player=page.getByLabel('资料视频预览');
   await expect(player).toBeVisible();
   await expect.poll(()=>player.evaluate((element:HTMLVideoElement)=>Number.isFinite(element.duration)&&element.duration>5)).toBe(true);
@@ -70,7 +70,7 @@ test('reviewer can drag or seek an uploaded video and switching sources resets p
   });
   await expect.poll(()=>player.evaluate((element:HTMLVideoElement)=>element.seeking?Infinity:element.currentTime)).toBeLessThan(forward);
 
-  await page.getByRole('button',{name:/可拖动视频 2/}).click();
+  await page.locator('.material-list-open').filter({hasText:'可拖动视频 2'}).click();
   await expect(player).toHaveAttribute('src',new RegExp(`id=${materialIds[1]}`));
   await expect.poll(()=>player.evaluate((element:HTMLVideoElement)=>element.currentTime)).toBeLessThan(0.25);
 });
