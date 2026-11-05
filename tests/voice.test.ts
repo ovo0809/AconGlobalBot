@@ -184,6 +184,8 @@ test('voice relay locks setup, persists final turns, forwards audio, and drains 
     turnComplete: true,
   } }));
   await waitUntil(() => persisted.length === 2);
+  // Persistence precedes WebSocket delivery; inspect the browser only after its turn ends.
+  await waitUntil(() => browserEvents.some((event) => JSON.parse(event).type === 'turnComplete'));
   assert.deepEqual(persisted.map((event) => event.role), ['user', 'assistant']);
   assert.notEqual(persisted[0].eventId, persisted[1].eventId);
   assert.match(persisted[0].eventId, /^live-session:voice:[0-9a-f-]+:1:user$/);

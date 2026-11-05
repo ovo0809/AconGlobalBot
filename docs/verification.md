@@ -1,5 +1,13 @@
 # 工程验证记录
 
+## 2026-11-04 GitHub 同步与语音测试时序核对
+
+- 本地访谈、报告编排、界面、文档及合成 PDF 已提交到 `codex/demo-sync-20261104`，对应 [PR #7](https://github.com/ovo0809/AconGlobalBot/pull/7)；此条更新覆盖下方历史条目中“尚未提交／推送”的当时状态，不表示已经合并 main 或部署。
+- 首个 PR 检查在 `tests/voice.test.ts` 读取浏览器事件时偶发失败：持久化数组已更新，最终字幕和 `turnComplete` 尚未经过 WebSocket 到达。相同提交 `f8ad2aa562fe04fe840d851b4d4756f5ea6f00c0` 的 [push 检查](https://github.com/ovo0809/AconGlobalBot/actions/runs/41960119321) 已通过。仅在测试读取事件前增加有界等待 `turnComplete`，保留音频、最终字幕、结束事件 ID 的精确断言；未修改生产语音逻辑。
+- 等待修正后的本机离线 `npm test` 为 **328/328、0 跳过**，`npm run typecheck`、`npx eslint tests/voice.test.ts` 与 `git diff --check` 通过；单测日志在 `tmp/github-sync-20261104-unit.log`。使用 mock／假上游、独立测试数据库和回环网络守卫，未读取业务数据库或调用付费服务。
+- 上述 `f8ad2aa` 的 Ubuntu CI 结果为单测 **326 通过／2 跳过**、浏览器 **65 通过／1 跳过**，类型检查、全量 lint 和生产构建通过。跳过项为 Windows 原生视频平台检查，不能视为 Linux 已验证；等待修正后提交的远端状态以 PR #7 最新提交检查为准。
+- GitHub 仓库为公开仓库；本轮未上传本机客户数据库、原始上传资料、环境密钥、日志、构建产物或私人商务报价。现有每案例 $8、UTC 每天 $40、每月 $160、审批／收件人及邮件 dry-run 规则不变；未新增真实 API、实体麦克风、手机或 Charles 业务验收。
+
 ## 2026-11-04 报告协作编排及独立读者验证
 
 本轮读取 Anthropic 官方 `doc-coauthoring/SKILL.md`，将上下文整理、分节精修及初读检查适配到现有报告；来源及计划见[设计说明](report-coauthoring.md)。开始时已有 33 个修改文件，保留既有代码、数据、报告及费用配置。未安装依赖、Claude 或新模型，未更换密钥。
