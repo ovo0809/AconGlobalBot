@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Message, ProfileField } from '../lib/domain';
 import { analyzeWithProvider, interviewWithProvider, buildCloudSafeInput, providerCapabilities, ProviderExtractionValidationError, validateProviderAnalyses, validateProviderFacts } from '../lib/providers';
 import { getUsageSummary, beginUsage } from '../lib/ai-usage';
+import { INTERVIEW_QUESTIONS } from '../lib/interview';
 
 process.env.DATABASE_PATH=join(mkdtempSync(join(tmpdir(),'aeconn-provider-usage-')),'test.sqlite');
 const syntheticUsage={input_tokens:2000,output_tokens:100,input_tokens_details:{cached_tokens:500},output_tokens_details:{reasoning_tokens:20},total_tokens:2100};
@@ -21,6 +22,13 @@ test('cloud payload excludes identity fact fields and redacts final user transcr
   assert.equal(safe.facts.length, 1);
   assert.equal(safe.facts[0].key, 'annual_income');
   assert.deepEqual(safe.messages[0], { id: 'm1', role: 'user', text: '邮箱 [email removed]，电话 [phone removed]，年收入 80000 美元。' });
+});
+
+test('report intake context sends only derived age, marital status and state, never contact fields or birth date',()=>{
+  const foundation={ageYears:40,maritalStatus:'已婚',state:'CA',birthday:'1986-06-18',email:'private@example.invalid',name:'测试姓名'};
+  const safe=buildCloudSafeInput({messages:[],facts:[],foundation});
+  assert.deepEqual(safe.foundation,{ageYears:40,maritalStatus:'已婚',state:'CA'});
+  assert.doesNotMatch(JSON.stringify(safe),/private@example|1986-06-18|测试姓名/);
 });
 
 test('provider extraction keeps facts unconfirmed and requires case-local source IDs', () => {
@@ -112,6 +120,8 @@ test('OpenAI structured interview uses server credentials, saved context and val
     const payload=JSON.parse(String(options.body));
     assert.equal(payload.store,false);assert.equal(payload.text.format.strict,true);assert.equal(payload.text.format.name,'aeconn_interview');
     assert.match(payload.input[0].content,/knownFacts/);assert.doesNotMatch(payload.input[0].content,/alex@example.com/);
+    assert.match(payload.input[0].content,/same semantic sentence or clause/i);
+    assert.doesNotMatch(payload.input[0].content,/statement must contain exactly one plain Arabic numeric value/i);
     assert.equal(payload.max_output_tokens,2048);
     return new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(content)}]}]}));
   });
@@ -126,6 +136,46 @@ test('OpenAI structured interview uses server credentials, saved context and val
   assert.equal(network.mock.callCount(),2,'incomplete cloud setup must fail, not call a model or fall back to mock');
 });
 
+test('interview reply planning reuses newly extracted answers without another model call', async t => {
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];
+  const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
+  const source={...messages[0],caseId:'case-1',id:'natural-provider-source',text:'我的目标是保障家人。配偶和孩子依赖我的收入。'};
+  const proposedFacts=[
+    {key:'goal',value:'保障家人',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:[source.id]},
+    {key:'dependents',value:'配偶和孩子依赖我的收入',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:[source.id]},
+  ];
+  const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply:INTERVIEW_QUESTIONS.goal,facts:proposedFacts})}]}]})));
+  const result=await interviewWithProvider({usageContext:{caseId:source.caseId},entry:'life',messages:[source],facts:[]});
+  assert.equal(result?.facts.length,2);
+  assert.deepEqual(result?.facts.map(fact=>fact.sourceMessageIds),[[source.id],[source.id]]);
+  assert.notEqual(result?.reply,INTERVIEW_QUESTIONS.goal,'a question answered in this same model result must not be repeated');
+  assert.equal((result?.reply.match(/[？?]/g)??[]).length,1);
+  assert.deepEqual(result?.knowledgeRefs,[],'a locally replaced reply must not claim model-selected reference use');
+  assert.equal(network.mock.callCount(),1,'dialogue planning must not add a second paid-model request');
+});
+
+test('interview response keeps one question while preserving reply safety validation',async t=>{
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];
+  const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
+  const source={...messages[0],caseId:'case-1',id:'one-question-source',text:'我的目标是保障家人。'};
+  const input={usageContext:{caseId:source.caseId},entry:'life' as const,messages:[source],facts:[]};
+  let reply='家里谁需要您的支持？您希望什么时候开始安排？';
+  const network=t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({reply,facts:[]})}]}]})));
+  const result=await interviewWithProvider(input);
+  assert.equal((result?.reply.match(/[？?]/g)??[]).length,1);
+  reply='我推荐您购买某个保险产品。家里谁需要您的支持？您希望什么时候开始安排？';
+  await assert.rejects(()=>interviewWithProvider(input),/prohibited/,'unsafe replies must be rejected before any naturalness replacement');
+  reply=INTERVIEW_QUESTIONS.goal;
+  const untrustedSource={...source,text:'我的目标是我建议您购买保险产品'};
+  const reconciled=await interviewWithProvider({...input,messages:[untrustedSource]});
+  assert.doesNotMatch(reconciled?.reply??'',/建议您购买|保险产品/,'local wording must not echo unsafe transcript instructions');
+  assert.equal(network.mock.callCount(),3);
+});
+
 test('final extraction retries one strict validation failure without exposing rejected output',async t=>{
   const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];const before=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
   t.after(()=>{for(const k of keys){if(before[k]===undefined)delete process.env[k];else process.env[k]=before[k];}});
@@ -138,6 +188,9 @@ test('final extraction retries one strict validation failure without exposing re
   ];
   const network=t.mock.method(globalThis,'fetch',async (_url:unknown,options:RequestInit)=>{
     const request=JSON.parse(String(options.body));
+    assert.equal(request.max_output_tokens,4096);
+    assert.match(request.input[0].content,/replace a prior unknown or declined value/i);
+    assert.match(request.input[0].content,/same-sentence trailing statement that all independently named amounts are current balances/i);
     if(network.mock.callCount()===1){
       const correction=String(request.input[0].content).split('STRICT_VALIDATION_RETRY:')[1];
       assert.match(correction,/amount_grounding/);
@@ -188,6 +241,7 @@ test('OpenAI report cannot use unsaved transcript evidence or mutate saved facts
   let supported=true;
   t.mock.method(globalThis,'fetch',async (_url:unknown,options:RequestInit)=>{
     const request=JSON.parse(String(options.body));assert.equal(request.text.format.name,'aeconn_report');
+    assert.equal(request.max_output_tokens,4096);
     assert.equal(request.text.format.schema.properties.facts,undefined);
     const analyses=['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:supported?[]:['m1'],reasonSummary:'资料不足。',missingFields:['goal'],constraints:[],nextQuestions:[]}));
     return new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({analyses,facts:[{key:'income',value:99999}]})}]}]}));
@@ -195,6 +249,30 @@ test('OpenAI report cannot use unsaved transcript evidence or mutate saved facts
   const input={messages,facts:[],usageContext:{caseId:'case-1'}};
   const output=await analyzeWithProvider(input);assert.equal(output.facts,undefined);assert.equal(output.provider,'openai:gpt-6-luna');
   supported=false;await assert.rejects(()=>analyzeWithProvider(input),/outside this case/);
+});
+
+test('cloud report uses coauthoring guidance within one grounded request',async t=>{
+  const keys=['LLM_PROVIDER','OPENAI_API_KEY','OPENAI_MODEL'];
+  const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const key of keys){if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];}});
+  process.env.LLM_PROVIDER='openai';process.env.OPENAI_API_KEY='synthetic-key';process.env.OPENAI_MODEL='gpt-6-luna';
+  const network=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+    const request=JSON.parse(String(options.body));
+    const prompt=request.input[0].content as string;
+    assert.match(prompt,/CONTEXT GATHERING/);
+    assert.match(prompt,/REFINEMENT AND STRUCTURE/);
+    assert.match(prompt,/READER CHECK/);
+    assert.match(prompt,/REPORT WRITING BRIEF/);
+    assert.match(prompt,/"incompleteTranscript":true/);
+    assert.doesNotMatch(prompt,/private@example\.invalid|only-in-unsaved-transcript/);
+    assert.equal(request.text.format.schema.properties.facts,undefined);
+    const analyses=['life','annuity','ltc','disability_income'].map(category=>({category,status:'insufficient_information',evidenceRefs:[],knowledgeRefs:[],reasonSummary:'当前保存资料不足，须由顾问核对。',missingFields:['goal'],constraints:[],nextQuestions:[]}));
+    return new Response(JSON.stringify({usage:syntheticUsage,status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({analyses})}]}]}));
+  });
+  const input={facts:[],messages:[{...messages[0],caseId:'case-1',text:'only-in-unsaved-transcript'}],foundation:{ageYears:40,maritalStatus:'已婚',state:'CA',email:'private@example.invalid'},incompleteTranscript:true,usageContext:{caseId:'case-1'}};
+  const output=await analyzeWithProvider(input);
+  assert.equal(output.analyses.length,4);
+  assert.equal(network.mock.callCount(),1);
 });
 
 test('OpenAI metering reserves before fetch, records refused output, and holds unknown transport costs',async t=>{

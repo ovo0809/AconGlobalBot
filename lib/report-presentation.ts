@@ -10,6 +10,12 @@ export function presentReport(report: ReportContent) {
     ...report.analyses.flatMap(item => item.evidenceRefs),
   ])];
   const references = ids.map((id, index) => ({ id, label: `来源 ${index + 1}` }));
+  // New snapshots already contain the same readable body used by PDF and email.
+  // Leave immutable legacy versions on their existing display-only projection.
+  if (report.formatVersion) return {
+    sections: report.sections.map(section=>({...section})), references,
+    knowledgeSources: presentKnowledgeSources(report.knowledge?.sources??[],report.analyses),
+  };
   const labels = new Map(references.map(ref => [ref.id, ref.label]));
   const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const pattern = ids.length ? new RegExp(`(?<![\\w-])(?:${[...ids].sort((a,b)=>b.length-a.length).map(escape).join('|')})(?![\\w-])`, 'g') : null;

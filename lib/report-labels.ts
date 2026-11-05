@@ -32,6 +32,7 @@ export const reviewStatusLabels: Record<string, string> = {
   draft: '草稿',
   pending_review: '待复核',
   approved: '已复核',
+  reviewed: '已复核',
   returned: '退回补问',
   quote_handoff: '已转现有报价流程',
 };

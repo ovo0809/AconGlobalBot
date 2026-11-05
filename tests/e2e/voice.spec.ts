@@ -20,6 +20,7 @@ async function stubClient(page:Page){
     const body=route.request().postDataJSON() as {action?:string};
     if(body.action==='voiceToken')return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true,token:'synthetic-voice-token'})});
     if(body.action==='pause')payload.clientSession.state='paused';
+    if(body.action==='resume')payload.clientSession.state='active';
     return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({ok:true})});
   });
   return payload;
@@ -33,6 +34,75 @@ test('production CSP rejects blob AudioWorklet modules',async({page})=>{
     try{await context.audioWorklet.addModule(url);return {loaded:true,message:''};}catch(error){return {loaded:false,message:error instanceof Error?error.message:String(error)};}finally{URL.revokeObjectURL(url);await context.close();}
   });
   expect(result.loaded).toBe(false);expect(result.message).toBeTruthy();
+});
+
+test('voice resumes on the same page after pause without reloading',async({page})=>{
+  await stubClient(page);let connections=0;
+  await page.routeWebSocket(/\/voice\?token=/,socket=>{
+    const connection=++connections;let sent=false;
+    socket.send(JSON.stringify({type:'ready',inputSampleRate:24_000,outputSampleRate:24_000}));
+    socket.onMessage(message=>{
+      if(!sent&&typeof JSON.parse(String(message)).audio==='string'){
+        sent=true;socket.send(JSON.stringify({type:'transcript',role:'user',text:`第${connection}段合成回答`,final:true,eventId:`resume-${connection}`}));
+        socket.send(JSON.stringify({type:'turnComplete'}));
+      }
+    });
+  });
+  await page.goto('/');await page.getByRole('button',{name:'开始连续语音对话'}).click();
+  await expect(page.getByText('第1段合成回答')).toBeVisible();
+  await page.getByRole('button',{name:'暂停访谈'}).click();
+  await expect(page.locator('.paused-card').getByText('访谈已暂停',{exact:true}).first()).toBeVisible();
+  await page.getByRole('button',{name:'恢复访谈'}).click();
+  await page.getByRole('button',{name:'开始连续语音对话'}).click({timeout:5_000});
+  await expect(page.getByText('第2段合成回答')).toHaveCount(1);
+  expect(connections).toBe(2);
+  await page.getByRole('button',{name:'暂停访谈'}).click();
+});
+
+test('only the matching latest voice reply can replay and refresh removes unavailable audio',async({page})=>{
+  const payload=await stubClient(page);
+  await page.addInitScript(()=>{
+    const samples:number[]=[];Object.defineProperty(window,'__replaySamples',{value:samples});
+    const createSource=AudioContext.prototype.createBufferSource;
+    AudioContext.prototype.createBufferSource=function(){
+      const source=createSource.call(this),start=source.start.bind(source);
+      source.start=(...args:Parameters<typeof source.start>)=>{samples.push(source.buffer?.getChannelData(0)[0]??0);start(...args);};
+      return source;
+    };
+  });
+  await page.routeWebSocket(/\/voice\?token=/,socket=>{
+    socket.send(JSON.stringify({type:'ready',inputSampleRate:24_000,outputSampleRate:24_000}));let first=false;
+    const reply=(id:string,text:string,value:number)=>{
+      const pcm=Buffer.alloc(24_000*.7*2);for(let i=0;i<pcm.length;i+=2)pcm.writeInt16LE(value,i);
+      socket.send(JSON.stringify({type:'audio',data:pcm.toString('base64'),mimeType:'audio/pcm;rate=24000',itemId:id,responseId:id,eventId:id}));
+      socket.send(JSON.stringify({type:'transcript',role:'assistant',text,final:true,eventId:id}));
+      socket.send(JSON.stringify({type:'turnComplete',responseId:id,eventId:id}));
+    };
+    socket.onMessage(message=>{
+      const event=JSON.parse(String(message));
+      if(!first&&typeof event.audio==='string'){first=true;reply('replay-first','第一条合成回复',1000);}
+      if(event.text==='继续')reply('replay-second','第二条合成回复',2000);
+    });
+  });
+  await page.goto('/');await page.getByRole('button',{name:'开始连续语音对话'}).click();
+  const firstBubble=page.locator('.bubble').filter({hasText:'第一条合成回复'});
+  await expect(firstBubble.getByRole('button',{name:'重播这条回答'})).toBeEnabled();
+  await page.getByLabel('文字回答').fill('继续');await page.getByRole('button',{name:'发送',exact:true}).click();
+  const secondBubble=page.locator('.bubble').filter({hasText:'第二条合成回复'});
+  await expect(secondBubble.getByRole('button',{name:'重播这条回答'})).toBeEnabled();
+  await expect(firstBubble.getByRole('button',{name:'重播这条回答'})).toHaveCount(0);
+  await secondBubble.getByRole('button',{name:'重播这条回答'}).click();
+  await expect(page.getByLabel('文字回答')).toBeDisabled();
+  await expect(page.getByText('正在重播',{exact:true})).toBeVisible();
+  await expect(page.getByLabel('文字回答')).toBeEnabled();
+  const samples=await page.evaluate(()=>(window as unknown as {__replaySamples:number[]}).__replaySamples);
+  expect(samples).toHaveLength(3);expect(samples[2]).toBe(samples[1]);expect(samples[2]).not.toBe(samples[0]);
+  await page.getByRole('button',{name:'暂停访谈'}).click();
+  await page.route('**/api/bootstrap*',route=>route.fulfill({json:{...payload,messages:[
+    {id:'replay-second',eventId:'replay-second',role:'assistant',text:'第二条合成回复',final:true,createdAt},
+  ]}}));
+  await page.reload();await expect(page.getByText('第二条合成回复',{exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'重播这条回答'})).toHaveCount(0);
 });
 
 test('same-origin capture worklet sends fake microphone PCM, receives captions and releases resources',async({page})=>{
@@ -54,7 +124,7 @@ test('same-origin capture worklet sends fake microphone PCM, receives captions a
   await page.getByRole('button',{name:'开始连续语音对话'}).click();
   await expect(page.getByText('正在听您说',{exact:true}).first()).toBeVisible();await expect.poll(()=>browserMessages.some(message=>typeof message.audio==='string')).toBe(true);
   await expect(page.getByText('假麦克风字幕')).toBeVisible();
-  await page.getByRole('button',{name:'暂停访谈'}).click();await expect(page.getByText('访谈已暂停',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'暂停访谈'}).click();await expect(page.locator('.paused-card').getByText('访谈已暂停',{exact:true})).toBeVisible();
   await expect.poll(()=>page.evaluate(()=>(window as unknown as {__voiceTest:{stoppedTracks:number}}).__voiceTest.stoppedTracks)).toBeGreaterThan(0);
   expect(await page.evaluate(()=>(window as unknown as {__voiceTest:{getUserMediaCalls:number;closedContexts:number}}).__voiceTest)).toMatchObject({getUserMediaCalls:1,closedContexts:expect.any(Number)});
   expect(await page.evaluate(()=>(window as unknown as {__voiceTest:{closedContexts:number}}).__voiceTest.closedContexts)).toBeGreaterThan(0);
@@ -94,7 +164,7 @@ test('real browser playback finishes all queued PCM before switching back to lis
   expect((await playback()).stopped).toBe(0);
   await expect(page.getByText('正在听您说',{exact:true}).first()).toBeVisible();
   await page.getByRole('button',{name:'暂停访谈'}).click();
-  await expect(page.getByText('访谈已暂停',{exact:true})).toBeVisible();
+  await expect(page.locator('.paused-card').getByText('访谈已暂停',{exact:true})).toBeVisible();
 });
 
 test('an output-limited reply keeps its caption and can continue without restarting the microphone',async({page})=>{

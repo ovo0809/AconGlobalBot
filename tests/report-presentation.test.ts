@@ -36,6 +36,15 @@ test('no extracted facts is not displayed as a customer claim of unknown',()=>{
   assert.equal(presentReport(report).sections[0].body,'尚未提取到有来源的访谈事实，请先核对访谈记录。');
 });
 
+test('readable snapshots use identical saved sections on screen, PDF and email without rewriting amounts',()=>{
+  const report=legacyReport();report.formatVersion='company-readable/2';
+  report.sections[0].body='• 收入：120,000 美元／年；来源：来源 1 [客户自述]';
+  const original=JSON.stringify(report);const view=presentReport(report);
+  assert.deepEqual(view.sections,report.sections);
+  view.sections[0].body='changed view';
+  assert.equal(JSON.stringify(report),original);
+});
+
 test('new report source kinds and explicit unknown survive the screen projection',()=>{
   const report=legacyReport();report.facts[0]={...report.facts[0],key:'budget',value:null,factStatus:'unknown'};
   report.sections[0].body='• 预算：客户表示不清楚；来源：source-1 [顾问更正；actor_id=advisor-1]';

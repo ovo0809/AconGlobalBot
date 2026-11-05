@@ -164,9 +164,9 @@ test('keyboard users can identify focus, open new-client setup and dismiss it wi
 
 test('client welcome uses one centered interview window at desktop and mobile widths',async({page})=>{
   await stubClient(page,null);
-  for(const viewport of [{width:1440,height:1000},{width:886,height:865},{width:768,height:900},{width:390,height:844}]){
+  for(const viewport of [{width:1440,height:1000},{width:886,height:865},{width:768,height:900},{width:390,height:844},{width:360,height:640}]){
     await page.setViewportSize(viewport);await page.goto('/');
-    await expect(page.getByRole('heading',{name:'您好，我是 Aeconn AI 助手'})).toBeVisible();
+    await expect(page.getByRole('heading',{name:/从您最在意的事，\s*慢慢聊起。/})).toBeVisible();
     await expect(page.getByRole('region',{name:'客户访谈'})).toBeVisible();
     await expect(page.locator('.client-backdrop')).toHaveCount(0);
     for(const label of ['人寿','伤残保险','年金','长期护理'])await expect(page.getByRole('button',{name:new RegExp(label)})).toBeVisible();
@@ -183,7 +183,7 @@ test('client welcome uses one centered interview window at desktop and mobile wi
 
 test('active interview stays centered with conversation and controls in one window',async({page})=>{
   await stubClient(page,'ltc');
-  for(const viewport of [{width:1440,height:1000},{width:886,height:865},{width:768,height:900},{width:390,height:844}]){
+  for(const viewport of [{width:1440,height:1000},{width:886,height:865},{width:768,height:900},{width:390,height:844},{width:360,height:640}]){
     await page.setViewportSize(viewport);await page.goto('/');
     await expect(page.locator('.client-backdrop')).toHaveCount(0);
     await expectHorizontallyCentered(page,'.assistant-panel');
@@ -207,5 +207,28 @@ test('short mobile interview scrolls the conversation while keeping controls rea
   await expect(page.getByRole('button',{name:'结束对话'})).toBeInViewport();
   await expectInsideViewport(page,'.assistant-controls');
   expect(await page.locator('.assistant-content').evaluate(element=>element.scrollHeight>element.clientHeight)).toBe(true);
+  await expectNoPageOverflow(page);
+});
+
+
+test('client topic selection and pause controls work with a narrow keyboard layout',async({page})=>{
+  await stubClient(page,null);await page.setViewportSize({width:360,height:640});await page.goto('/');
+  const topic=page.getByRole('button',{name:'长期护理 照护偏好与家庭支持'});
+  for(let step=0;step<8&&!(await topic.evaluate(element=>element===document.activeElement));step+=1)await page.keyboard.press('Tab');
+  await expect(topic).toBeFocused();
+  expect(await topic.evaluate(element=>element.matches(':focus-visible'))).toBe(true);
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('button',{name:'开始连续语音对话'})).toBeInViewport();
+  const identity=await page.locator('.assistant-identity').boundingBox();
+  const actions=await page.locator('.interview-header-actions').boundingBox();
+  expect(identity!.x+identity!.width).toBeLessThanOrEqual(actions!.x);
+  await page.getByRole('button',{name:'暂停访谈'}).click();
+  await expect(page.locator('.interview-status')).toHaveText('访谈已暂停');
+  await expect(page.getByRole('button',{name:'恢复访谈'})).toBeInViewport();
+  await expect(page.getByRole('button',{name:'结束对话'})).toBeInViewport();
+  await expect(page.getByRole('button',{name:'开始连续语音对话'})).toHaveCount(0);
+  await page.getByRole('button',{name:'恢复访谈'}).click();
+  await expect(page.getByRole('button',{name:'开始连续语音对话'})).toBeInViewport();
+  await expect(page.locator('.interview-status')).toHaveText('等待开始');
   await expectNoPageOverflow(page);
 });

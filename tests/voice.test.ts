@@ -125,10 +125,11 @@ test('voice relay locks setup, persists final turns, forwards audio, and drains 
 
   const persisted: Array<{ eventId: string; turnId: string; role: string; text: string; final?:boolean }> = [];
   const statuses: string[] = [];
+  let geminiContextCalls=0;
   const hooks: VoiceHooks = {
     consumeToken: (token) => ['live-token', 'live-token-2'].includes(token) ? { sessionId: 'live-session', caseId: 'case-1' } : null,
     isActive: () => true,
-    getContext: () => JSON.stringify({knownFacts:[{key:'income',value:80000,currency:'USD',period:'year'}],missingPriorityItems:[{key:'expenses',question:'确认支出周期'}],conversationPlan:{focusTopics:['expenses'],optionalTopics:['reserve'],deferredTopics:['care'],phase:'summarize',questionTurns:8,softQuestionLimit:8,maxQuestionTurns:10},transcript:Array.from({length:20},(_,index)=>({id:`m-${index}`,role:'user',text:`${index===0?'oldest-marker':index===19?'latest-marker':'turn'}-${index}-`+'x'.repeat(1_900)}))}),
+    getContext: () => {geminiContextCalls+=1;return JSON.stringify({knownFacts:[{key:'income',value:80000,currency:'USD',period:'year'}],missingPriorityItems:[{key:'expenses',question:'确认支出周期'}],conversationPlan:{focusTopics:['expenses'],optionalTopics:['reserve'],deferredTopics:['care'],phase:'summarize',questionTurns:8,softQuestionLimit:8,maxQuestionTurns:10},transcriptMemory:Array.from({length:12},(_,index)=>({key:'goal',sourceMessageIds:[`memory-${index}`],status:'answered',excerpt:index===0?'oldest-memory':index===11?'latest-memory':`memory-${index}`})),transcript:Array.from({length:20},(_,index)=>({id:`m-${index}`,role:'user',text:`${index===0?'oldest-marker':index===19?'latest-marker':'turn'}-${index}-`+'x'.repeat(1_900)}))});},
     persist: (_session, event) => { persisted.push(event); },
     status: (_session, state) => { statuses.push(state); },
   };
@@ -156,8 +157,11 @@ test('voice relay locks setup, persists final turns, forwards audio, and drains 
   assert.match(instruction,/80000/);
   assert.match(instruction,/latest-marker/);
   assert.doesNotMatch(instruction,/oldest-marker/);
+  assert.match(instruction,/latest-memory/);
+  assert.doesNotMatch(instruction,/oldest-memory/);
   assert.match(instruction,/"phase":"summarize"/);
   assert.match(instruction,/准确承接客户的意思/);
+  assert.match(instruction,/最终客户转写/);
   assert.deepEqual(setup.contextWindowCompression,{slidingWindow:{}});
   assert.deepEqual(setup.sessionResumption,{});
   assert.equal((setup.realtimeInputConfig as {activityHandling?:string}).activityHandling,'START_OF_ACTIVITY_INTERRUPTS');
@@ -180,12 +184,21 @@ test('voice relay locks setup, persists final turns, forwards audio, and drains 
     turnComplete: true,
   } }));
   await waitUntil(() => persisted.length === 2);
+  // Persistence precedes WebSocket delivery; inspect the browser only after its turn ends.
+  await waitUntil(() => browserEvents.some((event) => JSON.parse(event).type === 'turnComplete'));
   assert.deepEqual(persisted.map((event) => event.role), ['user', 'assistant']);
   assert.notEqual(persisted[0].eventId, persisted[1].eventId);
   assert.match(persisted[0].eventId, /^live-session:voice:[0-9a-f-]+:1:user$/);
   assert.match(persisted[0].turnId, /^live-session:voice:[0-9a-f-]+:turn:1$/);
   assert(browserEvents.some((event) => event.includes('"type":"audio"')));
   assert(browserEvents.some(event=>event.includes('谢谢，我会记录并交由顾问复核。')));
+  const geminiEvents=browserEvents.map(event=>JSON.parse(event) as Record<string,unknown>);
+  const geminiAudio=geminiEvents.find(event=>event.type==='audio');
+  const geminiFinal=geminiEvents.find(event=>event.type==='transcript'&&event.role==='assistant'&&event.final===true);
+  const geminiComplete=geminiEvents.find(event=>event.type==='turnComplete');
+  assert.equal(geminiAudio?.eventId,persisted[1].eventId);assert.equal(geminiFinal?.eventId,persisted[1].eventId);assert.equal(geminiComplete?.eventId,persisted[1].eventId);
+  assert.equal(geminiContextCalls,1,'Gemini keeps the initial snapshot because its Live protocol has no safe instruction-only update');
+  assert.equal(upstreamMessages.filter(message=>Boolean(message.setup)).length,1);assert.equal(upstreamMessages.filter(message=>Boolean(message.clientContent)).length,1);
 
   const duplicateModulePath = '../lib/voice-server.ts?duplicate=integration';
   const duplicateModule = await import(duplicateModulePath) as typeof import('../lib/voice-server');
@@ -291,7 +304,7 @@ test('OpenAI realtime relay uses 24k audio, source item IDs, VAD interruption, a
     {id:'K_public',title:'公开家庭保障讨论示例',path:'knowledge/family.md',url:`https://github.com/ovo0809/AconGlobalBot/blob/${'a'.repeat(40)}/knowledge/family.md`,revision:'a'.repeat(40),startLine:1,endLine:2,excerpt:'讨论家庭保障时核实家庭责任。',reviewStatus:'demo_unapproved'},
     {id:'K_local',title:'本地核对草稿',path:'knowledge/local.md',url:'knowledge://local/knowledge/local.md',revision:'b'.repeat(64),startLine:1,endLine:2,excerpt:'local-reference-must-not-be-in-customer-network',reviewStatus:'reference_only'},
   ]};
-  const persisted:Array<{role:string;text:string;final?:boolean;interrupted?:boolean;sourceItemId?:string;turnId:string;knowledge?:KnowledgeContext}>=[];
+  const persisted:Array<{eventId:string;role:string;text:string;final?:boolean;interrupted?:boolean;sourceItemId?:string;turnId:string;knowledge?:KnowledgeContext}>=[];
   const hooks:VoiceHooks={consumeToken:()=>({sessionId:'openai-session',caseId:'case-1'}),isActive:()=>true,getContext:()=>JSON.stringify({facts:[],missingPriorityItems:[{key:'goal',question:'了解当前最重要的目标'}],conversationPlan:{focusTopics:['goal'],optionalTopics:['dependents'],deferredTopics:['care'],phase:'explore',questionTurns:0,softQuestionLimit:8,maxQuestionTurns:10},referenceKnowledge}),persist:(_session,event)=>{persisted.push(event);},status:()=>undefined};
   const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'openai-test-key',model:'gpt-realtime-2.1'}});
   await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -325,6 +338,9 @@ test('OpenAI realtime relay uses 24k audio, source item IDs, VAD interruption, a
   assert.deepEqual(persisted.map(event=>({role:event.role,source:event.sourceItemId,interrupted:Boolean(event.interrupted)})),[
     {role:'user',source:'user-item-1',interrupted:false},{role:'assistant',source:'assistant-item-1',interrupted:true},
   ]);
+  const openAIAudio=events.find(event=>event.type==='audio'&&event.itemId==='assistant-item-1');
+  const openAIFinal=events.find(event=>event.type==='transcript'&&event.role==='assistant'&&event.final===true);
+  assert.equal(openAIAudio?.eventId,persisted.find(event=>event.role==='assistant')?.eventId);assert.equal(openAIFinal?.eventId,openAIAudio?.eventId);
   const userFinalIndex=events.findIndex(event=>event.type==='transcript'&&event.role==='user'&&event.final===true);
   const turnCompleteIndex=events.findIndex(event=>event.type==='turnComplete');
   assert(userFinalIndex>=0&&turnCompleteIndex>userFinalIndex);
@@ -333,6 +349,116 @@ test('OpenAI realtime relay uses 24k audio, source item IDs, VAD interruption, a
   assert(events.some(event=>event.type==='transcript'&&event.role==='user'&&event.text==='我想保障家人。'));
   const truncate=received.find(event=>event.type==='conversation.item.truncate');assert.equal(truncate?.item_id,'assistant-item-1');assert.equal(truncate?.audio_end_ms,10);
   assert.deepEqual(await closeVoiceSession('openai-session',500),{timedOut:false});
+});
+
+test('OpenAI refreshes future-turn instructions once after a persisted final customer transcript',async(t)=>{
+  addUsageTestCase('case-context-refresh');
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});
+  await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');
+  const received:Record<string,unknown>[]=[];let provider:WebSocket|undefined;let responseCreates=0;
+  upstream.on('connection',socket=>{
+    provider=socket;socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));
+    socket.on('message',data=>{
+      const event=JSON.parse(data.toString()) as Record<string,unknown>;received.push(event);
+      if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
+      if(event.type==='response.create'){
+        responseCreates+=1;
+        socket.send(JSON.stringify({type:'response.created',response:{id:`context-opening-${responseCreates}`}}));
+        socket.send(JSON.stringify({type:'response.done',response:{id:`context-opening-${responseCreates}`,usage:realtimeUsage()}}));
+      }
+    });
+  });
+  const oldKnowledge:KnowledgeContext={status:'ready',revision:'old-reference',notices:['OLD_REFERENCE'],sources:[]};
+  const newKnowledge:KnowledgeContext={status:'ready',revision:'new-reference',notices:['NEW_REFERENCE'],sources:[]};
+  let contextCalls=0;const persisted:Array<{eventId:string;role:string;final?:boolean;knowledge?:KnowledgeContext}>=[];
+  const hooks:VoiceHooks={
+    consumeToken:()=>({sessionId:'context-refresh-session',caseId:'case-context-refresh'}),isActive:()=>true,
+    getContext:()=>{contextCalls+=1;return JSON.stringify(contextCalls===1?{transcriptMemory:[{key:'goal',sourceMessageIds:['old-message'],status:'answered',excerpt:'initial-answer'}],referenceKnowledge:oldKnowledge}:{transcriptMemory:[{key:'goal',sourceMessageIds:['fresh-message'],status:'answered',excerpt:'fresh-final-answer'}],referenceKnowledge:newKnowledge});},
+    persist:(_session,event)=>{persisted.push(event);},status:()=>undefined,
+  };
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'test-key',model:'gpt-realtime-2.1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');
+  const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=context-refresh-token`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const browserEvents:Record<string,unknown>[]=[];browser.on('message',data=>browserEvents.push(JSON.parse(data.toString()) as Record<string,unknown>));
+  await waitUntil(()=>browserEvents.some(event=>event.type==='ready')&&Boolean(provider));
+  provider!.send(JSON.stringify({type:'conversation.item.input_audio_transcription.delta',item_id:'interim-only',delta:'尚未完成'}));
+  await waitUntil(()=>browserEvents.some(event=>event.type==='transcript'&&event.final===false&&event.text==='尚未完成'));
+  provider!.send(JSON.stringify({type:'response.created',response:{id:'assistant-only-response'}}));
+  provider!.send(JSON.stringify({type:'response.output_item.added',response_id:'assistant-only-response',item:{id:'assistant-only-item'}}));
+  provider!.send(JSON.stringify({type:'response.output_audio_transcript.done',response_id:'assistant-only-response',item_id:'assistant-only-item',transcript:'助手最终消息'}));
+  provider!.send(JSON.stringify({type:'response.done',response:{id:'assistant-only-response',usage:realtimeUsage()}}));
+  await waitUntil(()=>persisted.some(event=>event.role==='assistant'));
+  assert.equal(contextCalls,1,'interim and assistant transcripts must not refresh customer context');
+  provider!.send(JSON.stringify({type:'response.created',response:{id:'in-flight-response'}}));
+  provider!.send(JSON.stringify({type:'response.output_item.added',response_id:'in-flight-response',item:{id:'in-flight-item'}}));
+  provider!.send(JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'refresh-user-1',transcript:'这是最终客户回答',usage:{type:'duration',seconds:.01}}));
+  provider!.send(JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'refresh-user-1',transcript:'这是最终客户回答',usage:{type:'duration',seconds:.01}}));
+  await waitUntil(()=>received.filter(event=>event.type==='session.update').length===2);
+  const updates=received.filter(event=>event.type==='session.update');
+  assert.equal(contextCalls,2);assert.equal(persisted.filter(event=>event.role==='user'&&event.final).length,1);assert.equal(responseCreates,1,'instruction refresh must not generate another reply');
+  assert.match(JSON.stringify((updates[0].session as {instructions?:string}).instructions),/initial-answer/);
+  assert.match(JSON.stringify((updates[1].session as {instructions?:string}).instructions),/fresh-final-answer/);
+  assert.match(JSON.stringify((updates[1].session as {instructions?:string}).instructions),/OLD_REFERENCE/);
+  assert.doesNotMatch(JSON.stringify((updates[1].session as {instructions?:string}).instructions),/NEW_REFERENCE/);
+  assert.deepEqual(Object.keys(updates[1].session as object).sort(),['instructions','type']);
+  assert(!JSON.stringify(browserEvents).includes('fresh-final-answer'),'refreshed internal context must stay server-side');
+  provider!.send(JSON.stringify({type:'response.output_audio_transcript.done',response_id:'in-flight-response',item_id:'in-flight-item',transcript:'刷新期间已开始的助手消息'}));
+  provider!.send(JSON.stringify({type:'response.done',response:{id:'in-flight-response',usage:realtimeUsage()}}));
+  await waitUntil(()=>persisted.some(event=>event.eventId.includes('in-flight-item')));
+  assert.deepEqual(persisted.find(event=>event.eventId.includes('in-flight-item'))?.knowledge,oldKnowledge);
+  assert.equal(responseCreates,1,'context refresh and provenance checks must not generate another reply');
+  assert.deepEqual(await closeVoiceSession('context-refresh-session',500),{timedOut:false});
+});
+
+test('OpenAI context refresh failures are nonfatal and stale generations never replace newer guidance',async(t)=>{
+  addUsageTestCase('case-context-refresh-races');
+  const upstream=new WebSocketServer({host:'127.0.0.1',port:0});
+  await new Promise<void>(resolve=>upstream.once('listening',resolve));
+  const upstreamAddress=upstream.address();assert(upstreamAddress&&typeof upstreamAddress!=='string');
+  const received:Record<string,unknown>[]=[];let provider:WebSocket|undefined;
+  upstream.on('connection',socket=>{
+    provider=socket;socket.send(JSON.stringify({type:'session.created',session:{model:'gpt-realtime-2.1'}}));
+    socket.on('message',data=>{
+      const event=JSON.parse(data.toString()) as Record<string,unknown>;received.push(event);
+      if(event.type==='session.update')socket.send(JSON.stringify({type:'session.updated'}));
+      if(event.type==='response.create'){
+        socket.send(JSON.stringify({type:'response.created',response:{id:'context-race-opening'}}));
+        socket.send(JSON.stringify({type:'response.done',response:{id:'context-race-opening',usage:realtimeUsage()}}));
+      }
+    });
+  });
+  let releaseOlder!: (value:string)=>void;const older=new Promise<string>(resolve=>{releaseOlder=resolve;});
+  let releaseAfterFinish!: (value:string)=>void;const afterFinish=new Promise<string>(resolve=>{releaseAfterFinish=resolve;});
+  let contextCalls=0;const diagnostics:unknown[]=[];
+  const hooks:VoiceHooks={
+    consumeToken:()=>({sessionId:'context-refresh-race-session',caseId:'case-context-refresh-races'}),isActive:()=>true,
+    getContext:()=>{contextCalls+=1;if(contextCalls===1)return '{"marker":"initial"}';if(contextCalls===2)return older;if(contextCalls===3)return '{"marker":"newer"}';if(contextCalls===4)throw new Error('local read rejected');if(contextCalls===5)return new Promise<string>(()=>undefined);return afterFinish;},
+    persist:()=>undefined,status:()=>undefined,diagnostic:(_session,event)=>{diagnostics.push(event);},
+  };
+  const server=createServer();const relay=attachVoiceServer(server,hooks,{upstreamUrl:`ws://127.0.0.1:${upstreamAddress.port}`,configOverride:{provider:'openai',apiKey:'test-key',model:'gpt-realtime-2.1'}});
+  await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await relay.close();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
+  const address=server.address();assert(address&&typeof address!=='string');
+  const browser=new WebSocket(`ws://127.0.0.1:${address.port}/voice?token=context-race-token`,{headers:{Origin:`http://127.0.0.1:${address.port}`}});
+  const browserEvents:Record<string,unknown>[]=[];browser.on('message',data=>browserEvents.push(JSON.parse(data.toString()) as Record<string,unknown>));
+  await waitUntil(()=>browserEvents.some(event=>event.type==='ready')&&Boolean(provider));
+  const emitFinal=(id:string)=>provider!.send(JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:id,transcript:`answer-${id}`,usage:{type:'duration',seconds:.01}}));
+  emitFinal('older');await waitUntil(()=>contextCalls===2);emitFinal('newer');
+  await waitUntil(()=>received.filter(event=>event.type==='session.update').length===2);
+  releaseOlder('{"marker":"older-must-not-win"}');await new Promise(resolve=>setTimeout(resolve,25));
+  const appliedUpdates=received.filter(event=>event.type==='session.update');
+  assert.equal(appliedUpdates.length,2);assert.match(JSON.stringify(appliedUpdates[1]),/newer/);assert.doesNotMatch(JSON.stringify(received),/older-must-not-win/);
+  emitFinal('rejected');await waitUntil(()=>contextCalls===4&&diagnostics.some(event=>(event as {code?:unknown}).code==='context_unavailable'));
+  assert.equal(browser.readyState,WebSocket.OPEN);assert.equal(received.filter(event=>event.type==='session.update').length,2);
+  const diagnosticCount=diagnostics.length;emitFinal('timed-out');await waitUntil(()=>diagnostics.length>diagnosticCount,2_500);
+  assert.equal(browser.readyState,WebSocket.OPEN);assert.equal(received.filter(event=>event.type==='session.update').length,2);
+  emitFinal('after-finish');await waitUntil(()=>contextCalls===6);
+  assert.deepEqual(await closeVoiceSession('context-refresh-race-session',500),{timedOut:false});
+  releaseAfterFinish('{"marker":"closed-must-not-apply"}');await new Promise(resolve=>setTimeout(resolve,25));
+  assert.equal(received.filter(event=>event.type==='session.update').length,2);assert.doesNotMatch(JSON.stringify(received),/closed-must-not-apply/);
 });
 
 test('OpenAI assistant final waits for response end so a late VAD interruption is retained',async(t)=>{

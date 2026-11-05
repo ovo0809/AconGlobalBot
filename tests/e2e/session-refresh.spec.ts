@@ -15,6 +15,42 @@ function deferred() {
   return {promise,resolve};
 }
 
+for(const failBootstrap of [false,true]){
+  test(`entering client mode clears private DOM in every tab before bootstrap ${failBootstrap?'fails':'finishes'}`,async({page,context})=>{
+    const release=deferred();let entered=false,checks=0;
+    const record={id:'boundary-case',clientId:'boundary-client',ownerAgentId:'boundary-advisor',assignedReviewerId:'reviewer-refresh',status:'draft',entry:null,reportVersion:0,createdAt:'2026-10-31T00:00:00Z',updatedAt:'2026-10-31T00:00:00Z',clientName:'合成权限边界客户'};
+    const advisor={...bootstrap(),user:{...bootstrap().user,id:record.ownerAgentId,role:'advisor'},cases:[record],activeCase:record,
+      clients:[{id:record.clientId,name:record.clientName,state:'CA',language:'中文',ownerAgentId:record.ownerAgentId}],
+      messages:[{id:'private-message',caseId:record.id,sessionId:'advisor-note',role:'user',text:'仅顾问可见的合成历史',final:true}]};
+    await context.route('**/api/bootstrap*',async route=>{
+      if(!entered)return route.fulfill({json:advisor});
+      checks++;await release.promise;
+      return route.fulfill(failBootstrap?{status:503,json:{error:'synthetic bootstrap failure'}}:{json:{...bootstrap(),mode:'client',user:null,clientSession:{id:'boundary-interview',state:'active',entry:null}}});
+    });
+    await context.route('**/api/action',async route=>{
+      expect(route.request().postDataJSON().action).toBe('enterClient');entered=true;
+      await route.fulfill({json:{ok:true,caseId:record.id}});
+    });
+    await page.goto('/');await expect(page.locator('.case-sidebar')).toBeVisible();
+    const mirror=await context.newPage();await mirror.goto('/');await expect(mirror.locator('.case-sidebar')).toBeVisible();
+    await page.getByRole('button',{name:'开始客户访谈'}).click();
+    try{
+      await expect.poll(()=>checks).toBeGreaterThanOrEqual(1);
+      for(const tab of [page,mirror]){
+        await expect(tab.locator('.case-sidebar')).toHaveCount(0);
+        await expect(tab.getByText('仅顾问可见的合成历史',{exact:true})).toHaveCount(0);
+        await expect(tab.getByText('正在恢复安全会话…')).toBeVisible();
+      }
+    }finally{release.resolve();}
+    for(const tab of [page,mirror]){
+      if(failBootstrap)await expect(tab.getByRole('button',{name:'重新连接'})).toBeVisible();
+      else await expect(tab.getByText('受限客户模式')).toBeVisible();
+      await expect(tab.locator('.case-sidebar')).toHaveCount(0);
+    }
+    await mirror.close();
+  });
+}
+
 async function openDraft(page:Page) {
   await page.route('**/api/materials*',route=>route.fulfill({json:{items:[],provider:'mock',configured:true}}));
   await page.goto('/');

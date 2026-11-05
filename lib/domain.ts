@@ -13,6 +13,30 @@ export interface Message { responseStatus?:'incomplete'|'cancelled'|'failed' }
 export interface AnalysisItem { knowledgeRefs?:string[] }
 export interface ReportInput { knowledge?:KnowledgeContext }
 export interface ReportContent { knowledge?:KnowledgeContext }
+export interface ReportContent {
+  formatVersion?:string;
+  editorial?:ReportEditorialReview;
+  owner?:Pick<User,'id'|'name'|'email'>;
+  sourceReferences?:(Message & {label:string})[];
+  foundation?:{ageYears:number|null;maritalStatus:string;state:string};
+}
+export interface ReportWritingBrief {
+  audience:string;
+  purpose:string;
+  knownFactKeys:string[];
+  unknownFactKeys:string[];
+  declinedFactKeys:string[];
+  conflictingFactKeys:string[];
+  incompleteTranscript:boolean;
+}
+export interface ReportEditorialReview {
+  version:'doc-coauthoring/1';
+  method:'local_rules';
+  status:'needs_attention'|'ready_for_human_review';
+  brief:ReportWritingBrief;
+  checks:{id:string;question:string;answer:string;status:'located'|'needs_attention'}[];
+  issues:{code:string;section?:string;message:string}[];
+}
 export interface User { id:string; name:string; email:string; role:Role; orgId:string; emailVerified:boolean; accessScope?:'public_tester'; sharedRunId?:string }
 export interface Client { id:string; name:string; birthday:string; gender:string; phone:string; email:string; maritalStatus:string; state:string; language:string; ownerAgentId:string; consentStatus:string; createdAt:string; nextCaseNumber?:number }
 export interface Case { id:string; clientId:string; ownerAgentId:string; status:string; entry:Category|null; createdAt:string; updatedAt:string; assignedReviewerId:string|null; reportVersion:number; clientName?:string; deletedAt?:string|null; deletedBy?:string|null; caseNumber?:number }
