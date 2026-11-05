@@ -60,6 +60,8 @@ interface ActiveVoice {
   resumeDisabled: boolean;
   upstreamReconnects: number;
   context: string;
+  connectionKnowledge?:KnowledgeContext;
+  contextRefreshGeneration:number;
   lastOutputItemId: string | null;
   lastOutputAudioMs: number;
   openAIInputText: Map<string,string>;
@@ -119,6 +121,7 @@ const setupLocks=new Set<string>();
 const LIVE_ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 const MAX_TEXT = 2_000;
 const MAX_CONTEXT = 16_000;
+const CONTEXT_REFRESH_TIMEOUT_MS=2_000;
 const MAX_AUDIO_BASE64 = 256_000;
 const RESUME_TTL_MS = 2 * 60 * 60 * 1_000;
 const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
@@ -194,16 +197,22 @@ function makeTurnId(active: ActiveVoice) {
   return `${active.sessionId}:voice:${active.connectionId}:turn:${active.turn}`;
 }
 
+function transcriptEventId(active:ActiveVoice,role:'user'|'assistant',sourceItemId?:string){
+  const safeSource=sourceItemId?.replace(/[^A-Za-z0-9_.:-]/g,'_').slice(0,256);
+  return safeSource?`${active.sessionId}:voice:${active.connectionId}:${safeSource}:${role}`:makeEventId(active,role);
+}
+
 async function persistTranscript(active: ActiveVoice, role: 'user' | 'assistant', text: string, final = true, interrupted = false, sourceItemId?:string, turnId?:string,responseStatus?:'incomplete'|'cancelled'|'failed') {
   const normalized = text.trim();
   if (!normalized || (!active.hooks.isActive(active.sessionId) && !active.closing)) return;
   const safeSource=sourceItemId?.replace(/[^A-Za-z0-9_.:-]/g,'_').slice(0,256);
-  const eventId = safeSource?`${active.sessionId}:voice:${active.connectionId}:${safeSource}:${role}`:makeEventId(active, role);
+  const eventId = transcriptEventId(active,role,safeSource);
   if (active.seen.has(eventId)) return;
   active.seen.add(eventId);
+  const contextRefreshGeneration=role==='user'&&final?++active.contextRefreshGeneration:null;
   let write:Promise<void>;
   // This is the bounded context actually sent upstream, not a fresh retrieval.
-  const knowledge:KnowledgeContext|undefined=role==='assistant'?JSON.parse(active.context).referenceKnowledge:undefined;
+  const knowledge=role==='assistant'?active.connectionKnowledge:undefined;
   try{
     write=Promise.resolve(active.hooks.persist(active.sessionId, {
       eventId,
@@ -222,7 +231,33 @@ async function persistTranscript(active: ActiveVoice, role: 'user' | 'assistant'
   catch(cause){active.seen.delete(eventId);throw cause;}
   finally { active.pendingPersists.delete(write); }
   const publicKnowledge=publicKnowledgeContext(knowledge);
-  send(active.browser, { type: 'transcript', role, text: normalized, final, interrupted, incomplete: !final, ...(responseStatus?{responseStatus}:{}), ...(publicKnowledge?{knowledge:publicKnowledge}:{}) });
+  send(active.browser, { type: 'transcript', role, text: normalized, final, interrupted, incomplete: !final, eventId, ...(responseStatus?{responseStatus}:{}), ...(publicKnowledge?{knowledge:publicKnowledge}:{}) });
+  if(contextRefreshGeneration!==null)void refreshContextForFutureTurns(active,contextRefreshGeneration);
+  return eventId;
+}
+
+async function refreshContextForFutureTurns(active:ActiveVoice,generation:number){
+  if(active.provider!=='openai'||active.closing||active.closePromise||!active.openAIReady||sessions.get(active.sessionId)!==active||!active.hooks.isActive(active.sessionId))return;
+  let context:string;
+  try{
+    const rawContext=await withTimeout(Promise.resolve().then(()=>active.hooks.getContext(active.sessionId)),CONTEXT_REFRESH_TIMEOUT_MS);
+    const refreshed=JSON.parse(boundedContext(rawContext)) as Record<string,unknown>;
+    if(active.connectionKnowledge)refreshed.referenceKnowledge=active.connectionKnowledge;
+    else delete refreshed.referenceKnowledge;
+    context=boundedContext(JSON.stringify(refreshed)).replace(/<\/?case_context>/gi,'[case-context-tag-removed]');
+  }catch{
+    callDiagnostic(active.hooks,active.sessionId,{code:'context_unavailable',stage:'context'});
+    return;
+  }
+  if(generation!==active.contextRefreshGeneration||active.closing||active.closePromise||sessions.get(active.sessionId)!==active||!active.hooks.isActive(active.sessionId))return;
+  const upstream=active.upstream;
+  if(!upstream||upstream.readyState!==WebSocket.OPEN)return;
+  const instructions=systemInstruction(context);
+  active.openAITextChars+=Buffer.byteLength(instructions,'utf8');
+  if(checkOpenAISpending(active))return;
+  try{upstream.send(JSON.stringify({type:'session.update',session:{type:'realtime',instructions}}));}
+  catch{return;}
+  active.context=context;
 }
 
 const persistFinal = (active:ActiveVoice,role:'user'|'assistant',text:string,interrupted=false) =>
@@ -267,7 +302,7 @@ async function finalizeTurn(active: ActiveVoice) {
   const inputText = active.inputText;
   const outputText = active.outputText;
   const interrupted = active.outputInterrupted;
-  await Promise.all([persistFinal(active, 'user', inputText), persistFinal(active, 'assistant', outputText, interrupted)]);
+  const [,assistantEventId]=await Promise.all([persistFinal(active, 'user', inputText), persistFinal(active, 'assistant', outputText, interrupted)]);
   active.inputText = '';
   active.inputInterimText='';
   active.outputText = '';
@@ -275,7 +310,7 @@ async function finalizeTurn(active: ActiveVoice) {
   active.upstreamReconnects = 0;
   active.turn += 1;
   await active.hooks.status(active.sessionId, active.closing ? 'ended' : 'listening');
-  send(active.browser, { type: 'turnComplete' });
+  send(active.browser, { type: 'turnComplete', ...(assistantEventId?{eventId:assistantEventId}:{}) });
   if (active.closing) await closeBoth(active);
 }
 
@@ -340,7 +375,7 @@ async function handleUpstream(active: ActiveVoice, source: WebSocket, raw: WebSo
       const inlineData = (part as { inlineData?: { data?: unknown; mimeType?: unknown } }).inlineData;
       if (typeof inlineData?.data === 'string' && typeof inlineData.mimeType === 'string' && inlineData.mimeType.startsWith('audio/pcm')) {
         await active.hooks.status(active.sessionId, 'speaking');
-        send(active.browser, { type: 'audio', data: inlineData.data, mimeType: inlineData.mimeType });
+        send(active.browser, { type: 'audio', data: inlineData.data, mimeType: inlineData.mimeType, eventId:transcriptEventId(active,'assistant') });
       }
     }
   }
@@ -435,7 +470,17 @@ function boundedContext(value:unknown){
       return fact;
     }):[];
     const transcript=Array.isArray(parsed.transcript)?parsed.transcript:[];
-    const base={...parsed,knownFacts:facts,transcript:[] as unknown[]};
+    const transcriptMemory=Array.isArray(parsed.transcriptMemory)?parsed.transcriptMemory.slice(-8).map(row=>{
+      if(!row||typeof row!=='object')return row;
+      const item=row as Record<string,unknown>;
+      return {
+        key:String(item.key??'').slice(0,80),
+        sourceMessageIds:Array.isArray(item.sourceMessageIds)?item.sourceMessageIds.slice(-8).map(id=>String(id).slice(0,128)):[],
+        status:String(item.status??'').slice(0,24),
+        excerpt:String(item.excerpt??'').slice(0,300),
+      };
+    }):[];
+    const base={...parsed,knownFacts:facts,transcriptMemory,transcript:[] as unknown[]};
     let serialized=JSON.stringify(base);
     for(let index=transcript.length-1;index>=0;index-=1){
       const row=transcript[index];
@@ -446,9 +491,17 @@ function boundedContext(value:unknown){
       serialized=candidate;
     }
     if(serialized.length>MAX_CONTEXT){
-      serialized=JSON.stringify({caseId:parsed.caseId??null,entryType:parsed.entryType??null,clientRecord:parsed.clientRecord??null,knownFacts:facts,missingPriorityItems:parsed.missingPriorityItems??[],conversationPlan:parsed.conversationPlan??null,transcript:[],contextTruncated:true});
+      serialized=JSON.stringify({caseId:parsed.caseId??null,entryType:parsed.entryType??null,clientRecord:parsed.clientRecord??null,knownFacts:facts,missingPriorityItems:parsed.missingPriorityItems??[],conversationPlan:parsed.conversationPlan??null,transcriptMemory,referenceKnowledge:parsed.referenceKnowledge,transcript:[],contextTruncated:true});
     }
-    return serialized.length<=MAX_CONTEXT?serialized:JSON.stringify({contextTruncated:true,conversationPlan:parsed.conversationPlan??null,knownFacts:facts.slice(0,18).map(row=>row&&typeof row==='object'?{...(row as Record<string,unknown>),sourceMessageIds:[]}:row)});
+    if(serialized.length<=MAX_CONTEXT)return serialized;
+    const compactFacts=facts.slice(0,18).map(row=>row&&typeof row==='object'?{...(row as Record<string,unknown>),sourceMessageIds:[]}:row);
+    const compactMemory=transcriptMemory.slice(-6);
+    let compact=JSON.stringify({contextTruncated:true,conversationPlan:parsed.conversationPlan??null,knownFacts:compactFacts,transcriptMemory:compactMemory,referenceKnowledge:parsed.referenceKnowledge});
+    while(compact.length>MAX_CONTEXT&&compactMemory.length){compactMemory.shift();compact=JSON.stringify({contextTruncated:true,conversationPlan:parsed.conversationPlan??null,knownFacts:compactFacts,transcriptMemory:compactMemory,referenceKnowledge:parsed.referenceKnowledge});}
+    while(compact.length>MAX_CONTEXT&&compactFacts.length){compactFacts.pop();compact=JSON.stringify({contextTruncated:true,conversationPlan:parsed.conversationPlan??null,knownFacts:compactFacts,transcriptMemory:compactMemory,referenceKnowledge:parsed.referenceKnowledge});}
+    if(compact.length<=MAX_CONTEXT)return compact;
+    const knowledgeOnly=JSON.stringify({contextTruncated:true,referenceKnowledge:parsed.referenceKnowledge});
+    return knowledgeOnly.length<=MAX_CONTEXT?knowledgeOnly:JSON.stringify({contextTruncated:true});
   }catch{
     return JSON.stringify({contextText:raw.slice(-Math.floor(MAX_CONTEXT*.8)),contextTruncated:true});
   }
@@ -459,7 +512,7 @@ function systemInstruction(context:string) {
     '你是 Aeconn 的客户访谈助手，不是保险顾问。目标是依据当前案例已知资料，主动提出下一条最有价值的澄清问题，并把回答交给系统保存为待核验事实。',
     INTERVIEW_CONVERSATION_RULES,
     '回答简短、自然，使用简体中文。可以先用一句话准确承接客户的意思，再问一个最有价值的独立问题；不要长篇复述，也不要在同一轮用“另外”“还有”追加第二问。优先处理 missingPriorityItems 与 conversationPlan.focusTopics；optionalTopics 只在确实影响当前目标时追问，deferredTopics 留给顾问。conversationPlan.phase 为 summarize 时应简短总结已知和未确定内容，并邀请客户补充或结束，不要为了凑时长继续提问。',
-    '案例上下文是连接开始时的快照；连接中的最新客户回答和已有对话优先。不得因为快照仍列为缺失就重复询问客户刚刚已明确回答、表示不知道或拒绝回答的内容，也不得从回答中猜测或创造事实。',
+    '案例上下文可能是连接开始时的快照；连接中每条最终客户转写、最新客户回答和已有对话始终优先。不得因为快照仍列为缺失就重复询问客户刚刚已明确回答、表示不知道或拒绝回答的内容，也不得从回答中猜测或创造事实。',
     '客户说“不知道”时记录为未知并换到下一主题；客户说“不愿提供”时尊重并记录为拒绝，不施压，也不在本次访谈再次追问。',
     '只有金额缺少数值、币种或周期，或者答案存在会影响当前目标的明显矛盾时才补问；先中性说明缺口或复述两种说法，并只问一个确认问题，不自行覆盖旧值。',
     '不得给出内部分析、产品选择、报价、收益保证、核保结论、申请、退保、rollover 或资金转移指令。不得声称口头回答已经完成顾问确认。',
@@ -758,7 +811,7 @@ async function handleOpenAIUpstream(active:ActiveVoice,source:WebSocket,raw:WebS
     else active.openAIUsageUncertain=true;
     if(checkOpenAISpending(active))return;
     await active.hooks.status(active.sessionId,'speaking');
-    send(active.browser,{type:'audio',data:event.delta,mimeType:'audio/pcm;rate=24000',itemId:event.item_id,...(responseId?{responseId}:{})});return;
+    send(active.browser,{type:'audio',data:event.delta,mimeType:'audio/pcm;rate=24000',itemId:event.item_id,eventId:transcriptEventId(active,'assistant',event.item_id),...(responseId?{responseId}:{})});return;
   }
   if(type==='response.output_audio_transcript.delta'){
     if(typeof event.item_id==='string'&&typeof event.delta==='string'){
@@ -999,6 +1052,8 @@ async function acceptConnection(browser: WebSocket, req: IncomingMessage, hooks:
     resumeDisabled: false,
     upstreamReconnects: 0,
     context,
+    connectionKnowledge:(JSON.parse(context) as {referenceKnowledge?:KnowledgeContext}).referenceKnowledge,
+    contextRefreshGeneration:0,
     lastOutputItemId:null,
     lastOutputAudioMs:0,
     openAIInputText:new Map(),

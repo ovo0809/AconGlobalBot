@@ -4,22 +4,22 @@ import { formatKnowledgePrompt, validateKnowledgeRefs, type KnowledgeContext } f
 import { factLabels } from './report-labels';
 
 export const INTERVIEW_QUESTIONS = {
-  goal: '这次最想先解决哪件事？您可以从最在意的地方说起。',
-  horizon: '这件事您希望什么时候开始安排？大致时间就可以。',
-  dependents: '如果您的收入暂时停下来，家里最需要照顾的是谁、哪些开销？',
+  goal: '这次最想先解决什么？',
+  horizon: '您大概希望什么时候开始安排？',
+  dependents: '家里谁最依赖您的收入？',
   state: '您目前居住在哪个州？',
-  employment: '您目前从事什么工作？收入是否稳定？',
-  income: '您的收入大约是多少？请说明币种，以及每月或每年。',
-  expenses: '家庭支出大约是多少？请说明币种及每月或每年。',
-  debt: '目前有哪些债务？如提供金额，请说明币种和一次性余额。',
-  reserve: '紧急储备大约是多少？请说明币种和一次性金额。',
-  assets: '可支配资产大约是多少？请说明币种和一次性金额。',
-  existing_life: '目前有哪些人寿保障？您认为是否覆盖家庭责任？',
+  employment: '您目前做什么工作？',
+  income: '收入大约多少？请带上币种和每月或每年。',
+  expenses: '家庭支出大约多少？请带上币种和每月或每年。',
+  debt: '目前有哪些债务？金额可按币种和当前余额说明。',
+  reserve: '紧急储备大约多少？请带上币种和当前余额。',
+  assets: '可支配资产大约多少？请带上币种和当前余额。',
+  existing_life: '目前有哪些人寿保障？',
   existing_di: '目前有哪些收入中断或伤残保障？',
-  existing_ltc: '针对照护这件事，您现在已经做了哪些准备？还没安排也没关系。',
-  budget: '在不影响日常生活的前提下，您愿意为这件事留出多少预算？大概金额、币种和按月还是按年就可以。',
+  existing_ltc: '针对照护，您已经做了哪些准备？',
+  budget: '不影响日常生活的话，您愿意留出多少预算？请带上币种和按月或按年。',
   liquidity: '您对随时取用资金有哪些需要？',
-  retirement: '您有哪些退休收入来源、计划和时间安排？',
+  retirement: '退休方面，您目前有哪些安排？',
   care: '如果以后需要别人照顾，您最希望怎样安排？',
 } as const;
 
@@ -66,6 +66,12 @@ export interface InterviewContext {
     sourceKind: 'customer' | 'advisor' | 'synthetic' | 'mixed' | 'unsourced';
   }>;
   transcript: Array<{ id: string; role: Message['role']; text: string }>;
+  transcriptMemory: Array<{
+    key: InterviewFactKey;
+    sourceMessageIds: string[];
+    status: 'answered' | 'unknown' | 'declined' | 'partial';
+    excerpt: string;
+  }>;
   askedTopics: InterviewFactKey[];
   answeredTopics: InterviewFactKey[];
   conversationPlan: {
@@ -172,11 +178,134 @@ function validateInputScope(input: InterviewInput): { caseId: string | null; fin
 }
 
 function topicForAssistantText(text: string): InterviewFactKey | null {
-  const normalized = normalize(text);
-  for (const key of FACT_KEYS) {
-    if (normalized.includes(normalize(INTERVIEW_QUESTIONS[key])) || normalized.startsWith(normalize(`关于${factLabels[key]}，`))) return key;
+  const questionSegments = text.split(/(?<=[。！!？?])/).filter(segment => /[？?]/.test(segment));
+  const candidates = questionSegments.length > 0 ? questionSegments : [text];
+  const topicPatterns: Partial<Record<InterviewFactKey, RegExp>> = {
+    goal: /(最想|最希望|最在意|主要想|先解决).{0,12}(什么|哪件|事情|问题)|今天.{0,8}(处理|解决).{0,5}(什么|哪件)/i,
+    horizon: /(什么时候|何时|大概多久|时间安排|计划何时).{0,8}(开始|安排|准备)?/i,
+    dependents: /(谁|哪些人).{0,10}(依赖|需要照顾|靠您的收入)|家里.{0,10}(照顾谁|哪些开销)/i,
+    state: /(住|居住).{0,8}(哪个州|哪一州|什么州)|所在州/i,
+    employment: /(做什么工作|从事什么|职业是什么|工作稳定|收入稳定吗)/i,
+    income: /(收入|工资|薪资|薪水).{0,10}(多少|币种|每月|每年)/i,
+    expenses: /(支出|开销|生活费).{0,10}(多少|币种|每月|每年)/i,
+    debt: /(债务|房贷|车贷|贷款|欠款).{0,10}(哪些|多少|余额)/i,
+    reserve: /(紧急|应急|备用).{0,8}(储备|储蓄|资金|金).{0,8}(多少|币种|余额)/i,
+    assets: /(资产|存款|投资账户|可支配资金).{0,10}(多少|币种|余额)/i,
+    existing_life: /(人寿|寿险).{0,10}(保障|保险|保额|覆盖)/i,
+    existing_di: /(伤残|失能|收入中断|收入保障).{0,10}(保障|保险|安排)/i,
+    existing_ltc: /(长期照护|长期护理|照护).{0,10}(保障|保险|准备|安排)/i,
+    budget: /(预算|愿意留出|愿意投入|负担).{0,10}(多少|币种|每月|每年)/i,
+    liquidity: /(流动性|随时取用|取用资金|用钱).{0,10}(需要|安排|要求)/i,
+    retirement: /(退休).{0,12}(计划|收入|时间|来源|安排)/i,
+    care: /(以后|将来|未来).{0,8}(需要照顾|有人照顾)|希望.{0,10}(怎么|怎样|哪里).{0,5}(照顾|照护)/i,
+  };
+  for (const candidate of candidates) {
+    const normalized = normalize(candidate);
+    for (const key of FACT_KEYS) {
+      if (normalized.includes(normalize(INTERVIEW_QUESTIONS[key])) || normalized.startsWith(normalize(`关于${factLabels[key]}，`))) return key;
+    }
+    for (const key of FACT_KEYS) {
+      if (topicPatterns[key]?.test(candidate)) return key;
+    }
   }
   return null;
+}
+
+type TranscriptMemoryItem = InterviewContext['transcriptMemory'][number];
+
+const memoryAnchorPattern: Record<InterviewFactKey, RegExp> = {
+  goal: /目标|最在意|最想|希望|想要|主要想|先解决|(?:我|我们|这次)想/i,
+  horizon: /明年|今年|后年|年内|个月后|年后|什么时候|何时|开始安排|开始准备|时间/i,
+  dependents: /孩子|子女|父母|配偶|家人|家庭责任|依赖|负担|照顾谁/i,
+  state: /居住|住在|所在州|哪个州|哪一州/i,
+  employment: /工作|职业|就业|雇主|上班|自雇/i,
+  income: /收入|工资|薪资|薪水/i,
+  expenses: /支出|开销|生活费|花费/i,
+  debt: /债务|房贷|车贷|贷款|欠款|信用卡/i,
+  reserve: /紧急储备|应急储备|紧急储蓄|应急储蓄|备用金|应急资金/i,
+  assets: /资产|存款|投资账户|可支配资金/i,
+  existing_life: /人寿|寿险|life insurance/i,
+  existing_di: /伤残|失能|收入中断|收入保障|disability/i,
+  existing_ltc: /长期照护|长期护理|long.?term care/i,
+  budget: /预算|愿意留出|愿意投入|能负担/i,
+  liquidity: /流动性|随时取用|取用资金|随时用钱/i,
+  retirement: /退休/i,
+  care: /照顾|照护|护理|养老院|留在家里|在家养老|家人.{0,4}协助|专业(?:护理)?人员|护理机构|照护机构|(?:希望|想|打算|计划|最好).{0,8}在家/i,
+};
+
+const memoryAnsweredPattern: Record<InterviewFactKey, RegExp> = {
+  goal: /(我|我们|这次).{0,4}(想|希望|最在意|主要想)|目标是|先解决/i,
+  horizon: /(明年|今年|后年|年内|\d+\s*(?:个)?月后|\d+\s*年后).{0,8}(开始|安排|准备)?|(?:开始|安排|准备).{0,8}(明年|今年|后年|年内)/i,
+  dependents: /(孩子|子女|父母|配偶|家人).{0,12}(依赖|需要|照顾|承担|负担)|不想让.{0,10}(孩子|家人).{0,8}(承担|负担)/i,
+  state: /(住在|居住在|所在州是).{0,12}/i,
+  employment: /(从事|做|工作是|职业是|自雇|上班).{0,14}|收入.{0,4}(稳定|不稳定)/i,
+  income: /(收入|工资|薪资|薪水).{0,12}\d|\d.{0,8}(收入|工资|薪资|薪水)/i,
+  expenses: /(支出|开销|生活费|花费).{0,12}\d|\d.{0,8}(支出|开销|生活费)/i,
+  debt: /(有|没有|目前).{0,8}(债务|房贷|车贷|贷款|欠款)|(?:债务|房贷|车贷|贷款|欠款).{0,12}\d/i,
+  reserve: /(紧急储备|应急储备|紧急储蓄|应急储蓄|备用金|应急资金).{0,12}(\d|有|没有)/i,
+  assets: /(资产|存款|投资账户|可支配资金).{0,12}(\d|有|没有)/i,
+  existing_life: /(有|没有|已有|公司提供).{0,8}(人寿|寿险)|(?:人寿|寿险).{0,8}(有|没有|已有|还在)/i,
+  existing_di: /(有|没有|已有|已经有|公司提供).{0,8}(伤残|失能|收入中断|收入保障)|(?:伤残|失能|收入中断|收入保障).{0,8}(?:保险|保障).{0,5}(?:我)?(?:有|没有|已有|还在)/i,
+  existing_ltc: /(有|没有|已有|已经有|公司提供).{0,8}(长期照护|长期护理)|(?:长期照护|长期护理).{0,8}(?:保险|保障).{0,5}(?:我)?(?:有|没有|已有|还在)/i,
+  budget: /(预算|愿意留出|愿意投入|能负担).{0,12}(\d|没有|暂不)/i,
+  liquidity: /(需要|希望|要).{0,10}(随时取用|流动性|随时用钱)|(?:随时取用|流动性).{0,10}(需要|要求)/i,
+  retirement: /(计划|准备|希望).{0,10}退休|退休.{0,10}(收入|时间|来源|安排|账户|\d)/i,
+  care: /(希望|想|打算|计划|最好).{0,16}(留在家里|在家(?:里)?|在家养老|养老院|由家人|家人.{0,4}协助|专业(?:护理)?人员|护理机构|照护机构)|(?:留在家里|在家(?:里)?).{0,8}(?:接受)?(?:照顾|照护|养老|由家人协助)|(?:在家养老|养老院|由家人|家人.{0,4}协助|专业(?:护理)?人员|护理机构|照护机构)/i,
+};
+
+function transcriptMemory(finalMessages: Message[]): TranscriptMemoryItem[] {
+  const remembered = new Map<InterviewFactKey, TranscriptMemoryItem>();
+  for (const message of finalMessages) {
+    if (message.role !== 'user' || messageSource(message) === 'advisor') continue;
+    const explicitMessageCorrection = /(更正|不对|确认|正确|应为|改为)/i.test(message.text);
+    const scopedText = message.text.replace(/(?:，|,)?(?:但是|不过|可是|然而|(?<!不)但)/g, '。');
+    const clauses = semanticClauses(scopedText).map(clause => clause.text);
+    for (const clause of clauses) {
+      if (/[？?]/.test(clause)) continue;
+      for (const key of FACT_KEYS) {
+        if (!memoryAnchorPattern[key].test(clause)) continue;
+        const declined = DECLINED_EVIDENCE_PATTERN.test(clause);
+        const unknown = UNKNOWN_EVIDENCE_PATTERN.test(clause);
+        const narrowUnknownDetail = unknown && (
+          (['existing_life', 'existing_di', 'existing_ltc'].includes(key) && /(保额|條款|条款|期限|给付|給付|范围|範圍|责任|責任|包不包)/i.test(clause))
+          || (key === 'retirement' && /(账户|帳戶).{0,8}(余额|餘額)/i.test(clause))
+        );
+        if (narrowUnknownDetail) continue;
+        let status: TranscriptMemoryItem['status'] | null = declined ? 'declined' : unknown && !narrowUnknownDetail ? 'unknown' : null;
+        if (!status && /(?:什么|多少|是否|怎么|怎样|哪个州|哪一州|什么州|哪(?:个|些|里)|吗|来着)/i.test(clause)) continue;
+        if (!status && AMOUNT_KEYS.has(key) && memoryAnsweredPattern[key].test(clause)) {
+          const numbers = exactNumberTokens(clause);
+          const currencies = detectedCurrencies(clause);
+          const periods = detectedPeriods(clause);
+          status = numbers?.length === 1 && currencies.length === 1 && periods.length === 1 ? 'answered' : 'partial';
+        }
+        if (!status && memoryAnsweredPattern[key].test(clause)) status = 'answered';
+        if (!status) continue;
+        const prior = remembered.get(key);
+        if (AMOUNT_KEYS.has(key) && prior) {
+          const priorNumbers = exactNumberTokens(prior.excerpt);
+          const currentNumbers = exactNumberTokens(clause);
+          const priorSignature = prior.status === 'answered' && priorNumbers?.length === 1
+            ? `${priorNumbers[0]}|${detectedCurrencies(prior.excerpt).join(',')}|${detectedPeriods(prior.excerpt).join(',')}`
+            : null;
+          const currentSignature = status === 'answered' && currentNumbers?.length === 1
+            ? `${currentNumbers[0]}|${detectedCurrencies(clause).join(',')}|${detectedPeriods(clause).join(',')}`
+            : null;
+          const explicitlyResolves = status === 'unknown' || status === 'declined' || (status === 'answered' && explicitMessageCorrection);
+          if ((priorSignature && currentSignature && priorSignature !== currentSignature) || (prior.status === 'partial' && prior.excerpt === '' && !explicitlyResolves)) {
+            status = 'partial';
+          }
+        }
+        remembered.set(key, {
+          key,
+          sourceMessageIds: [...new Set([...(prior?.sourceMessageIds ?? []), message.id])],
+          status,
+          excerpt: status === 'partial' && (prior?.status === 'answered' || prior?.excerpt === '') ? '' : redactPII(clause).slice(0, 180),
+        });
+      }
+    }
+  }
+  return [...remembered.values()];
 }
 
 /** Exact mock-only conversation controls are never stored as customer facts. */
@@ -209,6 +338,19 @@ function factSourceKind(fact: ProfileField, messagesById: Map<string, Message>):
   return fact.confirmedBy ? 'advisor' : 'unsourced';
 }
 
+function partialAmountQuestion(key: InterviewFactKey, excerpt: string): string {
+  const numbers = exactNumberTokens(excerpt);
+  if (excerpt === '') return `关于${factLabels[key]}，我听到不同金额；哪一个是目前要记录的金额？不确定也可以先跳过。`;
+  if (numbers === null) return `关于${factLabels[key]}，您能用一个数字说明金额吗？不确定也可以先跳过。`;
+  if (numbers.length !== 1) return `关于${factLabels[key]}，这几个金额中，哪一个是目前要记录的金额？不确定也可以先跳过。`;
+  const hasCurrency = detectedCurrencies(excerpt).length === 1;
+  const hasPeriod = detectedPeriods(excerpt).length === 1;
+  const missing: string[] = [];
+  if (!hasCurrency) missing.push('币种');
+  if (!hasPeriod) missing.push(['debt', 'reserve', 'assets'].includes(key) ? '是否为当前余额' : '每月还是每年');
+  return `关于${factLabels[key]}，还缺${missing.join('和')}，可以补充吗？不确定也可以先跳过。`;
+}
+
 export function buildInterviewContext(input: InterviewInput): InterviewContext {
   const { caseId, finalMessages, allFinalUserById } = validateInputScope(input);
   const sessionId = input.sessionId ?? finalMessages.at(-1)?.sessionId;
@@ -220,7 +362,13 @@ export function buildInterviewContext(input: InterviewInput): InterviewContext {
   const deferredTopics = askedTopics.filter(key => askedTopicSequence.filter(topic => topic === key).length >= 2);
   const questionTurns = sessionQuestions.length;
   const focusTopics = orderFor(input.entry);
-  const answeredTopics = input.facts.map((fact) => fact.key as InterviewFactKey);
+  const memory = transcriptMemory(finalMessages);
+  const memoryByKey = new Map(memory.map(item => [item.key, item]));
+  const finalMessageIndex = new Map(finalMessages.map((message, index) => [message.id, index]));
+  const answeredTopics = [...new Set([
+    ...input.facts.map((fact) => fact.key as InterviewFactKey),
+    ...memory.filter(item => item.status !== 'partial').map(item => item.key),
+  ])];
   const factsByKey = new Map(input.facts.map((fact) => [fact.key, fact]));
   const clientState = knownClientState(input.knownClient?.state);
   let missingPriorityItems: InterviewContext['missingPriorityItems'] = [];
@@ -233,15 +381,32 @@ export function buildInterviewContext(input: InterviewInput): InterviewContext {
   }
   for (const key of focusTopics) {
     const fact = factsByKey.get(key);
+    const remembered = memoryByKey.get(key);
     if (fact?.factStatus === 'conflicting') continue;
-    if (fact) continue; // unknown and declined are respected and are not repeatedly requested.
     if (deferredTopics.includes(key)) continue; // Deferring is not an invented unknown fact.
+    if (fact) {
+      const latestDivergentSourceIndex = Math.max(-1, ...(remembered?.sourceMessageIds.map(id => finalMessageIndex.get(id) ?? -1) ?? []));
+      const hasLaterResolutionSource = fact.sourceMessageIds.some(id => (finalMessageIndex.get(id) ?? -1) > latestDivergentSourceIndex);
+      if (fact.factStatus === 'reported_unverified' && remembered?.status === 'partial' && remembered.excerpt === '' && !hasLaterResolutionSource) {
+        missingPriorityItems.push({
+          key,
+          kind: 'clarify',
+          question: `关于${factLabels[key]}，我听到不同金额；哪一个是目前要记录的金额？不确定也可以先跳过。`,
+        });
+      }
+      continue; // confirmed, unknown, and declined facts remain read-only and are not repeatedly requested.
+    }
     if (key === 'state' && clientState) continue; // Read-only client record context; never synthesized as an extracted fact.
+    if (remembered?.status === 'answered' || remembered?.status === 'unknown' || remembered?.status === 'declined') continue;
     const wasAsked = askedTopics.includes(key);
     missingPriorityItems.push({
       key,
-      kind: wasAsked ? 'clarify' : 'missing',
-      question: wasAsked ? `关于${factLabels[key]}，我还没记清楚，可以再说一点吗？不确定也可以先跳过。` : INTERVIEW_QUESTIONS[key],
+      kind: wasAsked || remembered?.status === 'partial' ? 'clarify' : 'missing',
+      question: remembered?.status === 'partial'
+        ? partialAmountQuestion(key, remembered.excerpt)
+        : wasAsked
+          ? `关于${factLabels[key]}，我还没听到明确答案，可以再说一点吗？不确定也可以先跳过。`
+          : INTERVIEW_QUESTIONS[key],
     });
   }
   // After the normal-question allowance, only an already identified clarification remains eligible.
@@ -264,6 +429,7 @@ export function buildInterviewContext(input: InterviewInput): InterviewContext {
       .filter((message) => message.role === 'assistant' || messageSource(message) !== 'advisor')
       .slice(-60)
       .map((message) => ({ id: message.id, role: message.role, text: redactPII(message.text) })),
+    transcriptMemory: memory,
     askedTopics,
     answeredTopics,
     conversationPlan: {
@@ -279,11 +445,67 @@ export function buildInterviewContext(input: InterviewInput): InterviewContext {
   };
 }
 
+function acknowledgementForContext(context: InterviewContext): string {
+  const latestUserId = [...context.transcript].reverse().find(item => item.role === 'user')?.id;
+  const latest = latestUserId
+    ? context.transcriptMemory.filter(item => item.sourceMessageIds.includes(latestUserId)).at(-1)
+    : undefined;
+  if (latest && context.knownFacts.some(item => item.key === latest.key && item.factStatus === 'conflicting')) return '';
+  if (latest?.status === 'answered') return `您说明的${factLabels[latest.key]}我记下了。`;
+  if (latest?.status === 'unknown') return `${factLabels[latest.key]}暂时不清楚，我会留作待核对。`;
+  if (latest?.status === 'declined') return `${factLabels[latest.key]}这项先跳过。`;
+  if (latest?.status === 'partial') return latest.excerpt === '' ? `${factLabels[latest.key]}有不同说法，需要再核对。` : `${factLabels[latest.key]}还需要补充一点。`;
+  if (latestUserId) return '';
+  const known = context.knownFacts.find(item => item.value !== null);
+  if (!known) return '';
+  if (known.sourceKind === 'advisor' || known.sourceKind === 'unsourced') return `已有${factLabels[known.key]}记录，我不会请您重复。`;
+  return `已记录您说明的${factLabels[known.key]}。`;
+}
+
+function completionReply(context: InterviewContext): string {
+  const knownSummary = context.knownFacts
+    .filter(item => item.factStatus !== 'unknown' && item.factStatus !== 'declined')
+    .slice(0, 2)
+    .map(item => `${factLabels[item.key]}已有记录`);
+  const memorySummary = context.transcriptMemory
+    .filter(item => item.status === 'answered' && !context.knownFacts.some(fact => fact.key === item.key))
+    .slice(-2)
+    .map(item => `${factLabels[item.key]}已说明`);
+  const summary = [...knownSummary, ...memorySummary].slice(0, 2);
+  const grounded = summary.length > 0 ? `目前记下了：${summary.join('；')}。` : '';
+  return `这轮可以先到这里。${grounded}不清楚或未补充的部分会留作待核对。您可以补充最在意的事，或点击结束并将手机交还顾问。`;
+}
+
 export function nextInterviewTurn(input: InterviewInput): { reply: string; targetKey: InterviewFactKey | null; reason: 'missing' | 'clarify' | 'complete' } {
+  const controlReply = mockInterviewControlReply(input);
+  if (controlReply) return { reply: controlReply, targetKey: null, reason: 'complete' };
   const context = buildInterviewContext(input);
   const next = context.missingPriorityItems[0];
-  if (!next || context.conversationPlan.phase === 'summarize') return { reply: '这轮可以先到这里。您提供的情况已记录，不清楚的部分会留作待核对。您可以补充最在意的事，或点击结束并将手机交还顾问。', targetKey: null, reason: 'complete' };
-  return { reply: next.question, targetKey: next.key, reason: next.kind };
+  if (!next || context.conversationPlan.phase === 'summarize') return { reply: completionReply(context), targetKey: null, reason: 'complete' };
+  return { reply: `${acknowledgementForContext(context)}${next.question}`, targetKey: next.key, reason: next.kind };
+}
+
+/**
+ * Keeps a provider's safe natural wording unless its question conflicts with the
+ * deterministic planner. This helper does not validate or alter extracted facts.
+ */
+export function reconcileInterviewReply(input: InterviewInput, reply: string): string {
+  const context = buildInterviewContext(input);
+  const questionCount = (reply.match(/[？?]/g) ?? []).length;
+  const topic = topicForAssistantText(reply);
+  const conflictingTopics = new Set(context.knownFacts.filter(item => item.factStatus === 'conflicting').map(item => item.key));
+  const terminalTopics = new Set<InterviewFactKey>([
+    ...context.knownFacts.filter(item => item.factStatus !== 'conflicting').map(item => item.key),
+    ...context.transcriptMemory.filter(item => item.status !== 'partial' && !conflictingTopics.has(item.key)).map(item => item.key),
+  ]);
+  const plannerAlreadySummarized = input.messages.some(message =>
+    message.final
+    && message.role === 'assistant'
+    && /(?:先总结|总结到这里|可以先到这里|点击结束|交还顾问)/.test(message.text));
+  if (questionCount > 1 || (questionCount > 0 && topic !== null && terminalTopics.has(topic)) || (questionCount > 0 && plannerAlreadySummarized)) {
+    return nextInterviewTurn(input).reply;
+  }
+  return reply;
 }
 
 export function interviewSystemPrompt(input: InterviewInput): string {
@@ -316,11 +538,83 @@ function sourceIncludesExactString(value: string, sources: Message[]): boolean {
   return needle.length > 0 && sources.some((message) => normalize(message.text).includes(needle));
 }
 
-function sourceIncludesExactNumber(value: number, sources: Message[]): boolean {
-  return sources.some((message) => {
-    const numbers = exactNumberTokens(message.text);
-    return numbers?.length === 1 && numbers[0] === value;
-  });
+const factAnchorPattern: Record<InterviewFactKey, RegExp> = {
+  goal: /目标|想要|希望解决|最在意|目的/i,
+  horizon: /时间|时候|何时|开始安排|明年|今年|年内/i,
+  dependents: /家人|家庭责任|孩子|子女|父母|配偶|依赖/i,
+  state: /居住|住在|州|state/i,
+  employment: /工作|职业|就业|雇主|上班|自雇/i,
+  income: /收入|工资|薪资|薪水|earnings|salary/i,
+  expenses: /支出|开销|花费|生活费|expense/i,
+  debt: /债务|房贷|车贷|贷款|欠款|信用卡/i,
+  reserve: /紧急储备|应急储备|紧急储蓄|应急储蓄|备用金|应急资金|emergency fund/i,
+  assets: /资产|存款|投资账户|可支配资金|asset/i,
+  existing_life: /人寿|寿险|life insurance/i,
+  existing_di: /伤残|收入中断|收入保障|失能|disability/i,
+  existing_ltc: /长期照护|长期护理|照护保险|护理保险|long.?term care/i,
+  budget: /预算|保费|愿意.{0,8}(?:花|付|投入)|budget/i,
+  liquidity: /流动性|随时取用|取钱|提款|变现|liquidity/i,
+  retirement: /退休|养老金|社保|401\s*\(?k\)?|\bira\b|retirement/i,
+  care: /照顾|照护|护理|养老安排|care/i,
+};
+
+function anchoredKeys(text: string): InterviewFactKey[] {
+  const keys = FACT_KEYS.filter((key) => factAnchorPattern[key].test(text));
+  // Compound insurance names are not evidence about the embedded general topic.
+  if (/伤残收入.{0,2}(?:保险|保障)|收入中断.{0,4}(?:保险|保障)|收入保障/i.test(text)) keys.splice(keys.indexOf('income'), keys.includes('income') ? 1 : 0);
+  if (/(?:长期照护|长期护理|照护|护理)(?:保险|保障)/i.test(text)) keys.splice(keys.indexOf('care'), keys.includes('care') ? 1 : 0);
+  // Willingness to pay a named debt or other amount is not itself an insurance budget.
+  const namedOtherAmount = keys.some((key) => key !== 'budget' && AMOUNT_KEYS.has(key));
+  if (keys.includes('budget') && namedOtherAmount && !/预算|保费/i.test(text)) keys.splice(keys.indexOf('budget'), 1);
+  return keys;
+}
+
+/** Keep units beside their value, but start a new scope when a comma introduces another named fact. */
+function semanticClauses(text: string): Array<{ text: string; keys: InterviewFactKey[] }> {
+  const clauses: Array<{ text: string; keys: InterviewFactKey[] }> = [];
+  for (const sentence of text.normalize('NFKC').split(/[。！？!?；;\n]+/).map((part) => part.trim()).filter(Boolean)) {
+    const sentenceClauses: Array<{ text: string; keys: InterviewFactKey[] }> = [];
+    let current = '';
+    for (const part of sentence.split(/[，,]+/).map((item) => item.trim()).filter(Boolean)) {
+      const keys = anchoredKeys(part);
+      const sharedBalanceCandidate = /^(?:(?:两者|二者|两项|以上金额))?(?:都|均)(?:是|为)?当前余额$/i.test(part);
+      if (current && (keys.length || sharedBalanceCandidate)) {
+        sentenceClauses.push({ text: current, keys: anchoredKeys(current) });
+        current = part;
+      } else {
+        current = current ? `${current}，${part}` : part;
+      }
+    }
+    if (current) sentenceClauses.push({ text: current, keys: anchoredKeys(current) });
+
+    const last = sentenceClauses.at(-1);
+    const sharedCurrentBalance = last?.keys.length === 0
+      && /^(?:(?:两者|二者|两项|以上金额))?(?:都|均)(?:是|为)?当前余额$/i.test(last.text);
+    const scopedAmounts = sentenceClauses.slice(0, -1).filter((clause) => clause.keys.length > 0 && (exactNumberTokens(clause.text)?.length ?? 0) === 1 && detectedCurrencies(clause.text).length === 1);
+    if (sharedCurrentBalance && scopedAmounts.length >= 2) {
+      const sharedText = last.text;
+      clauses.push(...sentenceClauses.slice(0, -1).map((clause) => scopedAmounts.includes(clause) ? { ...clause, text: `${clause.text}，${sharedText}` } : clause));
+    } else {
+      clauses.push(...sentenceClauses);
+    }
+  }
+  return clauses;
+}
+
+function clausesForKey(key: InterviewFactKey, text: string): string[] {
+  const clauses = semanticClauses(text);
+  const keyed = clauses.filter((clause) => clause.keys.includes(key)).map((clause) => clause.text);
+  if (keyed.length) return keyed;
+  // A single bare answer can rely on the immediately preceding interview question. Once the
+  // message names another field, however, it cannot be reused as evidence for this key.
+  return clauses.length === 1 && clauses[0].keys.length === 0 ? [clauses[0].text] : [];
+}
+
+function sourceIncludesExactNumber(key: InterviewFactKey, value: number, sources: Message[]): boolean {
+  const clauses = sources.flatMap((message) => clausesForKey(key, message.text));
+  const numericClauses = clauses.map((text) => exactNumberTokens(text)).filter((numbers): numbers is number[] => numbers !== null && numbers.length > 0);
+  return numericClauses.some((numbers) => numbers.length === 1 && numbers[0] === value)
+    && numericClauses.every((numbers) => numbers.length === 1 && numbers[0] === value);
 }
 
 const currencyPattern: Record<typeof CURRENCIES[number], RegExp> = {
@@ -333,7 +627,7 @@ const currencyPattern: Record<typeof CURRENCIES[number], RegExp> = {
 const periodPattern: Record<typeof PERIODS[number], RegExp> = {
   month: /每月|\/月|月薪|月收入|月度|按月|monthly|per\s+month/i,
   year: /每年|\/年|年薪|年收入|年度|按年|annual|yearly|per\s+year/i,
-  once: /一次性|一次|余额|总额|总计|once|lump\s+sum/i,
+  once: /一次性|一次|余额|剩余本金|总额|总计|once|lump\s+sum/i,
 };
 
 function exactNumberTokens(text: string): number[] | null {
@@ -353,13 +647,34 @@ function detectedPeriods(text: string): typeof PERIODS[number][] {
   return PERIODS.filter((period) => periodPattern[period].test(normalized));
 }
 
-function sourceSupportsExactAmount(value: number, currency: typeof CURRENCIES[number], period: typeof PERIODS[number], sources: Message[]): boolean {
-  return sources.some((message) => {
-    const numbers = exactNumberTokens(message.text);
-    const currencies = detectedCurrencies(message.text);
-    const periods = detectedPeriods(message.text);
+function sourceSupportsExactKeyedAmount(key: InterviewFactKey, value: number, currency: typeof CURRENCIES[number], period: typeof PERIODS[number], sources: Message[]): boolean {
+  const numericClauses = sources.flatMap((message) => clausesForKey(key, message.text)).filter((text) => (exactNumberTokens(text)?.length ?? 0) > 0);
+  const matches = (text: string) => {
+    const numbers = exactNumberTokens(text);
+    const currencies = detectedCurrencies(text);
+    const periods = detectedPeriods(text);
     return numbers?.length === 1 && numbers[0] === value && currencies.length === 1 && currencies[0] === currency && periods.length === 1 && periods[0] === period;
-  });
+  };
+  return numericClauses.some(matches) && numericClauses.every(matches);
+}
+
+const unresolvedSubdetailPattern: Partial<Record<InterviewFactKey, RegExp>> = {
+  existing_life: /保额|金额|期限|条款|责任|范围|给付|等待期|覆盖|是否有效/i,
+  existing_di: /保额|金额|期限|条款|责任|范围|给付|等待期|覆盖|是否有效/i,
+  existing_ltc: /保额|金额|期限|条款|责任|范围|给付|等待期|覆盖|是否有效/i,
+  retirement: /退休账户|账户余额|401\s*\(?k\)?|\bira\b|养老金.{0,6}(?:余额|金额)/i,
+};
+
+function mentionsOnlyUnresolvedSubdetail(key: InterviewFactKey, text: string): boolean {
+  const detail = unresolvedSubdetailPattern[key];
+  return Boolean(detail?.test(text));
+}
+
+function sourceSupportsKeyedStatus(key: InterviewFactKey, pattern: RegExp, sources: Message[]): boolean {
+  const clauses = sources.flatMap((message) => clausesForKey(key, message.text));
+  if (!clauses.length) return false;
+  return clauses.some((text) => pattern.test(text))
+    && clauses.every((text) => pattern.test(text) && (exactNumberTokens(text)?.length ?? 0) === 0 && !mentionsOnlyUnresolvedSubdetail(key, text));
 }
 
 /** Conservative deterministic extraction used when no cloud interview model is selected. */
@@ -381,9 +696,11 @@ export function parseGroundedAnswer(key: string, text: string, messageId: string
   if (new RegExp(`^(?:${DECLINED_EVIDENCE_PATTERN.source})$`, 'i').test(normalizedText)) return { ...base, value: null, factStatus: 'declined' };
   if (!AMOUNT_KEYS.has(key as InterviewFactKey)) return base;
 
-  const numbers = exactNumberTokens(normalizedText);
-  const currencies = detectedCurrencies(normalizedText);
-  const periods = detectedPeriods(normalizedText);
+  const amountClauses = clausesForKey(key as InterviewFactKey, normalizedText).filter((clause) => (exactNumberTokens(clause)?.length ?? 0) > 0);
+  if (amountClauses.length !== 1) return null;
+  const numbers = exactNumberTokens(amountClauses[0]);
+  const currencies = detectedCurrencies(amountClauses[0]);
+  const periods = detectedPeriods(amountClauses[0]);
   if (numbers?.length !== 1 || numbers[0] < 0 || currencies.length !== 1 || periods.length !== 1) return null;
   const value = numbers[0];
   const currency = currencies[0];
@@ -427,19 +744,19 @@ function validateReturnedFact(row: unknown, input: InterviewInput, finalUserById
   } else if (status === 'unknown' || status === 'declined') {
     if (fact.value !== null || fact.currency !== null || fact.period !== null) throw new Error('Unknown or declined facts must remain null without units.');
     const pattern = status === 'unknown' ? UNKNOWN_EVIDENCE_PATTERN : DECLINED_EVIDENCE_PATTERN;
-    if (!sources.some((message) => pattern.test(message.text))) throw new Error('Unknown or declined status is not supported by the cited text.');
+    if (!sourceSupportsKeyedStatus(key, pattern, sources)) throw new Error('Unknown or declined status is not supported by the cited text for the matching fact clause.');
     if (existing) throw new Error('Interview output cannot repeat an already answered fact.');
   } else {
     if (existing?.factStatus === 'confirmed' || existing?.factStatus === 'reported_unverified') throw new Error('Interview output cannot overwrite an existing fact.');
     if (existing?.factStatus === 'conflicting' && !refs.some((id) => !existing.sourceMessageIds.includes(id))) throw new Error('Resolving a conflict requires a new final user clarification.');
     if (fact.value === null || (typeof fact.value !== 'string' && typeof fact.value !== 'number')) throw new Error('Reported interview facts require a string or number value.');
     if (typeof fact.value === 'string' && !sourceIncludesExactString(fact.value, sources)) throw new Error('Interview string fact is not an exact phrase from its cited message.');
-    if (typeof fact.value === 'number' && (!Number.isFinite(fact.value) || fact.value < 0 || !sourceIncludesExactNumber(fact.value, sources))) throw new Error('Interview number was not present verbatim as a non-negative finite value in its cited message.');
+    if (typeof fact.value === 'number' && (!Number.isFinite(fact.value) || fact.value < 0 || !sourceIncludesExactNumber(key, fact.value, sources))) throw new Error('Interview number was not present verbatim as a non-negative finite value in its matching fact clause.');
     if (AMOUNT_KEYS.has(key)) {
       if (typeof fact.value !== 'number' || !CURRENCIES.includes(fact.currency as typeof CURRENCIES[number]) || !PERIODS.includes(fact.period as typeof PERIODS[number])) throw new Error('Interview amount requires a numeric value, supported currency, and period.');
       const currency = fact.currency as typeof CURRENCIES[number];
       const period = fact.period as typeof PERIODS[number];
-      if (!sourceSupportsExactAmount(fact.value, currency, period, sources)) throw new Error('Interview amount must have exactly one plain numeric value, one unambiguous currency, and one unambiguous period in the same cited message.');
+      if (!sourceSupportsExactKeyedAmount(key, fact.value, currency, period, sources)) throw new Error('Interview amount must have exactly one plain numeric value, one unambiguous currency, and one unambiguous period in the same semantic clause.');
     } else if (fact.currency !== null || fact.period !== null) throw new Error('Non-money interview facts cannot set currency or period.');
   }
 

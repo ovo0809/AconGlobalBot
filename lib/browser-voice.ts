@@ -8,7 +8,9 @@ export interface BrowserVoiceOptions {
   csrf: string;
   onState?: (state: BrowserVoiceState) => void;
   onInterim?: (event: { role: 'user' | 'assistant'; text: string }) => void;
-  onFinal?: (event: { role: 'user' | 'assistant'; text: string; interrupted: boolean; knowledge?:KnowledgeContext; responseStatus?:Message['responseStatus'] }) => void;
+  onFinal?: (event: { role: 'user' | 'assistant'; text: string; interrupted: boolean; eventId?:string; knowledge?:KnowledgeContext; responseStatus?:Message['responseStatus'] }) => void;
+  onReplayAvailable?: (eventId:string|null) => void;
+  onReplayState?: (replaying:boolean) => void;
   onError?: (message: string) => void;
   onInterrupted?: () => void;
   onMicPermission?: (granted: boolean) => void;
@@ -17,10 +19,10 @@ export interface BrowserVoiceOptions {
 
 type ServerEvent =
   | { type: 'ready'; inputSampleRate?: number; outputSampleRate?: number }
-  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean; knowledge?:KnowledgeContext; responseStatus?:Message['responseStatus'] }
-  | { type: 'audio'; data: string; mimeType: string; itemId?: string; responseId?: string }
+  | { type: 'transcript'; role: 'user' | 'assistant'; text: string; final: boolean; interrupted?: boolean; eventId?:string; knowledge?:KnowledgeContext; responseStatus?:Message['responseStatus'] }
+  | { type: 'audio'; data: string; mimeType: string; itemId?: string; responseId?: string; eventId?:string }
   | { type: 'interrupted'; itemId?: string }
-  | { type: 'turnComplete'; responseId?: string }
+  | { type: 'turnComplete'; responseId?: string; eventId?:string }
   | { type: 'ending' | 'reconnecting' }
   | { type: 'closed'; retryable?: boolean }
   | { type: 'unavailable' | 'error'; message: string; code?: string; retryable?: boolean };
@@ -72,7 +74,13 @@ export class BrowserVoiceClient {
   private outputStartedAtContext:number|null=null;
   private outputReceivedMs = 0;
   private currentAudio: string[] = [];
-  private lastAudio: string[] = [];
+  private currentAudioEventId:string|null=null;
+  private finalAssistantEventId:string|null=null;
+  private pendingReplay:{eventId:string;audio:string[]}|null=null;
+  private replayAudio:{eventId:string;audio:string[]}|null=null;
+  private replaying=false;
+  private replayScheduling=false;
+  private replayResolve:((completed:boolean)=>void)|null=null;
   private reconnectAttempts = 0;
   private captureChunks: Float32Array[] = [];
   private captureFrames = 0;
@@ -112,6 +120,7 @@ export class BrowserVoiceClient {
 
   async start() {
     if (!['idle', 'paused', 'error'].includes(this.voiceState)) return;
+    this.discardReplay();
     this.intentionallyClosed = false;
     this.paused = false;
     this.reconnectAttempts = 0;
@@ -151,7 +160,7 @@ export class BrowserVoiceClient {
     await this.captureContext.resume();
     const source = this.captureContext.createMediaStreamSource(this.stream);
     const emit = (samples: Float32Array) => {
-      if (this.isMuted || this.socket?.readyState !== WebSocket.OPEN || this.voiceState === 'connecting') return;
+      if (this.isMuted || this.replaying || this.socket?.readyState !== WebSocket.OPEN || this.voiceState === 'connecting') return;
       this.captureChunks.push(samples.slice());
       this.captureFrames += samples.length;
       const inputRate = this.captureContext?.sampleRate || 48_000;
@@ -201,13 +210,16 @@ export class BrowserVoiceClient {
     this.socket = socket;
     if(this.readyTimer)clearTimeout(this.readyTimer);
     this.readyTimer=setTimeout(()=>{if(this.socket===socket&&['connecting','reconnecting'].includes(this.voiceState))this.terminalError('实时语音连接超时，请检查网络后重试。');},this.options.readyTimeoutMs??10_000);
-    socket.onmessage = (event) => this.handleServerEvent(event.data);
+    socket.onmessage = (event) => { if(this.socket===socket)this.handleServerEvent(event.data); };
     socket.onerror = () => { if(this.socket===socket&&this.voiceState!=='error')this.options.onError?.('实时语音网络连接发生错误，正在等待连接结果。'); };
     socket.onclose = (event) => {
+      if(this.socket!==socket)return;
       if(this.readyTimer)clearTimeout(this.readyTimer);this.readyTimer=null;
       if (this.drainCloseTimer) clearTimeout(this.drainCloseTimer);
       this.drainCloseTimer = null;
-      if (this.socket === socket) this.socket = null;
+      this.socket = null;
+      this.stopPlayback();
+      this.discardReplay();
       if (!this.intentionallyClosed && !this.paused && event.code !== 1000 && this.reconnectAttempts < 2) {
         this.reconnectAttempts += 1;
         this.setState('reconnecting');
@@ -221,6 +233,7 @@ export class BrowserVoiceClient {
     let event: ServerEvent;
     try { event = JSON.parse(raw) as ServerEvent; } catch { return; }
     if (this.intentionallyClosed && event.type !== 'ending') return;
+    if(this.replaying&&['transcript','audio','interrupted','turnComplete','reconnecting','ending','unavailable','error'].includes(event.type))this.stopPlayback();
     if (event.type === 'ready') {
       if(this.readyTimer)clearTimeout(this.readyTimer);this.readyTimer=null;
       if(event.inputSampleRate===16_000||event.inputSampleRate===24_000)this.inputSampleRate=event.inputSampleRate;
@@ -228,13 +241,18 @@ export class BrowserVoiceClient {
       this.setState('listening');
     }
     else if (event.type === 'transcript') {
-      if (event.final) this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted),...(event.role==='assistant'&&event.knowledge?{knowledge:event.knowledge}:{}),...(event.role==='assistant'&&event.responseStatus?{responseStatus:event.responseStatus}:{}) });
+      if (event.final) {
+        if(event.role==='assistant')this.finalAssistantEventId=!event.interrupted&&!event.responseStatus&&event.eventId?event.eventId:null;
+        this.options.onFinal?.({ role: event.role, text: event.text, interrupted: Boolean(event.interrupted),...(event.eventId?{eventId:event.eventId}:{}),...(event.role==='assistant'&&event.knowledge?{knowledge:event.knowledge}:{}),...(event.role==='assistant'&&event.responseStatus?{responseStatus:event.responseStatus}:{}) });
+      }
       else this.options.onInterim?.({ role: event.role, text: event.text });
       if (event.role === 'user' && !this.pendingPlaybackChunks && !this.playbackSources.size) this.setState(event.final ? 'thinking' : 'listening');
     } else if (event.type === 'audio') {
       if (!this.intentionallyClosed) {
-        if(event.responseId&&this.outputResponseId&&event.responseId!==this.outputResponseId)this.currentAudio=[];
-        if(event.itemId&&event.itemId!==this.outputItemId){this.outputItemId=event.itemId;this.outputResponseId=event.responseId??null;this.outputStartedAtContext=null;this.outputReceivedMs=0;}
+        if(event.responseId&&this.outputResponseId&&event.responseId!==this.outputResponseId){this.currentAudio=[];this.currentAudioEventId=null;}
+        if(event.itemId&&event.itemId!==this.outputItemId){this.outputItemId=event.itemId;this.outputResponseId=event.responseId??null;this.outputStartedAtContext=null;this.outputReceivedMs=0;this.currentAudio=[];this.currentAudioEventId=null;}
+        if(!this.currentAudio.length){this.clearReplayAvailability();this.pendingReplay=null;this.currentAudioEventId=event.eventId??null;}
+        else if(event.eventId!==this.currentAudioEventId){this.currentAudio=[];this.currentAudioEventId=event.eventId??null;}
         if(event.responseId)this.outputResponseId=event.responseId;
         this.outputComplete=false;
         this.outputReceivedMs+=this.pcmDurationMs(event.data);
@@ -257,19 +275,22 @@ export class BrowserVoiceClient {
       const itemId=event.itemId||this.outputItemId;
       const contextPlayed=this.playbackContext&&this.outputStartedAtContext!==null?(this.playbackContext.currentTime-this.outputStartedAtContext)*1_000:0;
       const playedMs=Math.max(0,Math.min(this.outputReceivedMs,contextPlayed));
-      this.stopPlayback();this.currentAudio=[];
+      this.stopPlayback();this.currentAudio=[];this.currentAudioEventId=null;this.pendingReplay=null;this.finalAssistantEventId=null;this.clearReplayAvailability();
       if(itemId&&this.socket?.readyState===WebSocket.OPEN)this.socket.send(JSON.stringify({truncate:{itemId,audioEndMs:Math.round(playedMs)}}));
       this.outputItemId=null;this.outputReceivedMs=0;this.options.onInterrupted?.();this.setState('listening');
     }
     else if (event.type === 'turnComplete') {
       if(event.responseId&&this.outputResponseId&&event.responseId!==this.outputResponseId)return;
-      if (this.currentAudio.length) this.lastAudio = [...this.currentAudio];
+      const completedEventId=event.eventId??this.currentAudioEventId;
+      this.pendingReplay=this.currentAudio.length&&completedEventId&&completedEventId===this.currentAudioEventId&&completedEventId===this.finalAssistantEventId?{eventId:completedEventId,audio:[...this.currentAudio]}:null;
       this.currentAudio = [];
+      this.currentAudioEventId=null;
+      this.finalAssistantEventId=null;
       // The provider has finished sending. Queued PCM can still be audible.
       this.outputComplete=true;
       this.finishPlaybackIfReady();
     }
-    else if (event.type === 'reconnecting') { this.stopPlayback(); this.setState('reconnecting'); }
+    else if (event.type === 'reconnecting') { this.stopPlayback();this.discardReplay();this.setState('reconnecting'); }
     else if (event.type === 'ending' && !this.intentionallyClosed) void this.stopAll();
     else if (event.type === 'unavailable' || event.type === 'error') {
       this.terminalError(this.serverReason(event));
@@ -279,6 +300,7 @@ export class BrowserVoiceClient {
   private finishPlaybackIfReady() {
     if(!this.outputComplete||this.pendingPlaybackChunks||this.playbackSources.size)return;
     this.outputComplete=false;
+    if(this.pendingReplay){this.replayAudio=this.pendingReplay;this.pendingReplay=null;this.options.onReplayAvailable?.(this.replayAudio.eventId);}
     this.outputItemId=null;this.outputResponseId=null;this.outputStartedAtContext=null;this.outputReceivedMs=0;
     if(['speaking','thinking','listening'].includes(this.voiceState))this.setState('listening');
   }
@@ -304,7 +326,7 @@ export class BrowserVoiceClient {
     source.onended = () => {
       this.playbackSources.delete(source);
       source.disconnect();
-      if(generation===this.playbackGeneration)this.finishPlaybackIfReady();
+      if(generation===this.playbackGeneration){this.finishPlaybackIfReady();if(this.replaying&&!this.replayScheduling&&!this.playbackSources.size)this.finishReplay(true);}
     };
   }
 
@@ -316,19 +338,49 @@ export class BrowserVoiceClient {
 
   sendText(text: string) {
     const normalized = text.trim().slice(0, 2_000);
-    if (!normalized || this.socket?.readyState !== WebSocket.OPEN) return false;
+    if (!normalized || this.replaying || this.socket?.readyState !== WebSocket.OPEN) return false;
     this.socket.send(JSON.stringify({ text: normalized }));
     this.setState('thinking');
     return true;
   }
-  setMuted(muted: boolean) { this.isMuted = muted; for (const track of this.stream?.getAudioTracks() || []) track.enabled = !muted; }
+  setMuted(muted: boolean) { this.isMuted = muted; for (const track of this.stream?.getAudioTracks() || []) track.enabled = !muted&&!this.replaying; }
+  private clearReplayAvailability(){if(this.replayAudio)this.options.onReplayAvailable?.(null);this.replayAudio=null;}
+  private discardReplay(){this.clearReplayAvailability();this.pendingReplay=null;this.finalAssistantEventId=null;this.currentAudioEventId=null;}
+  private finishReplay(completed:boolean){
+    if(!this.replaying)return;
+    this.replaying=false;
+    for(const track of this.stream?.getAudioTracks()||[])track.enabled=!this.isMuted;
+    this.captureChunks=[];this.captureFrames=0;
+    this.options.onReplayState?.(false);
+    const resolve=this.replayResolve;this.replayResolve=null;resolve?.(completed);
+  }
   stopPlayback() {
+    const wasReplaying=this.replaying;
+    this.replayScheduling=false;
     this.playbackGeneration+=1;this.playbackQueue=Promise.resolve();this.pendingPlaybackChunks=0;this.outputComplete=false;
     for (const source of this.playbackSources) { try { source.stop(); } catch {} }
     this.playbackSources.clear();this.playbackCursor=this.playbackContext?.currentTime||0;
     this.currentAudio=[];this.outputItemId=null;this.outputResponseId=null;this.outputStartedAtContext=null;this.outputReceivedMs=0;
+    if(wasReplaying)this.finishReplay(false);
   }
-  async replayLast() { this.stopPlayback();const generation=this.playbackGeneration;for (const chunk of this.lastAudio) await this.playPcm(chunk,generation); }
+  async replayLast(eventId:string) {
+    const replay=this.replayAudio;
+    if(!replay||replay.eventId!==eventId||this.replaying||this.voiceState!=='listening'||this.pendingPlaybackChunks||this.playbackSources.size)return false;
+    this.replaying=true;this.captureChunks=[];this.captureFrames=0;
+    for(const track of this.stream?.getAudioTracks()||[])track.enabled=false;
+    this.options.onReplayState?.(true);
+    const generation=this.playbackGeneration;
+    const completed=new Promise<boolean>(resolve=>{this.replayResolve=resolve;});
+    try{
+      this.replayScheduling=true;
+      for(const chunk of replay.audio)await this.playPcm(chunk,generation,null);
+      this.replayScheduling=false;
+      if(!this.playbackSources.size)this.finishReplay(true);
+      return await completed;
+    }catch{
+      this.replayScheduling=false;this.stopPlayback();return false;
+    }
+  }
   async pause() { if (this.voiceState === 'paused' || this.voiceState === 'ended') return; this.paused = true; await this.closeResources(false); this.setState('paused'); }
   async resume() {
     if (!this.paused) return;
@@ -359,6 +411,7 @@ export class BrowserVoiceClient {
     }
     if (!keepSocket) this.socket = null;
     this.stopPlayback();
+    this.discardReplay();
     this.captureNode?.disconnect(); this.silentGain?.disconnect(); this.captureNode = null; this.silentGain = null;
     for (const track of this.stream?.getTracks() || []) track.stop();
     this.stream = null;

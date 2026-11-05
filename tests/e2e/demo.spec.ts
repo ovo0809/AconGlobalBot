@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { INTERVIEW_QUESTIONS } from '../../lib/interview';
 
 test.describe.configure({ mode: 'serial' });
 const screenshots = join(process.cwd(), 'docs', 'screenshots');
@@ -65,7 +66,7 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   expect(restricted).toEqual({ mode: 'client', user: null, clients: 0, facts: 0, reports: 0, reportStatus: 403 });
 
   await page.getByRole('button', { name: /人寿/ }).click();
-  await expect(page.getByText('这次最想先解决哪件事？您可以从最在意的地方说起。')).toBeVisible();
+  await expect(page.getByText(INTERVIEW_QUESTIONS.goal)).toBeVisible();
   await expect(page.getByText('模拟界面 · 未调用实时语音服务')).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
@@ -92,14 +93,14 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   await expect(page.getByText('回答已保存，云端回复未完成')).toHaveCount(0);
   expect(messageEventIds).toHaveLength(2);
   expect(messageEventIds[1]).toBe(messageEventIds[0]);
-  await expect(page.getByText('如果您的收入暂时停下来，家里最需要照顾的是谁、哪些开销？')).toBeVisible();
+  await expect(page.getByText(INTERVIEW_QUESTIONS.dependents)).toBeVisible();
   await page.getByRole('button', { name: '暂停访谈' }).click();
-  await expect(page.getByText('访谈已暂停', { exact: true })).toBeVisible();
+  await expect(page.locator('.paused-card').getByText('访谈已暂停', { exact: true })).toBeVisible();
   await page.reload();
-  await expect(page.getByText('访谈已暂停', { exact: true })).toBeVisible();
+  await expect(page.locator('.paused-card').getByText('访谈已暂停', { exact: true })).toBeVisible();
   await expect(page.locator('.case-sidebar')).toHaveCount(0);
   await page.getByRole('button', { name: '恢复访谈' }).click();
-  await expect(page.getByText('访谈已暂停', { exact: true })).toHaveCount(0);
+  await expect(page.locator('.paused-card').getByText('访谈已暂停', { exact: true })).toHaveCount(0);
 
   await page.getByRole('button', { name: '结束对话' }).click();
   await expect(page.getByRole('heading', { name: '请将手机交还给顾问' })).toBeVisible();
@@ -116,6 +117,12 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   await expect(page.locator('.analysis-grid')).not.toContainText(/insufficient_information|priority_discussion|existing_life/);
   await expect(page.locator('.report-sections details').first()).toContainText('主要目标');
   await expect(page.locator('.report-sections details').first()).toContainText('来源 1');
+  const editorial=page.locator('.report-editorial');
+  await expect(editorial).toHaveCount(1);
+  await editorial.locator('summary').click();
+  await expect(editorial).toContainText('不能代替事实核验或 Charles 人工复核');
+  await expect(editorial).toContainText('报告用途');
+  await editorial.locator('summary').click();
   const provenance = page.locator('.report-sections details').filter({has:page.getByText('来源编号与版本信息',{exact:true})});
   await expect(provenance).not.toHaveAttribute('open');
   await page.getByRole('button',{name:'关闭提示',exact:true}).click();
@@ -127,7 +134,11 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   await page.getByRole('button', { name: /内部报告/ }).click();
   await expect(page.locator('.report-view')).toBeVisible();
   await expect(page.locator('.report-sections details').first()).toContainText('主要目标');
+  await editorial.locator('summary').click();
+  await expect(editorial).toHaveJSProperty('open',true);
+  await expect(editorial.getByText(/阅读对象：/)).toBeVisible();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+  await editorial.locator('summary').click();
   await page.locator('.report-sections details').first().scrollIntoViewIfNeeded();
   await expect(page.locator('.report-sections details').first()).toBeInViewport();
   await page.screenshot({path:join(process.cwd(),'tmp','report-readability','mobile.png')});
@@ -201,4 +212,38 @@ test('报告后台任务失败时提供清晰的安全重试状态', async ({ pa
   await expect(page.getByRole('heading',{name:'报告生成未完成'})).toBeVisible();
   await expect(page.getByRole('button',{name:'重试生成报告'})).toBeVisible();
   await expect(page.getByText('synthetic failure')).toHaveCount(0);
+});
+
+test('客户一次回答多个主题后不重复提问，仍可结束并交还顾问',async({page})=>{
+  await login(page,'advisor1@aeconn.example');
+  await page.getByRole('button',{name:'新建客户'}).click();
+  const dialog=page.getByRole('dialog',{name:'建立客户档案'});
+  await dialog.getByLabel('姓名 *').fill('简短访谈验收（合成）');
+  await dialog.getByLabel('生日 *').fill('1986-06-18');
+  await dialog.getByLabel('性别 *').selectOption({label:'女性'});
+  await dialog.getByLabel('电话号码 *').fill('+1 202 555 0198');
+  await dialog.getByLabel('邮箱 *').fill(`short-interview-${Date.now()}@example.invalid`);
+  await dialog.getByLabel('婚姻状态 *').selectOption({label:'已婚'});
+  await dialog.getByLabel('居住州').fill('CA');
+  await dialog.getByRole('button',{name:'建立档案与案例'}).click();
+  await expect(page.getByRole('heading',{name:'简短访谈验收（合成）'})).toBeVisible();
+  await page.getByRole('button',{name:'开始客户访谈'}).click();
+  await page.getByRole('button',{name:/长期护理/}).click();
+  await expect(page.locator('.chat-stream')).toContainText(INTERVIEW_QUESTIONS.goal);
+  await page.getByLabel('文字回答').fill('这次想安排长期照护，希望明年开始，最好在家里接受照护。我已经有长期护理保险，预算是每月500美元。');
+  await page.getByRole('button',{name:'发送',exact:true}).click();
+  const assistant=page.locator('.chat-stream .bubble-row.assistant');
+  await expect(assistant).toHaveCount(2);
+  await expect(assistant.last()).toContainText(/结束|交还|顾问/);
+  await expect(assistant.last()).not.toContainText(/[？?]/);
+  await expect(page.locator('.report-view')).toHaveCount(0);
+  await page.setViewportSize({width:390,height:844});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  await hideDevelopmentChrome(page);
+  mkdirSync(join(process.cwd(),'tmp','paradox-interview'),{recursive:true});
+  await page.screenshot({path:join(process.cwd(),'tmp','paradox-interview','multi-topic-mobile.png')});
+  await page.getByRole('button',{name:'结束对话'}).click();
+  await expect(page.getByRole('heading',{name:'请将手机交还给顾问'})).toBeVisible();
+  await expect(page.locator('.case-sidebar')).toBeVisible({timeout:30_000});
+  await expect(page.locator('.report-view')).toHaveCount(0);
 });
