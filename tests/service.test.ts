@@ -177,6 +177,54 @@ test('focused mock interview handles progress and goodbye without facts, defers 
   await advisor.action({ action: 'end', caseId });
 });
 
+test('local interview help is saved without provider calls, usage reservations, facts, or automatic handback', async (t) => {
+  const keys = ['LLM_PROVIDER', 'OPENAI_API_KEY', 'OPENAI_MODEL'];
+  const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const key of keys) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+  });
+  process.env.LLM_PROVIDER = 'openai';
+  process.env.OPENAI_API_KEY = 'synthetic-key';
+  process.env.OPENAI_MODEL = 'gpt-6-luna';
+  let providerCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    providerCalls += 1;
+    throw new Error('local help must not call the provider');
+  });
+
+  const advisor = new BrowserSession();
+  await advisor.login('advisor1@aeconn.example');
+  const caseId = await createCase(advisor, 'local-help');
+  await advisor.action({ action: 'enterClient', caseId });
+  await advisor.action({ action: 'chooseEntry', caseId, entry: 'life' });
+  for (const [eventId, text] of [
+    ['help-why', '为什么问这个？'],
+    ['help-advisor', '我想找顾问'],
+  ]) {
+    const response = await advisor.action({ action: 'message', caseId, text, eventId });
+    assert.equal(response.response.status, 200, JSON.stringify(response.data));
+  }
+  const repeated = await advisor.action({ action: 'message', caseId, text: '为什么问这个？', eventId: 'help-why' });
+  assert.equal(repeated.response.status, 200, JSON.stringify(repeated.data));
+
+  const state = (await advisor.bootstrap()).data as Bootstrap;
+  assert.equal(state.mode, 'client', 'help must not end the interview automatically');
+  const helpReplies = state.messages.filter(message => ['help-why:reply', 'help-advisor:reply'].includes(message.eventId));
+  assert.equal(helpReplies.length, 2);
+  assert.doesNotMatch(helpReplies[0].text, /[？?]/);
+  assert.match(helpReplies[1].text, /点击.*结束对话/);
+  const { db } = await import('../lib/db');
+  const storedMessages = db().prepare('SELECT doc FROM messages WHERE case_id=? ORDER BY rowid').all(caseId).map(row => JSON.parse(String(row.doc)) as Message);
+  assert.equal(storedMessages.filter(message => message.eventId === 'help-why').length, 1, 'duplicate customer event is idempotent');
+  assert.equal(storedMessages.filter(message => message.eventId === 'help-why:reply').length, 1, 'duplicate local-control reply is idempotent');
+  assert.equal(providerCalls, 0);
+  assert.equal((db().prepare('SELECT COUNT(*) count FROM profile_fields WHERE case_id=?').get(caseId) as {count:number}).count, 0, 'isolated database contains no facts from local controls');
+  assert.equal(getUsageSummary('org-demo', caseId, true).records.length, 0);
+});
+
 test('anonymous sessions, login integrity, CSRF/origin and role data boundaries', async () => {
   const anonymous = new BrowserSession();
   const first = await anonymous.bootstrap();

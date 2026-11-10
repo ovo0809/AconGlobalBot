@@ -5,7 +5,7 @@ import { analyzeWithProvider, interviewWithProvider, ProviderExtractionValidatio
 import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-config';
 import { isSharedDemo } from './shared-demo-policy';
 import { publicRequestConfig, readSharedLiveConfig, SharedAccessError, sharedLiveScope, type VoiceAccessScope } from './shared-live-access';
-import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, mockInterviewControlReply, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
+import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, interviewControlReply, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
 import { closeVoiceSession, forgetVoiceSession, VOICE_DRAIN_TIMEOUT_MS, type VoiceDiagnosticEvent } from './voice-server';
 import { DryRunMailProvider } from './mail';
 import { getUsageSummary, purgeCaseUsage, recoverUsageReservations, UsageBudgetError, UsageDataError } from './ai-usage';
@@ -123,6 +123,9 @@ async function respondToText(session:Interview,text:string,eventId:string){
   try{
     const message=addMessage(session.id,session.case_id,'user',text,eventId);
     const input=interviewInput(session);
+    requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
+    const controlReply=interviewControlReply(input);
+    if(controlReply){transaction(()=>addMessage(session.id,session.case_id,'assistant',controlReply,replyId));return;}
     const knowledge=await loadCaseKnowledge(session.case_id,knowledgeQuery(input.entry,input.facts,input.messages));
     requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     let turn;
@@ -130,9 +133,7 @@ async function respondToText(session:Interview,text:string,eventId:string){
     catch(error){if(error instanceof UsageBudgetError)throw new AppError(429,`${error.message} 您的回答已保存，可结束访谈交还顾问。`);throw new AppError(503,'您的回答已保存。云端访谈暂时未完成，请稍后重试或交还顾问；不会使用模拟回复冒充 AI。');}
     requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     transaction(()=>{
-      const controlReply = !turn ? mockInterviewControlReply(input) : null;
       if(turn){for(const fact of turn.facts)saveFact(session.case_id,fact);addMessage(session.id,session.case_id,'assistant',turn.reply,replyId,replyId,false,true,'customer',undefined,{knowledge,knowledgeRefs:turn.knowledgeRefs??[]});}
-      else if(controlReply)addMessage(session.id,session.case_id,'assistant',controlReply,replyId);
       else if(session.current_question){const fact=parseAnswer(session.current_question,text,message.id);if(fact)saveFact(session.case_id,fact);askNext(session,replyId);}
       else askNext(session,replyId);
     });

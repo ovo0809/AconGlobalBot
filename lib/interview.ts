@@ -35,6 +35,7 @@ export const INTERVIEW_CONVERSATION_RULES = [
   '客户明确给了“大概、明年、20年”等程度的答案时，保留其粗略程度，不再问“这是准确值还是估算”“是具体日期还是大致时间”。只有缺失信息确实影响目标时才补充一次；不要为了数据格式要求客户重说整句。',
   '金额不清时只问缺的币种或周期等关键部分，不重问已经说清的数值；缺少来源依据的数值不得计算或拼接成已保存事实。不同用途、币种、月年周期或不同时间的数字不是自动矛盾；客户明确更正时核对新说法，保留旧来源交给顾问。',
   '听不清时说明自己没听清哪一小段，不笼统责怪客户；“谢谢”“再见”“先到这里”“还有多少问题”要先回应其意图，不能当成收入、债务等事实，更不能忽略后机械问下一题。',
+  '客户问为什么要问当前问题时，只简短说明这项信息如何帮助顾问理解其目标，允许不知道、不愿提供或跳过，不追加新问题。客户要求顾问或人工时，提示点击现有“结束对话”并交还设备；帮助、解释或交还顾问的意图不是客户的财务目标，不得提取为事实。不要自动结束、承诺回拨或创建不存在的服务。',
   '目标、相关现状和主要限制已清楚，或剩余项目未知／拒答／已补问过，就简短总结已知与待核对内容，邀请客户补充或点击结束交还顾问。结束不代表全部资料齐全；不要新增产品建议，不在总结后再顺带开新题。客户想停止时立即停止提问，提示结束按钮，不宣称系统已经关闭音频或生成报告。',
   '示例：客户说“想明年开始准备长期照护，希望在家，不想拖累孩子，已有保险但不知道包不包”。可回应“您更在意留在熟悉的家里，也希望减轻孩子的负担。除了这份待核对的保险，您还有其他照护安排吗？”不要再问目标、开始时间、地点、担忧或保险是否含照护；示例不能当作本客户事实。',
 ].join('\n');
@@ -147,6 +148,24 @@ function normalize(value: string): string {
   return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+type InterviewControlKind = 'stop' | 'thanks' | 'progress' | 'handback' | 'why';
+
+const STOP_CONTROL_PATTERN = /^(?:谢谢[，,\s]*)?(?:先到这里|先聊到这里|不聊了|结束访谈|结束对话|停止提问|再见|再会|再會|bye|goodbye)$/i;
+const THANKS_CONTROL_PATTERN = /^(谢谢|謝謝|thank you|thanks)$/i;
+const PROGRESS_CONTROL_PATTERN = /^(?:请问[，,\s]*)?(?:还要问多少(?:个)?问题|还要多少(?:个)?问题|还有多少问题|还有几(?:个)?问题|还剩几(?:个)?问题|还要多久|還有多少問題)$/;
+const HANDBACK_CONTROL_PATTERN = /^(?:(?:我)?(?:想|要|希望)(?:找|转给|轉給|和|跟)(?:人工|顾问|顧問)(?:聊|聊聊|谈|談|沟通|溝通|咨询|諮詢|帮助|幫助)?|转人工|轉人工|找顾问|找顧問)$/;
+const WHY_CONTROL_PATTERN = /^(?:请问[，,\s]*)?(?:为什么|為什麼)(?:要|会|會)?(?:问|問)(?:我(?:的)?)?(?:(?:这个|這個|这项|這項)?(?:问题|問題)?|主要目标|目标时间|家庭责任|居住州|工作情况|收入|家庭开支|债务|应急储备|资产与资金|现有人寿保障|现有伤残保障|现有照护安排|预算|流动性偏好|退休计划|照护考虑)$/;
+
+function pureInterviewControlKind(value: string): InterviewControlKind | null {
+  const text = value.trim().replace(/[。.!！?？\s]+$/g, '');
+  if (STOP_CONTROL_PATTERN.test(text)) return 'stop';
+  if (THANKS_CONTROL_PATTERN.test(text)) return 'thanks';
+  if (PROGRESS_CONTROL_PATTERN.test(text)) return 'progress';
+  if (HANDBACK_CONTROL_PATTERN.test(text)) return 'handback';
+  if (WHY_CONTROL_PATTERN.test(text)) return 'why';
+  return null;
+}
+
 function redactPII(text: string): string {
   return text
     .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[email removed]')
@@ -164,7 +183,7 @@ function validateInputScope(input: InterviewInput): { caseId: string | null; fin
   const finalUserMessages = finalMessages.filter((message) => message.role === 'user');
   const allFinalUserById = new Map(finalUserMessages.map((message) => [message.id, message]));
   const extractableUserById = new Map(finalUserMessages
-    .filter((message) => messageSource(message) !== 'advisor')
+    .filter((message) => messageSource(message) !== 'advisor' && !pureInterviewControlKind(message.text))
     .map((message) => [message.id, message]));
   const factKeys = new Set<string>();
   for (const fact of input.facts) {
@@ -256,7 +275,7 @@ const memoryAnsweredPattern: Record<InterviewFactKey, RegExp> = {
 function transcriptMemory(finalMessages: Message[]): TranscriptMemoryItem[] {
   const remembered = new Map<InterviewFactKey, TranscriptMemoryItem>();
   for (const message of finalMessages) {
-    if (message.role !== 'user' || messageSource(message) === 'advisor') continue;
+    if (message.role !== 'user' || messageSource(message) === 'advisor' || pureInterviewControlKind(message.text)) continue;
     const explicitMessageCorrection = /(更正|不对|确认|正确|应为|改为)/i.test(message.text);
     const scopedText = message.text.replace(/(?:，|,)?(?:但是|不过|可是|然而|(?<!不)但)/g, '。');
     const clauses = semanticClauses(scopedText).map(clause => clause.text);
@@ -308,22 +327,58 @@ function transcriptMemory(finalMessages: Message[]): TranscriptMemoryItem[] {
   return [...remembered.values()];
 }
 
-/** Exact mock-only conversation controls are never stored as customer facts. */
-export function mockInterviewControlReply(input: InterviewInput): string | null {
-  const latest = input.messages.filter(message => message.final && message.role === 'user' && messageSource(message) !== 'advisor' && (!input.sessionId || message.sessionId === input.sessionId)).at(-1);
+function currentQuestionTopic(input: InterviewInput, latestUser: Message): InterviewFactKey | null {
+  const latestIndex = input.messages.lastIndexOf(latestUser);
+  if (latestIndex < 0) return null;
+  const currentAssistant = input.messages.slice(0, latestIndex).reverse().find(message =>
+    message.final
+    && message.role === 'assistant'
+    && !message.interrupted
+    && !message.responseStatus
+    && (!input.sessionId || message.sessionId === input.sessionId));
+  return currentAssistant ? topicForAssistantText(currentAssistant.text) : null;
+}
+
+function namedWhyTopic(text: string): InterviewFactKey | null {
+  const label = text.replace(/^(?:请问[，,\s]*)?(?:为什么|為什麼)(?:要|会|會)?(?:问|問)(?:我(?:的)?)?/, '')
+    .replace(/^(?:这个|這個|这项|這項)/, '')
+    .replace(/(?:问题|問題)$/, '')
+    .trim();
+  if (!label) return null;
+  return FACT_KEYS.find(key => label === factLabels[key]) ?? null;
+}
+
+/** Exact local conversation controls are never stored as customer facts. */
+export function interviewControlReply(input: InterviewInput): string | null {
+  const { finalMessages } = validateInputScope(input);
+  const latest = finalMessages.filter(message => message.role === 'user' && messageSource(message) !== 'advisor' && (!input.sessionId || message.sessionId === input.sessionId)).at(-1);
   if (!latest) return null;
   const text = latest.text.trim().replace(/[。.!！?？\s]+$/g, '');
-  if (/^(?:谢谢[，,\s]*)?(?:先到这里|先聊到这里|不聊了|结束访谈|结束对话|停止提问|再见|再会|再會|bye|goodbye)$/i.test(text)) {
+  const controlKind = pureInterviewControlKind(text);
+  if (controlKind === 'stop') {
     return '可以，先聊到这里，您的回答已保存。请点击“结束对话”停止音频并交还顾问，暂不清楚的内容留待核对。';
   }
-  if (/^(谢谢|謝謝|thank you|thanks)$/i.test(text)) return '不客气。您可以继续补充，也可以点击结束并交还顾问。';
-  if (/^(?:请问[，,\s]*)?(?:还要问多少(?:个)?问题|还要多少(?:个)?问题|还有多少问题|还有几(?:个)?问题|还剩几(?:个)?问题|还要多久|還有多少問題)$/.test(text)) {
+  if (controlKind === 'thanks') return '不客气。您可以继续补充，也可以点击结束并交还顾问。';
+  if (controlKind === 'progress') {
     const context = buildInterviewContext(input);
     const remaining = Math.min(context.missingPriorityItems.length, Math.max(0, context.conversationPlan.maxQuestionTurns - context.conversationPlan.questionTurns));
     return remaining ? `按当前记录，最多还有 ${remaining} 个核心问题，已经说清的会跳过，不需要聊满一小时。您也可以现在点击结束，交还顾问。` : '这轮已经可以收尾了。您可以补充最在意的事，或点击结束并交还顾问。';
   }
+  if (controlKind === 'handback') {
+    return '可以。请点击“结束对话”停止音频并将设备交还顾问；您已经提供的内容会保留，暂不清楚的部分由顾问继续核对。';
+  }
+  if (controlKind === 'why') {
+    const currentTopic = currentQuestionTopic(input, latest);
+    const namedTopic = namedWhyTopic(text);
+    const topic = currentTopic && (!namedTopic || namedTopic === currentTopic) ? currentTopic : null;
+    if (topic) return `了解${factLabels[topic]}，是为了帮助顾问结合您的目标看清当前情况。您可以给大概信息，也可以说不知道、不愿提供或先跳过。`;
+    return '这是为了帮助顾问了解与您目标相关的情况。您可以说不知道、不愿提供或先跳过。';
+  }
   return null;
 }
+
+/** @deprecated Use interviewControlReply; retained for existing integrations. */
+export const mockInterviewControlReply = interviewControlReply;
 
 function knownClientState(value: string | undefined): string | null {
   const state = value?.trim();
@@ -681,7 +736,7 @@ function sourceSupportsKeyedStatus(key: InterviewFactKey, pattern: RegExp, sourc
 export function parseGroundedAnswer(key: string, text: string, messageId: string): ProfileField | null {
   if (!FACT_KEY_SET.has(key) || !messageId.trim()) return null;
   const normalizedText = text.trim();
-  if (!normalizedText) return null;
+  if (!normalizedText || pureInterviewControlKind(normalizedText)) return null;
   const base: ProfileField = {
     key,
     value: normalizedText,

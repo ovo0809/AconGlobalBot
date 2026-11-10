@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Message, ProfileField } from '../lib/domain';
-import { buildInterviewContext, INTERVIEW_QUESTIONS, mockInterviewControlReply, nextInterviewTurn, parseGroundedAnswer, validateInterviewTurn, type InterviewInput } from '../lib/interview';
+import { buildInterviewContext, INTERVIEW_QUESTIONS, interviewControlReply, mockInterviewControlReply, nextInterviewTurn, parseGroundedAnswer, validateInterviewTurn, type InterviewInput } from '../lib/interview';
 
 function message(id: string, role: Message['role'], text: string, sessionId = 'current'): Message {
   return { id, caseId: 'case', sessionId, turnId: id, eventId: id, role, text, final: true, interrupted: false, createdAt: '2026-10-30T12:00:00Z' };
@@ -78,6 +78,74 @@ test('mock conversation controls answer the customer without inventing a financi
   assert.match(mockInterviewControlReply(input([message('thanks', 'user', '谢谢')])) ?? '', /不客气/);
   assert.equal(mockInterviewControlReply(input([message('goal', 'user', '我想明年准备退休')])), null);
   assert.equal(mockInterviewControlReply(input([message('old-stop', 'user', '先到这里', 'old')])), null);
+});
+
+test('local help controls explain only the current question and offer the existing advisor handback', () => {
+  const currentIncome = input([
+    message('income-question', 'assistant', INTERVIEW_QUESTIONS.income),
+    message('why-income', 'user', '为什么要问收入？'),
+  ]);
+  const explanation = interviewControlReply(currentIncome) ?? '';
+  assert.match(explanation, /收入/);
+  assert.match(explanation, /顾问/);
+  assert.doesNotMatch(explanation, /[？?]/);
+
+  const naturalExplanation = interviewControlReply(input([
+    message('income-question', 'assistant', INTERVIEW_QUESTIONS.income),
+    message('why-my-income', 'user', '为什么要问我的收入？'),
+  ])) ?? '';
+  assert.match(naturalExplanation, /收入/);
+  assert.doesNotMatch(naturalExplanation, /[？?]/);
+
+  const mismatchedTopic = interviewControlReply(input([
+    message('income-question', 'assistant', INTERVIEW_QUESTIONS.income),
+    message('why-debt', 'user', '为什么要问债务？'),
+  ])) ?? '';
+  assert.match(mismatchedTopic, /与您目标相关/);
+  assert.doesNotMatch(mismatchedTopic, /收入|债务|[？?]/);
+
+  const oldIncome = input([
+    message('old-income-question', 'assistant', INTERVIEW_QUESTIONS.income, 'old'),
+    message('why-current', 'user', '为什么问这个？'),
+  ]);
+  const generic = interviewControlReply(oldIncome) ?? '';
+  assert.match(generic, /与您目标相关/);
+  assert.doesNotMatch(generic, /收入|[？?]/);
+
+  const handback = interviewControlReply(input([message('advisor', 'user', '我想找顾问')])) ?? '';
+  assert.match(handback, /点击.*结束对话/);
+  assert.match(handback, /交还顾问/);
+  assert.doesNotMatch(handback, /回拨|报告|[？?]/);
+
+  assert.equal(interviewControlReply(input([
+    message('income-question', 'assistant', INTERVIEW_QUESTIONS.income),
+    message('mixed', 'user', '为什么要问我的收入，我每月收入是 5000 USD'),
+  ])), null);
+  assert.equal(interviewControlReply(input([
+    message('draft-help', 'user', '我想找顾问'),
+  ].map(item => item.id === 'draft-help' ? { ...item, final: false } : item))), null);
+  assert.equal(interviewControlReply(input([message('old-help', 'user', '我想找顾问', 'old')])), null);
+  assert.equal(mockInterviewControlReply(currentIncome), explanation, 'legacy export remains behaviorally compatible');
+});
+
+test('pure local controls cannot become transcript memory or extracted facts', () => {
+  const handback = message('handback-control', 'user', '我想找顾问');
+  const data = input([handback]);
+  const context = buildInterviewContext(data);
+  assert.equal(context.transcriptMemory.some(item => item.key === 'goal'), false);
+  assert.equal(context.answeredTopics.includes('goal'), false);
+  assert(context.missingPriorityItems.some(item => item.key === 'goal'));
+  assert.equal(parseGroundedAnswer('goal', handback.text, handback.id), null);
+  assert.throws(() => validateInterviewTurn({
+    reply: '好的。',
+    facts: [{ key: 'goal', value: handback.text, currency: null, period: null, factStatus: 'reported_unverified', sourceMessageIds: [handback.id] }],
+  }, data), /source|final|user|case/i);
+
+  const mixed = '我想找顾问，不过我每月收入是 5000 USD';
+  const parsed = parseGroundedAnswer('income', mixed, 'mixed-financial-answer');
+  assert.equal(parsed?.value, 5000);
+  assert.equal(parsed?.currency, 'USD');
+  assert.equal(parsed?.period, 'month');
 });
 
 test('the generated clarification counts as the second attempt and defers an unclear amount', () => {

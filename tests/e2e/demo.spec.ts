@@ -65,11 +65,28 @@ test('顾问建档、受限访谈、报告与 dry-run 通知完整流程', async
   });
   expect(restricted).toEqual({ mode: 'client', user: null, clients: 0, facts: 0, reports: 0, reportStatus: 403 });
 
+  const guide = page.locator('.interview-guide');
+  const guideActionCount = postedActions.length;
+  await page.getByText('访谈怎么进行', { exact: true }).click();
+  await expect(guide.getByRole('listitem')).toHaveCount(3);
+  await expect(guide).toContainText('为什么问这个');
+  await expect(guide).toContainText('我想找顾问');
+  await hideDevelopmentChrome(page);
+  await page.screenshot({ path: join(screenshots, 'client-guide-welcome-1440x900.png') });
+  await page.getByText('访谈怎么进行', { exact: true }).press('Enter');
+  await expect(guide.getByRole('list')).toBeHidden();
+  expect(postedActions.length).toBe(guideActionCount);
+
   await page.getByRole('button', { name: /人寿/ }).click();
   await expect(page.getByText(INTERVIEW_QUESTIONS.goal)).toBeVisible();
   await expect(page.getByText('模拟界面 · 未调用实时语音服务')).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByText('访谈怎么进行', { exact: true }).click();
+  await expect(guide.getByRole('list')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await hideDevelopmentChrome(page);
+  await page.screenshot({ path: join(screenshots, 'client-guide-active-390x844.png') });
+  await page.getByText('访谈怎么进行', { exact: true }).click();
   await hideDevelopmentChrome(page);
   await page.screenshot({ path: join(screenshots, 'client-mobile-390x844.png') });
 
