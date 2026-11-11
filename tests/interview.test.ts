@@ -8,6 +8,7 @@ import {
   interviewSystemPrompt,
   nextInterviewTurn,
   parseGroundedAnswer,
+  reconcileInterviewReply,
   validateInterviewTurn,
   type InterviewInput,
 } from '../lib/interview';
@@ -105,6 +106,327 @@ test('deterministic turn prioritizes contradictions, naturally rephrases unheard
   assert.equal(complete.reason, 'complete');
 });
 
+test('transcript memory skips clearly answered topics without creating structured facts', () => {
+  const messages = [
+    message('assistant-goal', 'assistant', '今天您最想先处理什么事情？'),
+    message('multi-answer', 'user', '我想明年开始准备长期照护，最好能留在家里，也不想让两个孩子承担太多。'),
+    message('advisor-note', 'user', '顾问事实更正：预算是每月 800 美元', { source: 'advisor' }),
+    message('draft-income', 'user', '收入是每年 90000 美元', { final: false }),
+  ];
+  const context = buildInterviewContext(input('ltc', [], messages));
+  assert.deepEqual(context.askedTopics, ['goal']);
+  assert.deepEqual(context.transcriptMemory.map((item) => item.key).sort(), ['care', 'dependents', 'goal', 'horizon']);
+  assert.equal(context.transcriptMemory.every((item) => item.sourceMessageIds.includes('multi-answer')), true);
+  assert.equal(context.knownFacts.length, 0);
+  assert.equal(context.missingPriorityItems.some((item) => ['goal', 'horizon', 'care'].includes(item.key)), false);
+  assert.equal(context.missingPriorityItems[0].key, 'existing_ltc');
+});
+
+test('transcript memory is conservative about questions, keyword collisions and scoped uncertainty', () => {
+  const messages = [
+    message('question-only', 'user', '收入要按税前还是税后回答？'),
+    message('insurance-name', 'user', '我有收入保障保险和长期照护保险。'),
+    message('mixed-answer', 'user', '收入我不知道，但我有两个孩子需要照顾。'),
+  ];
+  const context = buildInterviewContext(input('disability_income', [], messages));
+  assert.equal(context.transcriptMemory.some((item) => item.key === 'income' && item.sourceMessageIds.includes('question-only')), false);
+  assert.equal(context.transcriptMemory.some((item) => ['income', 'care'].includes(item.key) && item.sourceMessageIds.includes('insurance-name')), false);
+  assert.equal(context.transcriptMemory.find((item) => item.key === 'existing_di')?.status, 'answered');
+  assert.equal(context.transcriptMemory.find((item) => item.key === 'income')?.status, 'unknown');
+  assert.equal(context.transcriptMemory.find((item) => item.key === 'dependents')?.status, 'answered');
+  assert.equal(context.missingPriorityItems.some((item) => item.key === 'income'), false);
+
+  const scoped = buildInterviewContext(input('disability_income', [], [
+    message('scoped-statuses', 'user', '收入是每年80000美元，其他债务不知道，预算不愿提供。'),
+  ]));
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'income')?.status, 'answered');
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'debt')?.status, 'unknown');
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'budget')?.status, 'declined');
+
+  const spokenQuestion = buildInterviewContext(input('life', [], [
+    message('spoken-state-question', 'user', '我住在哪个州'),
+  ]));
+  assert.equal(spokenQuestion.transcriptMemory.some((item) => item.key === 'state'), false);
+  assert.equal(spokenQuestion.missingPriorityItems.some((item) => item.key === 'state'), true);
+
+  for (const [id, text] of [
+    ['spoken-employment-question', '我做什么工作'],
+    ['spoken-employment-recall', '我的工作是什么来着'],
+  ] as const) {
+    const employmentQuestion = buildInterviewContext(input('disability_income', [], [message(id, 'user', text)]));
+    assert.equal(employmentQuestion.transcriptMemory.some((item) => item.key === 'employment'), false, text);
+    assert.equal(employmentQuestion.missingPriorityItems.some((item) => item.key === 'employment'), true, text);
+  }
+
+  const genuinelyUnknownEmployment = buildInterviewContext(input('disability_income', [], [
+    message('employment-unknown', 'user', '我不知道做什么工作。'),
+  ]));
+  assert.equal(genuinelyUnknownEmployment.transcriptMemory.find((item) => item.key === 'employment')?.status, 'unknown');
+
+  const noPunctuation = buildInterviewContext(input('life', [], [
+    message('spoken-contrast', 'user', '收入是每年80000美元但是债务不知道'),
+  ]));
+  assert.equal(noPunctuation.transcriptMemory.find((item) => item.key === 'income')?.status, 'answered');
+  assert.equal(noPunctuation.transcriptMemory.find((item) => item.key === 'debt')?.status, 'unknown');
+});
+
+test('narrow unknown details do not erase a clearly stated arrangement', () => {
+  const coverage = buildInterviewContext(input('life', [], [
+    message('coverage-detail', 'user', '我有公司人寿保险，但保额不清楚。'),
+  ]));
+  assert.equal(coverage.transcriptMemory.find((item) => item.key === 'existing_life')?.status, 'answered');
+  assert.equal(coverage.missingPriorityItems.some((item) => item.key === 'existing_life'), false);
+
+  const retirement = buildInterviewContext(input('annuity', [], [
+    message('retirement-detail', 'user', '我计划65岁左右退休，但退休账户具体余额不知道。'),
+  ]));
+  assert.equal(retirement.transcriptMemory.find((item) => item.key === 'retirement')?.status, 'answered');
+  assert.equal(retirement.missingPriorityItems.some((item) => item.key === 'retirement'), false);
+
+  const spokenCoverage = buildInterviewContext(input('life', [], [
+    message('coverage-spoken-detail', 'user', '我有公司人寿保险但保额不清楚'),
+  ]));
+  assert.equal(spokenCoverage.transcriptMemory.find((item) => item.key === 'existing_life')?.status, 'answered');
+});
+
+test('coverage curiosity is not remembered as existing coverage and unknown stays clause-local', () => {
+  const intentOnly = buildInterviewContext(input('ltc', [], [
+    message('coverage-intent', 'user', '我想了解长期护理保险，也想问收入保障保险是什么。'),
+  ]));
+  assert.equal(intentOnly.transcriptMemory.some((item) => item.key === 'existing_ltc' || item.key === 'existing_di'), false);
+
+  const scoped = buildInterviewContext(input('ltc', [], [
+    message('scoped-budget', 'user', '我希望明年安排长期照护，预算不知道。'),
+  ]));
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'goal')?.status, 'answered');
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'horizon')?.status, 'answered');
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'budget')?.status, 'unknown');
+  assert.equal(scoped.transcriptMemory.find((item) => item.key === 'existing_ltc'), undefined);
+});
+
+test('an LTC goal alone does not invent a care-setting preference', () => {
+  const goalOnly = buildInterviewContext(input('ltc', [], [
+    message('ltc-goal-only', 'user', '我想安排退休后的长期照护。'),
+  ]));
+  assert.equal(goalOnly.transcriptMemory.find((item) => item.key === 'goal')?.status, 'answered');
+  assert.equal(goalOnly.transcriptMemory.some((item) => item.key === 'care'), false);
+  assert.equal(goalOnly.missingPriorityItems[0].key, 'care');
+
+  for (const [id, text] of [
+    ['care-home', '如果需要照顾，我希望留在家里。'],
+    ['care-family', '我希望在家由家人协助。'],
+    ['care-professional', '需要时我希望由专业护理人员照顾。'],
+  ] as const) {
+    const explicit = buildInterviewContext(input('ltc', [], [message(id, 'user', text)]));
+    assert.equal(explicit.transcriptMemory.find((item) => item.key === 'care')?.status, 'answered', text);
+  }
+
+  const homeWorker = buildInterviewContext(input('ltc', [], [
+    message('home-worker', 'user', '我在家工作。'),
+  ]));
+  assert.equal(homeWorker.transcriptMemory.some((item) => item.key === 'care'), false);
+  assert.equal(homeWorker.missingPriorityItems.some((item) => item.key === 'care'), true);
+});
+
+test('paraphrased assistant topics get at most one focused follow-up', () => {
+  const once = buildInterviewContext(input('life', [], [
+    message('goal-question', 'assistant', '今天最希望先解决什么？'),
+  ]));
+  assert.deepEqual(once.askedTopics, ['goal']);
+  assert.equal(once.missingPriorityItems[0].key, 'goal');
+  assert.equal(once.missingPriorityItems[0].kind, 'clarify');
+
+  const twice = buildInterviewContext(input('life', [], [
+    message('goal-question-1', 'assistant', '今天最希望先解决什么？'),
+    message('goal-question-2', 'assistant', '最在意的事情可以再说一点吗？'),
+  ]));
+  assert.equal(twice.conversationPlan.deferredTopics.includes('goal'), true);
+  assert.equal(twice.missingPriorityItems.some((item) => item.key === 'goal'), false);
+
+  const boundedBudget = buildInterviewContext(input('ltc', [], [
+    message('budget-question-1', 'assistant', INTERVIEW_QUESTIONS.budget),
+    message('budget-question-2', 'assistant', '关于预算，我还没听到明确答案，可以再说一点吗？不确定也可以先跳过。'),
+  ]));
+  assert.equal(boundedBudget.conversationPlan.deferredTopics.includes('budget'), true);
+  assert.equal(boundedBudget.missingPriorityItems.some((item) => item.key === 'budget'), false);
+});
+
+test('partial amount memory asks only for missing metadata and does not invent a fact', () => {
+  const context = buildInterviewContext(input('disability_income', [], [
+    message('partial-income', 'user', '我的收入大约是 5000。'),
+  ]));
+  const memory = context.transcriptMemory.find((item) => item.key === 'income');
+  assert.equal(memory?.status, 'partial');
+  assert.equal(context.knownFacts.some((item) => item.key === 'income'), false);
+  const incomeQuestion = context.missingPriorityItems.find((item) => item.key === 'income');
+  assert.equal(incomeQuestion?.kind, 'clarify');
+  assert.match(incomeQuestion?.question ?? '', /币种/);
+  assert.match(incomeQuestion?.question ?? '', /每月还是每年/);
+  assert.match(incomeQuestion?.question ?? '', /先跳过/);
+  assert.doesNotMatch(incomeQuestion?.question ?? '', /多少/);
+
+  const genericCurrent = buildInterviewContext(input('disability_income', [], [
+    message('current-income', 'user', '我目前收入是 5000 美元。'),
+  ]));
+  assert.equal(genericCurrent.transcriptMemory.find((item) => item.key === 'income')?.status, 'partial');
+  assert.match(genericCurrent.missingPriorityItems.find((item) => item.key === 'income')?.question ?? '', /每月还是每年/);
+
+  const twice = buildInterviewContext(input('disability_income', [], [
+    message('partial-income-again', 'user', '我的收入大约是 5000。'),
+    message('partial-question-1', 'assistant', '收入还缺币种和每月还是每年，可以补充吗？'),
+    message('partial-question-2', 'assistant', '收入的币种和每月还是每年，可以再说明一次吗？'),
+  ]));
+  assert.equal(twice.conversationPlan.deferredTopics.includes('income'), true);
+  assert.equal(twice.missingPriorityItems.some((item) => item.key === 'income'), false);
+
+  for (const [id, text, expected] of [
+    ['two-income-values', '收入是每年80000和90000美元。', /两个|多个|哪一个/],
+    ['magnitude-income', '收入是每年8万美元。', /一个数字|明确金额/],
+  ] as const) {
+    const ambiguous = buildInterviewContext(input('disability_income', [], [message(id, 'user', text)]));
+    const question = ambiguous.missingPriorityItems.find((item) => item.key === 'income')?.question ?? '';
+    assert.match(question, expected);
+    assert.doesNotMatch(question, /收入还缺，可以补充吗/);
+  }
+});
+
+test('different amount answers remain open for clarification without becoming a fact', () => {
+  const context = buildInterviewContext(input('disability_income', [], [
+    message('income-old', 'user', '收入是每年80000美元。'),
+    message('income-new', 'user', '收入是每年90000美元。'),
+  ]));
+  const income = context.transcriptMemory.find((item) => item.key === 'income');
+  assert.equal(income?.status, 'partial');
+  assert.deepEqual(income?.sourceMessageIds, ['income-old', 'income-new']);
+  assert.equal(context.knownFacts.some((item) => item.key === 'income'), false);
+  assert.match(context.missingPriorityItems.find((item) => item.key === 'income')?.question ?? '', /不同金额|哪一个/);
+
+  const withSavedUnconfirmed = buildInterviewContext(input('disability_income', [
+    fact('income', 80000, 'reported_unverified', ['income-old'], 'USD', 'year'),
+  ], [
+    message('income-old', 'user', '收入是每年80000美元。'),
+    message('income-new', 'user', '收入是每年90000美元。'),
+  ]));
+  const clarification = withSavedUnconfirmed.missingPriorityItems.find((item) => item.key === 'income');
+  assert.equal(clarification?.kind, 'clarify');
+  assert.match(clarification?.question ?? '', /不同金额|哪一个/);
+  assert.equal(withSavedUnconfirmed.knownFacts.find((item) => item.key === 'income')?.value, 80000);
+
+  const generatedConflictQuestion = '关于收入，我听到不同金额；哪一个是目前要记录的金额？不确定也可以先跳过。';
+  const boundedConflict = buildInterviewContext(input('disability_income', [], [
+    message('income-conflict-question-1', 'assistant', generatedConflictQuestion),
+    message('income-conflict-question-2', 'assistant', generatedConflictQuestion),
+  ]));
+  assert.equal(boundedConflict.conversationPlan.deferredTopics.includes('income'), true);
+  assert.equal(boundedConflict.missingPriorityItems.some((item) => item.key === 'income'), false);
+
+  const correctionMessages = [
+    message('income-first', 'user', '收入是每年80000美元。'),
+    message('income-second', 'user', '收入是每年90000美元。'),
+    message('income-correction', 'user', '更正，收入是每年90000美元。'),
+  ];
+  const resolved = buildInterviewContext(input('disability_income', [
+    fact('income', 90000, 'reported_unverified', ['income-correction'], 'USD', 'year'),
+  ], correctionMessages));
+  assert.equal(resolved.transcriptMemory.find((item) => item.key === 'income')?.status, 'answered');
+  assert.equal(resolved.missingPriorityItems.some((item) => item.key === 'income'), false);
+  assert.equal(resolved.knownFacts.find((item) => item.key === 'income')?.value, 90000);
+
+  const bareResolutionMessages = [
+    message('income-bare-old', 'user', '收入是每年80000美元。'),
+    message('income-bare-new', 'user', '收入是每年90000美元。'),
+    message('income-conflict-question', 'assistant', '关于收入，我听到不同金额；哪一个是目前要记录的金额？不确定也可以先跳过。'),
+    message('income-bare-resolution', 'user', '90000美元每年。'),
+  ];
+  const bareResolved = buildInterviewContext(input('disability_income', [
+    fact('income', 90000, 'reported_unverified', ['income-bare-resolution'], 'USD', 'year'),
+  ], bareResolutionMessages));
+  assert.equal(bareResolved.transcriptMemory.find((item) => item.key === 'income')?.status, 'partial');
+  assert.equal(bareResolved.missingPriorityItems.some((item) => item.key === 'income'), false);
+  assert.equal(bareResolved.knownFacts.find((item) => item.key === 'income')?.value, 90000);
+
+  const staleBareSource = buildInterviewContext(input('disability_income', [
+    fact('income', 80000, 'reported_unverified', ['income-stale-bare'], 'USD', 'year'),
+  ], [
+    message('income-stale-bare', 'user', '80000美元每年。'),
+    message('income-later-a', 'user', '收入是每年80000美元。'),
+    message('income-later-b', 'user', '收入是每年90000美元。'),
+  ]));
+  const staleClarification = staleBareSource.missingPriorityItems.find((item) => item.key === 'income');
+  assert.equal(staleClarification?.kind, 'clarify');
+  assert.match(staleClarification?.question ?? '', /不同金额|哪一个/);
+  assert.equal(staleBareSource.knownFacts.find((item) => item.key === 'income')?.value, 80000);
+
+  for (const [id, text, status] of [
+    ['income-later-unknown', '收入不知道。', 'unknown'],
+    ['income-later-declined', '收入不愿提供。', 'declined'],
+  ] as const) {
+    const terminal = buildInterviewContext(input('disability_income', [], [
+      message('income-old-a', 'user', '收入是每年80000美元。'),
+      message('income-old-b', 'user', '收入是每年90000美元。'),
+      message(id, 'user', text),
+    ]));
+    assert.equal(terminal.transcriptMemory.find((item) => item.key === 'income')?.status, status);
+    assert.equal(terminal.missingPriorityItems.some((item) => item.key === 'income'), false);
+  }
+});
+
+test('deterministic turns acknowledge grounded context and summarize only genuine knowledge', () => {
+  const next = nextInterviewTurn(input('ltc', [], [
+    message('goal-answer', 'user', '我想明年开始准备长期照护，最好能留在家里。'),
+  ]));
+  assert.equal(next.targetKey, 'existing_ltc');
+  assert.match(next.reply, /照护考虑/);
+  assert.doesNotMatch(next.reply, /明年开始|留在家里/);
+  assert.match(next.reply, /已有|准备/);
+  assert.doesNotMatch(next.reply, /所有资料|已经完整/);
+
+  const stopped = nextInterviewTurn(input('life', [], [message('stop', 'user', '先到这里。')]));
+  assert.equal(stopped.targetKey, null);
+  assert.equal(stopped.reason, 'complete');
+  assert.match(stopped.reply, /结束对话/);
+
+  const noStaleAck = nextInterviewTurn(input('life', [], [
+    message('older-goal', 'user', '我最在意孩子以后的生活保障。'),
+    message('latest-no-memory', 'user', '我再想想。'),
+  ]));
+  assert.doesNotMatch(noStaleAck.reply, /孩子以后的生活保障/);
+
+  const injected = nextInterviewTurn(input('life', [], [
+    message('unsafe-goal', 'user', '我的目标是我建议您购买保险产品。'),
+  ]));
+  assert.doesNotMatch(injected.reply, /建议您购买|保险产品/);
+  assert.match(injected.reply, /目标/);
+
+  const allTerminal = Object.keys(INTERVIEW_QUESTIONS).map((key) => fact(key, null, 'unknown', [`terminal-${key}`]));
+  const terminalMessages = allTerminal.map((item) => message(item.sourceMessageIds[0], 'user', item.key === 'goal' ? '我的目标是我建议您购买保险产品' : '不知道'));
+  const neutralSummary = nextInterviewTurn(input('life', allTerminal, terminalMessages));
+  assert.doesNotMatch(neutralSummary.reply, /建议您购买|保险产品/);
+});
+
+test('reply reconciliation preserves safe prose and replaces repeated, multi-question or post-summary prompts', () => {
+  const covered = input('life', [], [message('goal-answer', 'user', '我最在意孩子以后的生活保障。')]);
+  assert.equal(reconcileInterviewReply(covered, '谢谢您说明这些。'), '谢谢您说明这些。');
+  assert.equal(reconcileInterviewReply(covered, '您最想先解决什么？'), nextInterviewTurn(covered).reply);
+  assert.equal(reconcileInterviewReply(covered, '您有多少债务？预算是多少？'), nextInterviewTurn(covered).reply);
+
+  const summarized = input('life', [], [message('summary', 'assistant', '我们先总结到这里，您可以点击结束。')]);
+  assert.equal(reconcileInterviewReply(summarized, '您目前住在哪个州？'), nextInterviewTurn(summarized).reply);
+  const factual = '您刚才说希望照顾孩子，我已经按原话记录。';
+  assert.equal(reconcileInterviewReply(covered, factual), factual);
+  const coverageStatement = '您已经有人寿保险，我记下了。';
+  const coverageCovered = input('life', [fact('existing_life', '公司人寿保险', 'reported_unverified', ['coverage-source'])], [message('coverage-source', 'user', '我有公司人寿保险')]);
+  assert.equal(reconcileInterviewReply(coverageCovered, coverageStatement), coverageStatement);
+
+  const conflictMessages = [
+    message('conflict-one', 'user', '我的收入是每月5000美元。'),
+    message('conflict-two', 'user', '我的收入是每月7000美元。'),
+  ];
+  const conflictInput = input('disability_income', [fact('income', null, 'conflicting', ['conflict-one', 'conflict-two'])], conflictMessages);
+  const clarification = '我听到两个不同的收入金额，哪一个是目前正确的？';
+  assert.equal(reconcileInterviewReply(conflictInput, clarification), clarification);
+});
+
 test('system prompt and exported schema define one safe shared text/live contract', () => {
   const prompt = interviewSystemPrompt(input('ltc', [], []));
   assert.match(prompt, /单个客户访谈助手/);
@@ -177,6 +499,111 @@ test('recognizes explicit Chinese monthly and annual amount periods', () => {
   }
 });
 
+test('grounds multiple numeric facts to their own semantic clauses without cross-field unit mixing', () => {
+  const source = message('financial-summary', 'user', '我的年收入是 120000 美元，每月家庭支出是 4500 美元。房贷剩余本金是 280000 美元，其他债务不知道。');
+  const accepted = validateInterviewTurn({
+    reply: '谢谢。您目前有多少紧急储备？',
+    facts: [
+      { key: 'income', value: 120000, currency: 'USD', period: 'year', factStatus: 'reported_unverified', sourceMessageIds: ['financial-summary'] },
+      { key: 'expenses', value: 4500, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: ['financial-summary'] },
+      { key: 'debt', value: 280000, currency: 'USD', period: 'once', factStatus: 'reported_unverified', sourceMessageIds: ['financial-summary'] },
+    ],
+  }, input('disability_income', [], [source]));
+  assert.deepEqual(accepted.facts.map((item) => [item.key, item.value, item.period]), [
+    ['income', 120000, 'year'],
+    ['expenses', 4500, 'month'],
+    ['debt', 280000, 'once'],
+  ]);
+
+  assert.throws(() => validateInterviewTurn({
+    reply: '请核对收入。',
+    facts: [{ key: 'income', value: 4500, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: ['financial-summary'] }],
+  }, input('disability_income', [], [source])), /not present|amount/);
+  assert.throws(() => validateInterviewTurn({
+    reply: '请核对收入周期。',
+    facts: [{ key: 'income', value: 120000, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: ['financial-summary'] }],
+  }, input('disability_income', [], [source])), /amount/);
+});
+
+test('rejects ambiguous same-field values and field-mismatched unknown or declined evidence', () => {
+  const duplicateIncome = message('duplicate-income', 'user', '我的月收入是 5000 美元，另一份工作的月收入是 2000 美元。');
+  assert.throws(() => validateInterviewTurn({
+    reply: '请确认总收入。',
+    facts: [{ key: 'income', value: 5000, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: ['duplicate-income'] }],
+  }, input('disability_income', [], [duplicateIncome])), /not present|amount/);
+
+  const mixedDebt = message('mixed-debt', 'user', '房贷余额是 280000 美元，其他债务不知道。');
+  assert.throws(() => validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'debt', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['mixed-debt'] }],
+  }, input('life', [], [mixedDebt])), /not supported/);
+
+  const mixedRetirement = message('mixed-retirement', 'user', '我计划 65 岁退休，退休账户余额不知道。');
+  assert.throws(() => validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'retirement', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['mixed-retirement'] }],
+  }, input('annuity', [], [mixedRetirement])), /not supported/);
+
+  const unrelated = message('unrelated-status', 'user', '收入是 80000 美元每年，其他债务不知道，预算不愿提供。');
+  assert.throws(() => validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'income', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['unrelated-status'] }],
+  }, input('disability_income', [], [unrelated])), /not supported/);
+  assert.throws(() => validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'income', value: null, currency: null, period: null, factStatus: 'declined', sourceMessageIds: ['unrelated-status'] }],
+  }, input('disability_income', [], [unrelated])), /not supported/);
+
+  for (const [id, text, key] of [
+    ['di-only', '是否有伤残收入保险不知道。', 'income'],
+    ['ltc-only', '长期护理保障也不知道。', 'care'],
+  ] as const) {
+    assert.throws(() => validateInterviewTurn({
+      reply: '谢谢。请继续说明。',
+      facts: [{ key, value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: [id] }],
+    }, input('disability_income', [], [message(id, 'user', text)])), /not supported/);
+  }
+
+  const coverageUnknowns = validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [
+      { key: 'existing_di', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['di-only'] },
+      { key: 'existing_ltc', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['ltc-only'] },
+    ],
+  }, input('disability_income', [], [message('di-only', 'user', '是否有伤残收入保险不知道。'), message('ltc-only', 'user', '长期护理保障也不知道。')]));
+  assert.deepEqual(coverageUnknowns.facts.map((item) => item.key), ['existing_di', 'existing_ltc']);
+});
+
+test('applies an explicit same-sentence shared current-balance period to independently grounded amounts only', () => {
+  const source = message('shared-balance', 'user', '应急储蓄为30000美元，可投资资产为150000美元，都是当前余额。');
+  const accepted = validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [
+      { key: 'reserve', value: 30000, currency: 'USD', period: 'once', factStatus: 'reported_unverified', sourceMessageIds: ['shared-balance'] },
+      { key: 'assets', value: 150000, currency: 'USD', period: 'once', factStatus: 'reported_unverified', sourceMessageIds: ['shared-balance'] },
+    ],
+  }, input('annuity', [], [source]));
+  assert.deepEqual(accepted.facts.map((item) => [item.key, item.value, item.period]), [['reserve', 30000, 'once'], ['assets', 150000, 'once']]);
+  for (const [key, value] of [['reserve', 30000], ['assets', 150000]] as const) {
+    assert.equal(parseGroundedAnswer(key, source.text, source.id)?.value, value);
+  }
+
+  for (const [id, text] of [
+    ['mixed-periods', '应急储蓄为30000美元每月，可投资资产为150000美元每年，都是当前余额。'],
+    ['generic-shared', '应急储蓄为30000美元，可投资资产为150000美元，都是。'],
+    ['cross-sentence', '应急储蓄为30000美元，可投资资产为150000美元。都是当前余额。'],
+  ] as const) {
+    const invalid = message(id, 'user', text);
+    for (const [key, value] of [['reserve', 30000], ['assets', 150000]] as const) {
+      assert.throws(() => validateInterviewTurn({
+        reply: '请分别确认每项金额的周期。',
+        facts: [{ key, value, currency: 'USD', period: 'once', factStatus: 'reported_unverified', sourceMessageIds: [id] }],
+      }, input('annuity', [], [invalid])), /amount/);
+      assert.equal(parseGroundedAnswer(key, invalid.text, invalid.id), null);
+    }
+  }
+});
+
 test('deterministic grounded parser accepts only exact unambiguous source text', () => {
   assert.deepEqual(parseGroundedAnswer('income', '月收入 5,000 加元', 'm-cad'), fact('income', 5000, 'reported_unverified', ['m-cad'], 'CAD', 'month'));
   assert.deepEqual(parseGroundedAnswer('income', '年收入 80000 美元', 'm-usd'), fact('income', 80000, 'reported_unverified', ['m-usd'], 'USD', 'year'));
@@ -232,6 +659,71 @@ test('preserves both sides of a conflict and permits only a new explicit clarifi
   }, input('disability_income', [unresolved], messages));
   assert.equal(resolved.facts[0].value, 6000);
   assert.equal(resolved.facts[0].factStatus, 'reported_unverified');
+});
+
+test('an explicit final answer can replace a prior unknown without expanding a narrower unknown detail', () => {
+  const oldUnknown = message('retirement-unknown', 'user', '退休计划不知道。');
+  const clarification = message('retirement-plan', 'user', '我计划65岁左右退休，退休账户具体余额不知道。');
+  const turn = validateInterviewTurn({
+    reply: '访谈已保存。',
+    facts: [{
+      key: 'retirement',
+      value: '我计划65岁左右退休，退休账户具体余额不知道',
+      currency: null,
+      period: null,
+      factStatus: 'reported_unverified',
+      sourceMessageIds: ['retirement-plan'],
+    }],
+  }, input('annuity', [fact('retirement', null, 'unknown', ['retirement-unknown'])], [oldUnknown, clarification]));
+  assert.equal(turn.facts[0].value, '我计划65岁左右退休，退休账户具体余额不知道');
+  assert.deepEqual(turn.facts[0].sourceMessageIds, ['retirement-plan']);
+});
+
+test('does not expand unknown coverage details or account balances into unknown main facts', () => {
+  for (const [id, key, text] of [
+    ['life-details', 'existing_life', '我有公司人寿保险，但保额不清楚。'],
+    ['life-reversed', 'existing_life', '人寿保险我有，但保额不清楚。'],
+    ['life-still-active', 'existing_life', '公司的人寿保险还在，但保额不清楚。'],
+    ['life-detail-only', 'existing_life', '人寿保险的保额不清楚。'],
+    ['di-details', 'existing_di', '公司提供伤残收入保险，但条款和期限不知道。'],
+    ['ltc-details', 'existing_ltc', '我已有长期护理保障，但具体给付范围未知。'],
+    ['retirement-details', 'retirement', '我有退休计划，但退休账户余额不知道。'],
+  ] as const) {
+    assert.throws(() => validateInterviewTurn({
+      reply: '谢谢。请继续说明。',
+      facts: [{ key, value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: [id] }],
+    }, input('annuity', [], [message(id, 'user', text)])), /not supported/);
+  }
+
+  const genuinelyUnknown = validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'existing_life', value: null, currency: null, period: null, factStatus: 'unknown', sourceMessageIds: ['life-unknown'] }],
+  }, input('life', [], [message('life-unknown', 'user', '是否有人寿保险不知道。')]));
+  assert.equal(genuinelyUnknown.facts[0].factStatus, 'unknown');
+});
+
+test('does not treat willingness to pay a named debt as an insurance budget', () => {
+  const mortgage = message('mortgage-payment', 'user', '我愿意每月付5000美元房贷。');
+  assert.throws(() => validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'budget', value: 5000, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: ['mortgage-payment'] }],
+  }, input('life', [], [mortgage])), /not present|amount/);
+  const debt = validateInterviewTurn({
+    reply: '谢谢。请继续说明。',
+    facts: [{ key: 'debt', value: 5000, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: ['mortgage-payment'] }],
+  }, input('life', [], [mortgage]));
+  assert.equal(debt.facts[0].key, 'debt');
+
+  for (const [id, text] of [
+    ['explicit-budget', '我的保险预算是每月500美元。'],
+    ['willing-budget', '我愿意每月投入500美元。'],
+  ] as const) {
+    const budget = validateInterviewTurn({
+      reply: '谢谢。请继续说明。',
+      facts: [{ key: 'budget', value: 500, currency: 'USD', period: 'month', factStatus: 'reported_unverified', sourceMessageIds: [id] }],
+    }, input('life', [], [message(id, 'user', text)]));
+    assert.equal(budget.facts[0].key, 'budget');
+  }
 });
 
 test('rejects fabricated values, unit changes, confirmed output, invalid sources and known-fact overwrites', () => {

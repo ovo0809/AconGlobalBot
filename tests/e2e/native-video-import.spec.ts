@@ -28,7 +28,7 @@ test('Windows prepares a real oversized synthetic MP4 through isolated upload an
   await page.getByLabel('关联复核案例').selectOption(caseId);await page.getByLabel('资料名称').fill('原生大视频合成验证');await page.getByLabel('来源说明').fill('合成画面和音调，33 MiB 容器填充，仅验证本机流程。');
   await page.getByLabel('图片或视频').setInputFiles(path);await page.getByLabel(/我确认有权处理这份资料/).check();await page.getByRole('button',{name:'上传并自动提取'}).click();
   await expect(page.getByText('大视频已分成 1 段送入提取；提取完成后请逐段复核。')).toBeVisible({timeout:90_000});
-  await page.getByRole('button',{name:/原生大视频合成验证（第1\/1段）/}).click();
+  await page.locator('.material-list-open').filter({hasText:'原生大视频合成验证（第1/1段）'}).click();
   await expect(page.getByText('待复核',{exact:true}).first()).toBeVisible({timeout:15_000});
   await expect(page.getByLabel('AI 原始提取')).toHaveValue(/模拟/);
   await expect(page.getByText(new RegExp(`源文件 SHA-256：${checksum}`))).toBeVisible();

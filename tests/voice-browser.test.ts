@@ -44,7 +44,7 @@ function installConnectedBrowserFakes(t:{after(fn:()=>void):void}){
   Object.defineProperty(globalThis,'AudioContext',{configurable:true,value:FakeAudioContext});
   Object.defineProperty(globalThis,'WebSocket',{configurable:true,value:FakeWebSocket});
   Object.defineProperty(globalThis,'fetch',{configurable:true,value:async()=>new Response(JSON.stringify({token:`token-${++tokens}`}),{status:200,headers:{'content-type':'application/json'}})});
-  return {instances,sources,getUserMedia,setClock:(seconds:number)=>{playbackClock=seconds;},deferPlayback:(promise:Promise<void>)=>{resumePlayback=promise;},get stopped(){return stopped;},get closedContexts(){return closedContexts;},get tokens(){return tokens;}};
+  return {instances,sources,track,getUserMedia,setClock:(seconds:number)=>{playbackClock=seconds;},deferPlayback:(promise:Promise<void>)=>{resumePlayback=promise;},get stopped(){return stopped;},get closedContexts(){return closedContexts;},get tokens(){return tokens;}};
 }
 
 const pcm100ms=Buffer.alloc(4_800).toString('base64');
@@ -63,6 +63,51 @@ test('generation completion waits for every queued PCM source to finish before l
   assert(fake.sources.every(source=>!source.stopped),'normal completion must not call stop on the tail');
   assert.equal(states.slice(states.lastIndexOf('speaking')+1).filter(state=>state==='listening').length,1);
   await client.pause();
+});
+
+test('unexpected socket close stops old playback and stale socket events cannot affect the replacement',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);const client=new BrowserVoiceClient({csrf:'test'});
+  await client.start();const oldSocket=fake.instances[0];oldSocket.serverEvent({type:'ready'});
+  oldSocket.serverEvent({type:'audio',data:pcm100ms,mimeType:'audio/pcm;rate=24000',itemId:'old-reply',eventId:'old-event'});
+  await waitUntil(()=>fake.sources.length===1);oldSocket.serverClose(1011);
+  assert.equal(fake.sources[0].stopped,true);assert.equal(client.state,'reconnecting');
+  await waitUntil(()=>fake.instances.length===2);const replacement=fake.instances[1];replacement.serverEvent({type:'ready'});
+  oldSocket.serverEvent({type:'audio',data:pcm100ms,mimeType:'audio/pcm;rate=24000',itemId:'stale-reply',eventId:'stale-event'});
+  assert.equal(fake.sources.length,1);assert.equal(client.state,'listening');
+  await client.pause();
+});
+
+test('replay is available only for the matching completed reply and blocks live input until playback ends',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);const availability:Array<string|null>=[];const replayStates:boolean[]=[];
+  const client=new BrowserVoiceClient({csrf:'test',onReplayAvailable:eventId=>availability.push(eventId),onReplayState:value=>replayStates.push(value)});
+  await client.start();const socket=fake.instances[0];socket.serverEvent({type:'ready'});
+  socket.serverEvent({type:'audio',data:pcm100ms,mimeType:'audio/pcm;rate=24000',itemId:'reply-a',eventId:'assistant-event-a'});
+  socket.serverEvent({type:'transcript',role:'assistant',text:'可以重播的回答。',final:true,eventId:'assistant-event-a'});
+  socket.serverEvent({type:'turnComplete',eventId:'assistant-event-a'});
+  await waitUntil(()=>fake.sources.length===1);assert.deepEqual(availability,[],'audio is not replayable until the original playback finishes');
+  fake.sources[0].end();assert.deepEqual(availability,['assistant-event-a']);
+  assert.equal(await client.replayLast('another-event'),false);assert.equal(fake.sources.length,1);
+  const replay=client.replayLast('assistant-event-a');await waitUntil(()=>fake.sources.length===2);
+  assert.equal(fake.track.enabled,false);assert.equal(client.sendText('重播时不能发送'),false);assert.deepEqual(replayStates,[true]);
+  fake.sources[1].end();assert.equal(await replay,true);assert.equal(fake.track.enabled,true);assert.deepEqual(replayStates,[true,false]);
+  const cancelledReplay=client.replayLast('assistant-event-a');await waitUntil(()=>fake.sources.length===3);
+  socket.serverEvent({type:'audio',data:pcm100ms,mimeType:'audio/pcm;rate=24000',itemId:'reply-b',eventId:'assistant-event-b'});
+  assert.equal(fake.sources[2].stopped,true);assert.equal(await cancelledReplay,false);assert.equal(fake.track.enabled,true);
+  await waitUntil(()=>fake.sources.length===4);assert.deepEqual(availability,['assistant-event-a',null]);assert.equal(await client.replayLast('assistant-event-a'),false);
+  await client.pause();
+});
+
+test('interrupted or incomplete assistant audio never becomes replayable',async(t)=>{
+  const fake=installConnectedBrowserFakes(t);const availability:Array<string|null>=[];
+  const client=new BrowserVoiceClient({csrf:'test',onReplayAvailable:eventId=>availability.push(eventId)});
+  await client.start();const socket=fake.instances[0];socket.serverEvent({type:'ready'});
+  for(const [eventId,status] of [['interrupted-event','interrupted'],['incomplete-event','incomplete']] as const){
+    socket.serverEvent({type:'audio',data:pcm100ms,mimeType:'audio/pcm;rate=24000',itemId:eventId,eventId});
+    socket.serverEvent({type:'transcript',role:'assistant',text:'不能重播的回答。',final:true,eventId,...(status==='interrupted'?{interrupted:true}:{responseStatus:'incomplete'})});
+    socket.serverEvent({type:'turnComplete',eventId});await waitUntil(()=>fake.sources.length>=(status==='interrupted'?1:2));fake.sources.at(-1)!.end();
+    assert.equal(await client.replayLast(eventId),false);
+  }
+  assert.deepEqual(availability,[]);await client.pause();
 });
 
 test('interruption during the playback tail retains the item and actual played duration',async(t)=>{

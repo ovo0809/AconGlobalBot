@@ -108,7 +108,9 @@ test('service persists interview and voice reference snapshots, reports version 
   assert.deepEqual(savedVoice.knowledge,voice.referenceKnowledge);
   await act({action:'end'});await service.processReportJobs();
   const report1=docs<import('../lib/domain').ReportContent>('SELECT doc FROM reports WHERE case_id=? ORDER BY version',caseId)[0];
-  assert(report1?.knowledge?.sources.length);assert(report1.fullText.includes(referenceText));
+  assert(report1?.knowledge?.sources.length);
+  assert(report1.knowledge.sources.some(source=>source.excerpt.includes(referenceText)),'full reference text remains in the immutable snapshot');
+  assert(!report1.fullText.includes(referenceText),'raw reference excerpts are not pasted into the company report');
   const pdf1=db().prepare('SELECT pdf FROM reports WHERE case_id=? AND version=?').get(caseId,report1.version)!.pdf as Uint8Array;
   assert(Buffer.from(pdf1).subarray(0,4).equals(Buffer.from('%PDF')));
   writeFileSync(join(root,'family.md'),`# 家庭保障访谈示例\nreview_status: demo_unapproved\n\n${referenceText}\n新增的家庭保障核对内容。\n`);

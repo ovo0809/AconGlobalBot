@@ -1,11 +1,11 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { audit, checkPassword, db, docs, id, now, pack, transaction, unpack } from './db';
-import { buildReport, renderPdf, validateAnalyses } from './report';
+import { buildReport, renderPdf, validateAnalyses, REPORT_FORMAT_VERSION, reportClientContext } from './report';
 import { analyzeWithProvider, interviewWithProvider, ProviderExtractionValidationError } from './providers';
 import { providerDisplayCapabilities, requireAnalysisConfig } from './provider-config';
 import { isSharedDemo } from './shared-demo-policy';
 import { publicRequestConfig, readSharedLiveConfig, SharedAccessError, sharedLiveScope, type VoiceAccessScope } from './shared-live-access';
-import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, mockInterviewControlReply, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
+import { buildInterviewContext, nextInterviewTurn, parseGroundedAnswer, interviewControlReply, INTERVIEW_QUESTIONS, type InterviewInput } from './interview';
 import { closeVoiceSession, forgetVoiceSession, VOICE_DRAIN_TIMEOUT_MS, type VoiceDiagnosticEvent } from './voice-server';
 import { DryRunMailProvider } from './mail';
 import { getUsageSummary, purgeCaseUsage, recoverUsageReservations, UsageBudgetError, UsageDataError } from './ai-usage';
@@ -123,6 +123,9 @@ async function respondToText(session:Interview,text:string,eventId:string){
   try{
     const message=addMessage(session.id,session.case_id,'user',text,eventId);
     const input=interviewInput(session);
+    requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
+    const controlReply=interviewControlReply(input);
+    if(controlReply){transaction(()=>addMessage(session.id,session.case_id,'assistant',controlReply,replyId));return;}
     const knowledge=await loadCaseKnowledge(session.case_id,knowledgeQuery(input.entry,input.facts,input.messages));
     requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     let turn;
@@ -130,9 +133,7 @@ async function respondToText(session:Interview,text:string,eventId:string){
     catch(error){if(error instanceof UsageBudgetError)throw new AppError(429,`${error.message} 您的回答已保存，可结束访谈交还顾问。`);throw new AppError(503,'您的回答已保存。云端访谈暂时未完成，请稍后重试或交还顾问；不会使用模拟回复冒充 AI。');}
     requireThat(voiceHooks.isActive(session.id)&&db().prepare('SELECT epoch FROM interviews WHERE id=?').get(session.id)?.epoch===session.epoch,409,'访谈已暂停或结束，回答已保存，未继续生成问题。');
     transaction(()=>{
-      const controlReply = !turn ? mockInterviewControlReply(input) : null;
       if(turn){for(const fact of turn.facts)saveFact(session.case_id,fact);addMessage(session.id,session.case_id,'assistant',turn.reply,replyId,replyId,false,true,'customer',undefined,{knowledge,knowledgeRefs:turn.knowledgeRefs??[]});}
-      else if(controlReply)addMessage(session.id,session.case_id,'assistant',controlReply,replyId);
       else if(session.current_question){const fact=parseAnswer(session.current_question,text,message.id);if(fact)saveFact(session.case_id,fact);askNext(session,replyId);}
       else askNext(session,replyId);
     });
@@ -144,7 +145,8 @@ async function finalizeInterviewFacts(caseId:string){
   for(const session of sessions){
     const base=interviewInput(session),recordingSessionId=session.id.startsWith('recording:')?session.id.split(':')[1]:null,input=recordingSessionId?(()=>{const sourceIds=new Set(base.facts.flatMap(fact=>fact.sourceMessageIds)),anchors=base.messages.filter(message=>sourceIds.has(message.id)&&message.sessionId!==session.id),current=base.messages.filter(message=>message.sessionId===session.id);return {...base,messages:[...anchors,...current]};})():base;
     const finalized=input.messages.filter(m=>m.sessionId===session.id&&m.role==='user'&&m.final);
-    const hash=digest(pack(finalized));
+    // Revalidate old extraction results on the next requested report, never at startup.
+    const hash=digest(pack({validationVersion:'field-clause/2',messages:finalized}));
     const prior=db().prepare('SELECT transcript_hash FROM interview_extractions WHERE session_id=?').get(session.id);
     if(prior?.transcript_hash===hash)continue;
     // A real voice transcript must not silently finish with mock extraction.
@@ -285,7 +287,9 @@ export async function recordingRequest(request:Request):Promise<Response>{
   throw new AppError(400,'未知录音操作。');
 }
 
-async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:string):Promise<ReportRecord>{
+type ReportCommit={actorId:string;apply:(report:ReportContent,record:Case)=>void};
+
+async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:string,commit?:ReportCommit):Promise<ReportRecord>{
   const existing=locks.get(caseId);if(existing){requireThat(!reviewNote,409,'另一份报告正在生成，请完成后再提交复核。');return existing;}
   const task=(async()=>{
     let record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];requireThat(record,404,'案例不存在。');
@@ -297,9 +301,15 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
     const before=digest(pack({messages,facts}));
     const knowledge=await loadCaseKnowledge(record.id,knowledgeQuery(record.entry,facts,messages));
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'检索期间资料发生变化，请重新生成。');
-    const originalSnapshot=digest(pack({before,reviewStatus,reviewNote,rule:'demo_unapproved_v1',knowledge}));
-    const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];if(prior)return reportRecord(prior,record);
-    const output=await analyzeWithProvider({messages,facts,knowledge,usageContext:{caseId}});const {analyses,provider}=output;
+    const foundation=reportClientContext(client,now());
+    const originalSnapshot=digest(pack({before,foundation,reviewStatus,reviewNote,rule:'demo_unapproved_v1',formatVersion:REPORT_FORMAT_VERSION,knowledge}));
+    const prior=docs<ReportContent>('SELECT doc FROM reports WHERE case_id=? AND snapshot_id=?',caseId,originalSnapshot)[0];
+    if(prior){
+      record=docs<Case>('SELECT doc FROM cases WHERE id=?',caseId)[0];
+      if(commit)transaction(()=>commit.apply(prior,record));
+      return reportRecord(prior,record);
+    }
+    const output=await analyzeWithProvider({messages,facts,foundation,knowledge,incompleteTranscript:incomplete,usageContext:{caseId}});const {analyses,provider}=output;
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
     validateAnalyses(analyses,facts,messages,knowledge);
     const snapshotId=originalSnapshot;
@@ -307,7 +317,7 @@ async function generateReport(caseId:string,reviewStatus='draft',reviewNote?:str
     const report=buildReport({client,owner,caseRecord:record,version,snapshotId,reviewStatus,createdAt:now(),facts,messages,analyses,incompleteTranscript:incomplete,provider,reviewNote,knowledge});const pdf=await renderPdf(report);
     requireThat(pdf.length>500&&pdf.subarray(0,4).toString()==='%PDF',500,'PDF 生成失败，未创建发送任务。');
     requireThat(before===digest(pack({messages:messagesFor(caseId),facts:factsFor(caseId)})),409,'生成期间事实发生变化，请重新生成。');
-    transaction(()=>{for(const fact of facts)saveFact(caseId,fact);db().prepare('INSERT INTO reports VALUES(?,?,?,?,?)').run(caseId,version,snapshotId,pack(report),pdf);record.reportVersion=version;record.status=reviewStatus==='reviewed'?'reviewed':reviewStatus==='returned'?'returned':'draft';saveCase(record);audit(owner.id,caseId,'report.generated',{version,snapshotId,provider});});
+    transaction(()=>{for(const fact of facts)saveFact(caseId,fact);db().prepare('INSERT INTO reports VALUES(?,?,?,?,?)').run(caseId,version,snapshotId,pack(report),pdf);record.reportVersion=version;record.status=reviewStatus==='reviewed'?'reviewed':reviewStatus==='returned'?'returned':'draft';saveCase(record);audit(commit?.actorId??owner.id,caseId,'report.generated',{version,snapshotId,provider});commit?.apply(report,record);});
     return reportRecord(report,record);
   })();locks.set(caseId,task);try{return await task;}finally{locks.delete(caseId);}
 }
@@ -422,9 +432,21 @@ export async function action(request:Request):Promise<Response>{
   if(name==='submitReview'){const record=caseFor(user,str(input,'caseId'),true);requireThat(record.reportVersion>0&&record.status!=='needs_report',409,'请先生成当前报告。');record.assignedReviewerId='charles';record.status='pending_review';saveCase(record);audit(user.id,record.id,'review.submitted');return json({ok:true});}
   if(name==='review'){
     requireThat(user.role==='reviewer',403,'仅 Charles 可以复核。');const record=caseFor(user,str(input,'caseId'));const decision=str(input,'decision'),reason=str(input,'reason',2000);requireThat(['approved','returned','amended','quote_handoff'].includes(decision),400,'复核动作无效。');requireThat(reason,400,'请填写复核意见或修改理由。');requireThat(record.reportVersion>0&&record.status!=='needs_report',409,'请先由顾问生成当前报告。');
-    const review:Review={id:id(),caseId:record.id,reportVersion:record.reportVersion,reviewerId:user.id,decision,reason,createdAt:now()};
     // A review creates a new immutable report version; advice is never a global rules change.
-    const report=await generateReport(record.id,decision==='returned'?'returned':'reviewed',`${decision}：${reason}`);review.reportVersion=report.version;transaction(()=>{db().prepare('INSERT INTO reviews VALUES(?,?,?)').run(review.id,record.id,pack(review));if(decision==='quote_handoff'){const fresh=caseFor(user,record.id);fresh.status='quote_handoff';saveCase(fresh);}audit(user.id,record.id,'review.recorded',{decision,version:report.version});});return json({ok:true,version:report.version});
+    const report=await generateReport(record.id,decision==='returned'?'returned':'reviewed',`${decision}：${reason}`,{actorId:user.id,apply:(content,current)=>{
+      const matching=docs<Review>('SELECT doc FROM reviews WHERE case_id=?',record.id).find(existing=>existing.reportVersion===content.version&&existing.reviewerId===user.id&&existing.decision===decision&&existing.reason===reason);
+      if(matching)return; // Preserve and recognize reviews created before deterministic operation IDs.
+      const reviewId=`review-${digest(pack({caseId:record.id,snapshotId:content.snapshotId,reviewerId:user.id,decision,reason})).slice(0,32)}`;
+      const review:Review={id:reviewId,caseId:record.id,reportVersion:content.version,reviewerId:user.id,decision,reason,createdAt:now()};
+      const inserted=db().prepare('INSERT OR IGNORE INTO reviews VALUES(?,?,?)').run(review.id,record.id,pack(review)).changes;
+      if(!inserted){
+        const existing=docs<Review>('SELECT doc FROM reviews WHERE id=?',review.id)[0];
+        requireThat(existing?.caseId===review.caseId&&existing.reportVersion===review.reportVersion&&existing.reviewerId===review.reviewerId&&existing.decision===review.decision&&existing.reason===review.reason,409,'复核记录已变化，请刷新后重试。');
+        return;
+      }
+      if(decision==='quote_handoff'){current.status='quote_handoff';saveCase(current);}
+      audit(user.id,record.id,'review.recorded',{decision,version:content.version});
+    }});return json({ok:true,version:report.version});
   }
   if(name==='approveSend'){
     const record=caseFor(user,str(input,'caseId'),true);const version=Number(input.version);requireThat(version===record.reportVersion&&record.status!=='needs_report',409,'报告已变化，请重新预览并确认。');

@@ -60,6 +60,104 @@ async function stubBootstrap(page:Page,role:Role,initialCase:StubCase|null,recor
 
 function caseList(page:Page) { return page.locator('.case-list'); }
 
+test('案例排序支持更新、建档和姓名，搜索及当前案例保持不变',async({page})=>{
+  const records:StubCase[]=[
+    {...cases[0],clientName:'Carol',createdAt:'2026-10-03T00:00:00Z',updatedAt:'2026-10-05T10:00:00+08:00'},
+    {...cases[1],clientName:'Alice',createdAt:'2026-10-01T00:00:00Z',updatedAt:'2026-10-05T03:00:00Z'},
+    {...cases[2],clientName:'Bob',createdAt:'2026-10-02T00:00:00Z',updatedAt:'2026-10-04T12:00:00Z'},
+  ];
+  let writes=0;
+  await stubBootstrap(page,'advisor',records[0],records);
+  await page.route('**/api/action',route=>{writes++;return route.fulfill({json:{ok:true}});});
+  await page.setViewportSize({width:1440,height:900});await page.goto('/');
+  const sort=page.getByRole('combobox',{name:'案例排序'});
+  const names=caseList(page).locator('.case-copy b');
+  await expect(sort).toHaveValue('updated_desc');
+  await expect(names).toHaveText(['Alice','Carol','Bob']);
+  for(const [value,expected] of [
+    ['updated_asc',['Bob','Carol','Alice']],['created_desc',['Carol','Bob','Alice']],
+    ['created_asc',['Alice','Bob','Carol']],['name',['Alice','Bob','Carol']],
+  ] as const){
+    await sort.selectOption(value);await expect(names).toHaveText([...expected]);
+    await expect(caseList(page).locator('.selected .case-copy b')).toHaveText('Carol');
+    await expect(page.locator('.client-identity b')).toHaveText('Carol');
+    if(value.startsWith('created'))await expect(caseList(page).locator('.selected time')).toHaveAttribute('datetime',records[0].createdAt);
+  }
+  await page.getByPlaceholder('搜索客户或案例').fill('al');await expect(names).toHaveText(['Alice']);
+  await sort.selectOption('updated_asc');await expect(names).toHaveText(['Alice']);
+  await expect(page.locator('.directory-summary')).toContainText('1 份案例');
+  await page.getByPlaceholder('搜索客户或案例').fill('');await expect(names).toHaveText(['Bob','Carol','Alice']);
+  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+  await expect(sort).toHaveValue('updated_asc');await expect(names).toHaveText(['Bob','Carol','Alice']);
+  expect(writes).toBe(0);
+});
+
+test('手机复核列表的排序与复核范围独立且不溢出',async({page})=>{
+  const records=cases.map((record,index)=>({...record,updatedAt:`2026-10-${String(20+index).padStart(2,'0')}T12:00:00Z`}));
+  await stubBootstrap(page,'reviewer',records[1],records);
+  await page.setViewportSize({width:360,height:640});await page.goto('/');
+  const sort=page.getByRole('combobox',{name:'案例排序'});
+  await expect(caseList(page).getByRole('button')).toHaveCount(1);
+  await sort.selectOption('updated_asc');
+  await page.getByLabel('复核范围').selectOption('all');
+  await expect(caseList(page).locator('.case-copy b')).toHaveText(records.slice(1).map(record=>record.clientName));
+  await expect(sort).toHaveValue('updated_asc');
+  await sort.selectOption('updated_desc');
+  await expect(caseList(page).locator('.case-copy b')).toHaveText(records.slice(1).reverse().map(record=>record.clientName));
+  await expect(sort).toBeInViewport();
+  await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+  const screenshots=join(validationDir,'case-sort');mkdirSync(screenshots,{recursive:true});
+  await page.screenshot({path:join(screenshots,'reviewer-mobile.png')});
+});
+
+test('报告长标题与复核操作在桌面和手机可读可达，提交保留原动作',async({page})=>{
+  const record={...cases[1],clientName:'长期照护与退休现金流规划客户（合成）'};
+  const payload=bootstrap('reviewer',record,[record]);
+  payload.reports[0].sections=[
+    {title:'一、客户画像',body:'客户希望提前安排退休后的长期照护，并减少家人的照护压力。具体预算和启动时间尚待核实。'},
+    {title:'二、四类初步方向',body:'现阶段优先了解照护安排和退休现金流，其他方向资料不足，交由顾问确认。'},
+    {title:'三、证据与理由',body:'本页面使用合成资料验证显示与操作，不代表业务审核结论。'},
+    {title:'四、限制与缺失',body:'预算金额、现有保障与照护安排待核实。'},
+    {title:'五、下次问题',body:'您希望优先在家接受照护，还是考虑专业机构？'},
+    {title:'六、交接摘要',body:'请结合客户原话核对上述需求，再记录复核意见。'},
+  ];
+  const submissions:unknown[]=[];
+  await page.route('**/api/bootstrap*',route=>route.fulfill({json:payload}));
+  await page.route('**/api/action',route=>{submissions.push(route.request().postDataJSON());return route.fulfill({json:{ok:true}});});
+  const screenshots=join(validationDir,'ui-polish');mkdirSync(screenshots,{recursive:true});
+  for(const viewport of [{width:1440,height:1000},{width:1024,height:900},{width:768,height:900},{width:390,height:844},{width:360,height:640}]){
+    await page.setViewportSize(viewport);await page.goto('/');
+    if(viewport.width<=760)await caseList(page).getByRole('button').click();
+    await expect(page.getByRole('heading',{name:payload.reports[0].title})).toBeVisible();
+    await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+    await expect.poll(()=>page.locator('.workspace-body').evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+    if(viewport.width<=760){
+      const title=await page.locator('.workspace-header h1').boundingBox();
+      const status=await page.locator('.workspace-header .status').boundingBox();
+      expect(title).not.toBeNull();expect(status).not.toBeNull();
+      expect(title!.x+title!.width).toBeLessThanOrEqual(status!.x+1);
+    }
+    await page.getByRole('link',{name:'预览 PDF'}).scrollIntoViewIfNeeded();
+    await expect(page.getByRole('link',{name:'预览 PDF'})).toBeInViewport();
+    await page.screenshot({path:join(screenshots,`report-${viewport.width}.png`)});
+    const reason=page.getByLabel('复核理由／备注');
+    const confirm=page.getByRole('button',{name:'确认复核',exact:true});
+    await expect(confirm).toBeDisabled();
+    await reason.fill('合成界面验证：保留现有复核动作与理由。');
+    await confirm.scrollIntoViewIfNeeded();
+    await expect(confirm).toBeEnabled();await expect(confirm).toBeInViewport();
+    for(const name of ['退回补问','记录修改','确认复核']){
+      const box=await page.getByRole('button',{name,exact:true}).boundingBox();
+      expect(box).not.toBeNull();expect(box!.x).toBeGreaterThanOrEqual(0);
+      expect(box!.x+box!.width).toBeLessThanOrEqual(viewport.width+1);
+    }
+    await page.screenshot({path:join(screenshots,`review-${viewport.width}.png`)});
+  }
+  await page.getByRole('button',{name:'确认复核',exact:true}).click();
+  await expect.poll(()=>submissions.length).toBe(1);
+  expect(submissions[0]).toMatchObject({action:'review',caseId:record.id,decision:'approved',reason:'合成界面验证：保留现有复核动作与理由。'});
+});
+
 function deferred() {
   let resolve!:()=>void;
   const promise=new Promise<void>(done=>{resolve=done;});

@@ -2,7 +2,7 @@
 
 ## Source of truth
 - Status: Active
-- Last refreshed: 2026-10-30
+- Last refreshed: 2026-10-31
 - Primary surfaces: advisor/reviewer workspace, client interview, report, login, settings, deleted cases.
 - Evidence reviewed: `PRD.md`, `mvp.md`, `app/page.tsx`, `app/globals.css`, desktop/mobile screenshots, existing Playwright flows. User direction: 高级感、私人定制感; retain working Aeconn Demo.
 - Reference: Wix Design System layout guidance (via Wix plugin): consistency, inclusive layouts, deliberate hierarchy/white space, related content kept together. This is a local Next.js redesign, not a Wix migration or deployment.
@@ -39,6 +39,8 @@
 
 ## Visual language
 - Color: warm paper #F7F5F0; panels #FFFEFB; ink #21332D; deep green #203B34; muted text #68736C; brass #A18047; borders #E3E3D9.
+- Client interview palette (2026-10-31): pine #173D35 header/actions, white #FFFFFF reading surface, pale green #EDF2EE canvas/messages, ink #243D34, muted #5C7066, restrained brass #A48B58 monogram border. Keep the existing 880px centered shell; left-align the welcome copy. Four topic choices use semantic line icons, without the former large monogram and English decorative label.
+- Client interview type: native Chinese sans body at 16px+, Songti/SimSun-style serif welcome headline; no remote fonts. Speaker labels distinguish AI and customer messages. Paused session labels remain consistent in header and controls.
 - Typography: native system sans body, Georgia/Chinese serif fallback for editorial headings and names. No remote font dependency. Body 15–16px, metadata 12–13px, dossier names 30–36px desktop.
 - Rhythm: 4/8px base; desktop section padding 28–36px; compact 16–20px mobile.
 - Shapes: 8–12px controls, 16px larger panels; fine borders, low elevation, no repeated heavy shadows.
@@ -61,7 +63,7 @@
 - 761–1279px: narrow navigation and controlled action wrapping; readable labels.
 - <=760px: existing list/detail navigation and bottom rail, safe-area padding; no horizontal page overflow.
 - 390/844 and 1440/900 are screenshot checkpoints; inspect 768 and 1024 widths too.
-- Client window: centered horizontally and vertically within available desktop/tablet height; at 886px wide retain one column. On phones use the full viewport with safe-area padding. Only the conversation/welcome content scrolls; header and active pause/end/input controls stay reachable, including short 390×667 viewports.
+- Client window: centered horizontally and vertically within available desktop/tablet height; at 886px wide retain one column. On phones use the full viewport with safe-area padding. Conversation/welcome content scrolls independently; the header stays fixed. Active controls occupy at most 55% of the panel and can scroll when error/retry content is long, keeping the conversation available. Topic choices become one column at 520px and below. Browser checks include 360×640 and short 390×667 viewports; these are not physical phone acceptance.
 
 ## Interaction states
 - Empty: useful next step and calm illustration/monogram, no fake metrics.

@@ -1,15 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import PDFDocument from 'pdfkit';
-import { messageSource, type AnalysisItem, type Category, type DemandStatus, type Message, type ProfileField, type ReportContent, type ReportInput } from './domain';
-import { demandStatusLabels, factLabel, factStatusLabels, formatFactValue, reviewStatusLabel } from './report-labels';
+import { messageSource, type AnalysisItem, type Category, type Client, type DemandStatus, type Message, type ProfileField, type ReportContent, type ReportInput } from './domain';
+import { demandStatusLabels, factLabel, factLabels, factStatusLabels, formatFactValue, reviewStatusLabel } from './report-labels';
 import type { KnowledgeContext, KnowledgeSource } from './knowledge';
+import { buildReportWritingBrief, prioritizeReportQuestions, reviewReportDraft } from './report-editorial';
 
 const CATEGORIES: Category[] = ['life', 'annuity', 'ltc', 'disability_income'];
 const STATUSES: DemandStatus[] = ['priority_discussion', 'secondary_discussion', 'defer', 'insufficient_information', 'review_existing'];
 const MONEY_KEYS = new Set(['income', 'expenses', 'debt', 'reserve', 'assets', 'budget']);
 const PERIODS = new Set(['month', 'year', 'once']);
 const RULE_VERSION = 'demo_unapproved/1.0';
+export const REPORT_FORMAT_VERSION = 'company-readable/4';
 const FONT_PATH = path.join(process.cwd(), 'public', 'fonts', 'NotoSansCJKsc-Regular.otf');
 
 const categoryLabel: Record<Category, string> = { life: '人寿', annuity: '年金／退休收入', ltc: '长期护理', disability_income: '伤残收入保障' };
@@ -45,6 +47,9 @@ export function analyzeDemo(facts: ProfileField[]): AnalysisItem[] {
   const dependents = map.get('dependents');
   const debt = map.get('debt');
   const existingLife = map.get('existing_life');
+  const lifePolicyQuestions=existingLife?.factStatus==='declined'?[]:existingLife?.factStatus==='unknown'
+    ?['是否方便在下次会面时提供现有保单，供顾问核对？']
+    :['目前已有何种人寿保障？希望覆盖哪些责任与时间范围？'];
   const lifeConflicts = conflicting(facts, ['dependents', 'debt', 'existing_life']);
   const lifeSupport = [dependents, debt, existingLife].filter(usable);
   const life = lifeConflicts.length
@@ -52,8 +57,8 @@ export function analyzeDemo(facts: ProfileField[]): AnalysisItem[] {
     : usable(existingLife)
       ? analysis('life', 'review_existing', lifeSupport, '已陈述存在人寿保障，应先由顾问核对范围、期限与家庭责任。', [], ['现有保障未经核验，不表示充足或不足。'], ['现有保障的类型、期限、金额及受益安排是什么？'])
       : usable(dependents) || usable(debt)
-        ? analysis('life', 'priority_discussion', lifeSupport, '存在家庭责任或债务线索，适合优先核实身故后的责任与现有保障。', ['existing_life'], ['仅为讨论顺序，不构成产品建议或承保结论。'], ['目前已有何种人寿保障？希望覆盖哪些责任与时间范围？'])
-        : analysis('life', 'insufficient_information', [], '缺少家庭责任、债务与现有保障资料。', ['dependents', 'debt', 'existing_life'], ['资料不足时不得推断“无需新增”。'], ['是否有受扶养人、重要债务或现有人寿保障？']);
+        ? analysis('life', 'priority_discussion', lifeSupport, '存在家庭责任或债务线索，适合优先核实身故后的责任与现有保障。', ['existing_life'], ['仅为讨论顺序，不构成产品建议或承保结论。'], lifePolicyQuestions)
+        : analysis('life', 'insufficient_information', [], '缺少家庭责任、债务与现有保障资料。', ['dependents', 'debt', 'existing_life'], ['资料不足时不得推断“无需新增”。'], existingLife?lifePolicyQuestions:['是否有受扶养人、重要债务或现有人寿保障？']);
 
   const goal = map.get('goal');
   const horizon = map.get('horizon');
@@ -69,10 +74,13 @@ export function analyzeDemo(facts: ProfileField[]): AnalysisItem[] {
       ? analysis('annuity', usable(horizon) && usable(liquidity) ? 'priority_discussion' : 'secondary_discussion', annuitySupport, '客户表达退休或未来现金流目标，可继续核实时间、资金用途与流动性约束。', [!usable(horizon) ? 'horizon' : '', !usable(liquidity) ? 'liquidity' : '', !usable(retirement) ? 'retirement' : ''].filter(Boolean), ['入口不等于产品推荐；需由人工比较流动性、费用、税务及替代方案。', ...special], ['预计何时使用资金？希望保留多少流动性？退休需求是什么？'])
       : usable(assets) || usable(retirement)
         ? analysis('annuity', 'secondary_discussion', annuitySupport, '存在资产或退休线索，但目标和约束尚未完整。', ['goal', 'horizon', 'liquidity'], ['不得仅因存在资产就固定映射为年金。', ...special], ['这笔资金的目标、使用时间和流动性要求是什么？'])
-        : analysis('annuity', 'insufficient_information', [], '缺少退休目标、时间与流动性资料。', ['goal', 'horizon', 'retirement', 'liquidity'], ['资料不足，不形成产品方向。', ...special], ['是否有退休时间、收入需求或流动性目标？']);
+        : analysis('annuity', 'insufficient_information', [], usable(goal)?'本轮已有其他目标记录，退休方面的安排与流动性资料尚未形成，不据此推断年金需求。':'缺少退休目标、时间与流动性资料。', ['goal', 'horizon', 'retirement', 'liquidity'], ['资料不足，不形成产品方向。', ...special], ['是否有退休时间、收入需求或流动性目标？']);
 
   const care = map.get('care');
   const existingLtc = map.get('existing_ltc');
+  const careSupportQuestions=existingLtc?.factStatus==='declined'?[]:existingLtc?.factStatus==='unknown'
+    ?['是否愿意让顾问结合现有保单，帮您核对照护责任？']
+    :['围绕已说明的照护偏好，目前还有哪些可用支持或保障？'];
   const ltcConflicts = conflicting(facts, ['care', 'existing_ltc']);
   const ltcSupport = [care, existingLtc].filter(usable);
   const ltc = ltcConflicts.length
@@ -80,7 +88,7 @@ export function analyzeDemo(facts: ProfileField[]): AnalysisItem[] {
     : usable(existingLtc)
       ? analysis('ltc', 'review_existing', ltcSupport, '已陈述存在照护安排，应先复核范围、限制与目标。', [], ['不根据名称推断具体给付或适用性。'], ['现有安排包括哪些照护情形、等待期与限制？'])
       : usable(care)
-        ? analysis('ltc', 'priority_discussion', ltcSupport, '存在照护担忧或偏好，可继续厘清目标与资源。', ['existing_ltc'], ['仅澄清担忧，不承诺具体给付或条款。'], ['希望在哪里接受照护？目前有哪些照护资源或保障？'])
+        ? analysis('ltc', 'priority_discussion', ltcSupport, '存在照护担忧或偏好，可继续厘清目标与资源。', ['existing_ltc'], ['仅澄清担忧，不承诺具体给付或条款。'], careSupportQuestions)
         : analysis('ltc', 'insufficient_information', [], '缺少照护目标与现有安排资料。', ['care', 'existing_ltc'], ['资料不足，不推断照护需求。'], ['是否有长期照护担忧、偏好或现有安排？']);
 
   const employment = map.get('employment');
@@ -98,7 +106,7 @@ export function analyzeDemo(facts: ProfileField[]): AnalysisItem[] {
         ? analysis('disability_income', usable(employment) && usable(income) ? 'priority_discussion' : 'secondary_discussion', diSupport, '存在劳动收入依赖线索，可继续核实现有保障和收入中断承受能力。', ['existing_di', !usable(reserve) ? 'reserve' : ''].filter(Boolean), ['不根据职业、年龄或性别直接决定适合性。'], ['若收入中断，现有保障与储备可覆盖多久？'])
         : analysis('disability_income', 'insufficient_information', [], '缺少职业、收入依赖与现有保障资料。', ['employment', 'income', 'existing_di'], ['资料不足，不推断收入保障缺口。'], ['目前是否依赖劳动收入？是否已有伤残收入保障？']);
 
-  return [life, annuity, ltc, disability];
+  return [life, annuity, ltc, disability].map(item=>({...item,missingFields:item.missingFields.filter(key=>!usable(map.get(key)))}));
 }
 
 export function validateFacts(facts: ProfileField[]): void {
@@ -151,17 +159,15 @@ export function validateAnalyses(analyses: AnalysisItem[], facts: ProfileField[]
 
 const sourceKindLabel = { customer: '客户自述', advisor: '顾问更正', synthetic: '合成资料' } as const;
 
-function factSourceSummary(fact: ProfileField, messagesById: Map<string, Message>): string {
+function factSourceSummary(fact: ProfileField, messagesById: Map<string, Message>, labels: Map<string,string>): string {
   if (!fact.sourceMessageIds.length) {
-    return fact.confirmedBy ? `无消息来源 ID；人工确认 actor_id=${fact.confirmedBy}` : '无消息来源 ID';
+    return fact.confirmedBy ? '顾问人工确认（详见更正记录）' : '无消息来源';
   }
   return fact.sourceMessageIds.map((id) => {
     const message = messagesById.get(id)!;
-    const actor = message.actorId ? `；actor_id=${message.actorId}` : '';
     const recording=message.sourceKind==='advisor_reviewed_recording';
     const kind=recording?'顾问核对的录音客户发言':sourceKindLabel[messageSource(message)];
-    const segments=recording&&message.recordingSegmentIds?.length?`；录音片段=${message.recordingSegmentIds.join(',')}`:'';
-    return `${id} [${kind}${actor}${segments}]`;
+    return `${labels.get(id)} [${kind}]`;
   }).join('、');
 }
 
@@ -177,10 +183,28 @@ function cloneKnowledge(context: KnowledgeContext | undefined): KnowledgeContext
   };
 }
 
-function knowledgeLine(source: KnowledgeSource): string {
+function knowledgeLine(source: KnowledgeSource, label: string): string {
   const lines = source.startLine === source.endLine ? `第 ${source.startLine} 行` : `第 ${source.startLine}–${source.endLine} 行`;
   const status = source.reviewStatus === 'demo_unapproved' ? '合成示例／未批准' : '参考资料／待人工复核';
-  return `${source.id}｜${source.title}｜${source.path}｜版本 ${source.revision}｜${lines}｜${status}\n  摘录：${source.excerpt}\n  链接：${source.url || '本地资料，无公开链接'}`;
+  return `${label}：${source.title}（${lines}；${status}）。`;
+}
+
+function reportFactValue(fact: ProfileField): string {
+  if (typeof fact.value === 'number' && fact.currency === 'USD' && fact.period) {
+    const period = {month:'／月',year:'／年',once:'（当前余额／一次性金额）'}[fact.period];
+    const raw=String(fact.value);
+    const [whole,fraction]=raw.split('.');
+    const amount=/e/i.test(raw)?raw:whole.replace(/\B(?=(\d{3})+(?!\d))/g,',')+(fraction===undefined?'':`.${fraction}`);
+    if (period) return `${amount} 美元${period}`;
+  }
+  return formatFactValue(fact);
+}
+
+/** Saved intake context, separate from transcript facts; no contact details leave the server. */
+export function reportClientContext(client: Pick<Client,'birthday'|'maritalStatus'|'state'>, asOf: string): NonNullable<ReportContent['foundation']> {
+  const birth=new Date(client.birthday), date=new Date(asOf);
+  const years=date.getUTCFullYear()-birth.getUTCFullYear()-(date.toISOString().slice(5,10)<client.birthday.slice(5,10)?1:0);
+  return {ageYears:Number.isFinite(birth.getTime())&&years>=0&&years<=130?years:null,maritalStatus:client.maritalStatus,state:client.state};
 }
 
 export function buildReport(input: ReportInput): ReportContent {
@@ -191,26 +215,37 @@ export function buildReport(input: ReportInput): ReportContent {
   if (input.caseRecord.ownerAgentId !== input.owner.id) throw new Error('报告归属顾问与案例不一致');
 
   const messagesById = new Map(input.messages.map((message) => [message.id, message]));
-  const factLines = input.facts.map((fact) => {
-    const value = formatFactValue(fact);
+  const sourceIds = [...new Set([...input.facts.flatMap(fact=>fact.sourceMessageIds), ...input.analyses.flatMap(item=>item.evidenceRefs)])];
+  const sourceLabels = new Map(sourceIds.map((id,index)=>[id,`来源 ${index+1}`]));
+  const sourceReferences = sourceIds.filter(id=>messagesById.has(id)).map(id=>({...messagesById.get(id)!,label:sourceLabels.get(id)!,recordingSegmentIds:messagesById.get(id)!.recordingSegmentIds?.slice()}));
+  const fieldOrder=Object.keys(factLabels);
+  const factLines = [...input.facts].sort((a,b)=>fieldOrder.indexOf(a.key)-fieldOrder.indexOf(b.key)).map((fact) => {
+    const value = reportFactValue(fact);
     const status = factStatusLabels[fact.factStatus];
-    return `${factLabel(fact.key)}：${value}${value === status ? '' : ` [${status}]`}；来源：${factSourceSummary(fact, messagesById)}`;
+    return `${fact.key==='debt'?'债务（已披露部分）':factLabel(fact.key)}：${value}${value === status || fact.factStatus==='reported_unverified' ? '' : ` [${status}]`}；来源：${factSourceSummary(fact, messagesById, sourceLabels)}`;
   });
+  const foundation=reportClientContext(input.client,input.createdAt);
+  const foundationLine=`建档资料：${[foundation.ageYears===null?'':`${foundation.ageYears}岁`,foundation.maritalStatus,foundation.state].filter(Boolean).join('；')}（来源：顾问建档，非访谈转写）。`;
   const directionLines = input.analyses.map((entry) => `${categoryLabel[entry.category]} — ${demandStatusLabels[entry.status]}：${entry.reasonSummary}`);
-  const evidenceLines = input.analyses.map((entry) => {
-    const clientEvidence = entry.evidenceRefs.length ? entry.evidenceRefs.join('、') : '无客户事实引用；资料不足';
-    const referenceEvidence = entry.knowledgeRefs?.length ? `；资料参考：${entry.knowledgeRefs.join('、')}` : '；未引用资料库内容';
-    return `${categoryLabel[entry.category]}：客户事实证据：${clientEvidence}${referenceEvidence}`;
-  });
   const knowledge = cloneKnowledge(input.knowledge);
-  const knowledgeLines = knowledge?.sources.map(knowledgeLine) ?? [];
-  if (knowledgeLines.length) {
-    evidenceLines.push(input.provider.includes('mock')?'检索到的参考资料（本版本未调用 AI，不属于客户事实）：':'提供给 AI 的参考资料（不属于客户事实，仍需人工复核）：');
-    evidenceLines.push(...knowledgeLines);
-    if (input.provider.includes('mock')) evidenceLines.push('本版本由确定性演示规则生成，未调用 AI；以上资料只随报告快照保存，没有作为模型引用。');
+  const citedIds = new Set(input.analyses.flatMap(item=>item.knowledgeRefs??[]));
+  const citedSources = knowledge?.sources.filter(source=>citedIds.has(source.id))??[];
+  const knowledgeLabels = new Map(citedSources.map((source,index)=>[source.id,`资料 ${index+1}`]));
+  const evidenceLines = input.analyses.map((entry) => {
+    const clientEvidence = entry.evidenceRefs.length ? entry.evidenceRefs.map(ref=>ref.startsWith('fact:')?`${factLabel(ref.slice(5))}（顾问确认）`:sourceLabels.get(ref)).join('、') : '资料不足，未形成判断';
+    const referenceEvidence = entry.knowledgeRefs?.length ? `；参考：${entry.knowledgeRefs.map(ref=>knowledgeLabels.get(ref)).join('、')}` : '';
+    return `${categoryLabel[entry.category]}：${clientEvidence}${referenceEvidence}`;
+  });
+  if (citedSources.length) {
+    evidenceLines.push('引用参考资料（不属于客户事实）：', ...citedSources.map(source=>knowledgeLine(source,knowledgeLabels.get(source.id)!)));
+  }
+  if (knowledge?.sources.length) {
+    if (!citedSources.length) evidenceLines.push('检索资料未被本次分析引用，不作为本报告判断依据。');
+    evidenceLines.push('完整原文、资料版本与来源记录保存在本报告快照，可在系统内展开查阅。');
+    if (input.provider.includes('mock')) evidenceLines.push('本版本使用演示规则，未调用 AI。');
   }
   if(knowledge){
-    if(!knowledgeLines.length)evidenceLines.push('本报告没有可用的相关知识资料片段，未据此补充客户事实。');
+    if(!knowledge.sources.length)evidenceLines.push('本报告没有可用的相关知识资料片段，未据此补充客户事实。');
     evidenceLines.push(...knowledge.notices.map((notice) => `资料同步说明：${notice}`));
   }
   const limitationLines = input.analyses.flatMap((entry) => entry.constraints.map((constraint) => `${categoryLabel[entry.category]}：${constraint}`));
@@ -224,42 +259,49 @@ export function buildReport(input: ReportInput): ReportContent {
     `待补充：${factLabel(field)}（涉及：${[...categories].map((category) => categoryLabel[category]).join('、')}）`,
   ));
   if (input.incompleteTranscript) limitationLines.unshift('部分语音转写未完成或收尾超时；未确认的残留片段未作为事实，需顾问核对。');
-  const questionLines = [...new Set(input.analyses.flatMap((entry) => entry.nextQuestions))];
+  const brief = buildReportWritingBrief(input.facts,input.incompleteTranscript);
+  const allQuestions = prioritizeReportQuestions(input.analyses,input.facts,input.caseRecord.entry);
+  const questionLines = allQuestions.slice(0,3);
   const specialLines = limitationLines.filter((line) => /(专项|转移|转保|退保|冲突)/.test(line));
+  const correctionNotes=sourceReferences.filter(message=>messageSource(message)==='advisor'&&message.text.includes('；理由：')).map(message=>`${message.label}更正说明：${message.text.split('；理由：').slice(1).join('；理由：')}`);
   const reviewNote = input.reviewNote?.trim();
   const sections = [
-    { title: '一、客户画像', body: factLines.length ? bullets(factLines) : '尚未提取到有来源的访谈事实，请先核对访谈记录。' },
+    { title: '一、客户画像', body: `${foundationLine}\n${factLines.length ? '以下资料待业务核验；人工确认与更正另行标注。\n'+bullets(factLines) : '尚未提取到有来源的访谈事实，请先核对访谈记录。'}` },
     { title: '二、四类初步方向', body: bullets(directionLines) },
     { title: '三、证据与理由', body: bullets(evidenceLines) },
     { title: '四、反对因素／限制／缺失', body: bullets(limitationLines) },
-    { title: '五、下次问题', body: bullets(questionLines) },
+    { title: '五、下次问题', body: `${bullets(questionLines)}${allQuestions.length>3?'\n其余待核对事项见第四部分；完整候选问题保留在分析记录中。':''}` },
     {
       title: '六、给 Charles 的交接摘要与专项审核项',
       body: bullets([
+        ...(input.facts.find(fact=>fact.key==='goal'&&usable(fact)) ? [`客户目标：${input.facts.find(fact=>fact.key==='goal')!.value}`] : []),
         `请复核四类方向、证据及缺失项；当前复核状态：${reviewStatusLabel(input.reviewStatus)}。`,
         ...(reviewNote ? [`本版本人工复核意见：${reviewNote}`] : []),
+        ...correctionNotes,
         ...(specialLines.length ? specialLines : ['未识别到专项执行事项；所有业务判断仍需人工审核。']),
         '本报告不生成报价，不执行申请、退保、转保、rollover 或资金转移。',
       ]),
     },
   ];
   const headerLines = [
-    `客户显示名：${input.client.name}`,
-    `client_id：${input.client.id}`,
-    `case_id：${input.caseRecord.id}`,
-    `归属顾问：${input.owner.name} / ${input.owner.id}`,
-    `顾问联系邮箱（程序字段）：${input.owner.email}`,
-    `生成时间：${input.createdAt}`,
-    `report_version：${input.version}`,
-    `复核状态：${reviewStatusLabel(input.reviewStatus)}`,
-    `snapshot_id：${input.snapshotId}`,
-    `规则版本：${RULE_VERSION}`,
-    `分析来源：${input.provider}`,
+    `客户：${input.client.name}　｜　归属顾问：${input.owner.name}`,
+    `生成时间：${input.createdAt.replace('T',' ').replace(/\.\d{3}Z$/,' UTC')}　｜　版本 ${input.version}　｜　${reviewStatusLabel(input.reviewStatus)}`,
   ];
   const header = headerLines.join('\n');
   const disclaimer = '演示规则，待业务审核。本报告为内部初筛与人工交接材料，不是产品推荐、报价、核保、法律或税务意见。';
-  const fullText = ['Aeconn AI Agent 内部报告', header, disclaimer, ...sections.map((section) => `${section.title}\n${section.body}`)].join('\n\n');
+  const goal=input.facts.find(fact=>fact.key==='goal');
+  const goalText=goal&&usable(goal)?String(goal.value).replace(/\s+/g,' ').trim():'';
+  const focus=goalText?`本次已记录目标“${goalText.slice(0,120)}${goalText.length>120?'…':''}”（${factStatusLabels[goal!.factStatus]}，完整记录及来源见第一部分）。`
+    :goal?`客户目标目前标为${factStatusLabels[goal.factStatus]}，按原状态保留。`:'本次尚未保存明确的客户目标，不能从访谈入口推断。';
+  const summary=`${focus}${brief.conflictingFactKeys.length?`有 ${brief.conflictingFactKeys.length} 项事实前后不一致，须先核对。`:''}${input.incompleteTranscript?'转写尚不完整，请核对遗漏。':''}本报告供归属顾问与 Charles 复核，优先核对事项见第五部分。`;
+  const editorial=reviewReportDraft({caseId:input.caseRecord.id,snapshotId:input.snapshotId,sections,facts:input.facts,analyses:input.analyses,sourceReferences,reviewStatus:input.reviewStatus},brief);
+  const fullText = ['Aeconn AI Agent 内部报告', header, disclaimer, summary, ...sections.map((section) => `${section.title}\n${section.body}`)].join('\n\n');
   const content = {
+    formatVersion: REPORT_FORMAT_VERSION,
+    editorial,
+    owner: {id:input.owner.id,name:input.owner.name,email:input.owner.email},
+    sourceReferences,
+    foundation,
     caseId: input.caseRecord.id,
     clientId: input.client.id,
     version: input.version,
@@ -269,7 +311,7 @@ export function buildReport(input: ReportInput): ReportContent {
     ruleVersion: RULE_VERSION,
     provider: input.provider,
     title: `Aeconn 内部初筛报告 — ${input.client.name}`,
-    summary: `${input.client.name} 的四类需求初筛已生成，须由归属顾问与 Charles 人工复核。`,
+    summary,
     sections,
     fullText,
     analyses: input.analyses.map((entry) => ({ ...entry, evidenceRefs: [...entry.evidenceRefs], knowledgeRefs: entry.knowledgeRefs ? [...entry.knowledgeRefs] : undefined, missingFields: [...entry.missingFields], constraints: [...entry.constraints], nextQuestions: [...entry.nextQuestions] })),
@@ -294,11 +336,11 @@ export async function renderPdf(report: ReportContent): Promise<Buffer> {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.registerFont('NotoSC', FONT_PATH).font('NotoSC');
 
-    doc.rect(0, 0, doc.page.width, 16).fill('#0F766E');
-    doc.fillColor('#12343B').fontSize(21).text(report.title);
+    doc.rect(0, 0, doc.page.width, 10).fill('#253D38');
+    doc.fillColor('#9B7942').fontSize(9).text('AECONN  /  PRIVATE ADVISORY');
+    doc.moveDown(0.6);
+    doc.fillColor('#253D38').fontSize(20).text(report.title);
     doc.moveDown(0.35);
-    doc.fillColor('#4B6570').fontSize(9.5).text(`Case ${report.caseId}  ·  Client ${report.clientId}  ·  Version ${report.version}`);
-    doc.moveDown(0.55);
     const boxY = doc.y;
     doc.roundedRect(54, boxY, doc.page.width - 108, 58, 8).fill('#E8F5F2');
     doc.fillColor('#134E4A').fontSize(10).text('演示规则，待业务审核。本材料仅供归属顾问与 Charles 内部复核，不构成产品推荐、报价、核保、法律或税务意见。', 66, boxY + 11, { width: doc.page.width - 132, lineGap: 3 });
@@ -318,10 +360,15 @@ export async function renderPdf(report: ReportContent): Promise<Buffer> {
     }
     doc.moveDown(0.7);
 
+    if(report.editorial){
+      doc.fillColor('#20383E').fontSize(10.2).text(report.summary,{lineGap:3,paragraphGap:3});
+      doc.moveDown(0.8);
+    }
+
     for (const section of report.sections) {
       const width=doc.page.width-108;
       const headingHeight=doc.fontSize(14).heightOfString(section.title,{width,lineGap:2});
-      const bodyHeight=doc.fontSize(10.2).heightOfString(section.body,{width,lineGap:5,paragraphGap:4});
+      const bodyHeight=doc.fontSize(10.2).heightOfString(section.body,{width,lineGap:3,paragraphGap:3});
       const sectionHeight=headingHeight+bodyHeight+30;
       const usableHeight=doc.page.height-doc.page.margins.top-doc.page.margins.bottom;
       if (doc.y > doc.page.height - 180 || sectionHeight<=usableHeight&&doc.y+sectionHeight>doc.page.height-doc.page.margins.bottom) doc.addPage();
@@ -329,7 +376,7 @@ export async function renderPdf(report: ReportContent): Promise<Buffer> {
       const lineY = doc.y + 3;
       doc.moveTo(54, lineY).lineTo(doc.page.width - 54, lineY).lineWidth(0.7).strokeColor('#B7DCD6').stroke();
       doc.moveDown(0.65);
-      doc.fillColor('#20383E').fontSize(10.2).text(section.body,54,doc.y,{width,lineGap:5,paragraphGap:4});
+      doc.fillColor('#20383E').fontSize(10.2).text(section.body,54,doc.y,{width,lineGap:3,paragraphGap:3});
       doc.moveDown(0.85);
     }
 

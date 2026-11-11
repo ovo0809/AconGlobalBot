@@ -125,6 +125,26 @@ async function createCase(session: BrowserSession, suffix: string): Promise<stri
   return String(result.data.caseId);
 }
 
+test('one multi-topic mock answer is reused by the next turn without inventing stored facts',async()=>{
+  const advisor=new BrowserSession();
+  await advisor.login('advisor1@aeconn.example');
+  const caseId=await createCase(advisor,'paradox-reuse');
+  await advisor.action({action:'enterClient',caseId});
+  await advisor.action({action:'chooseEntry',caseId,entry:'ltc'});
+  const text='这次想安排长期照护，希望明年开始，最好在家里接受照护。我已经有长期护理保险，预算是每月500美元。';
+  const result=await advisor.action({action:'message',caseId,text,eventId:'paradox-reuse-answer'});
+  assert.equal(result.response.status,200,JSON.stringify(result.data));
+  const {db}=await import('../lib/db');
+  const conversation=db().prepare('SELECT doc FROM messages WHERE case_id=? ORDER BY rowid').all(caseId).map(row=>JSON.parse(String(row.doc)) as Message);
+  const latest=conversation.filter(row=>row.role==='assistant').at(-1);
+  assert.doesNotMatch(latest?.text??'',/[？?]/,'do not repeat care, coverage, budget or timing already expressed in the same answer');
+  assert.match(latest?.text??'',/结束|交还|顾问/);
+  const stored=db().prepare('SELECT doc FROM profile_fields WHERE case_id=?').all(caseId).map(row=>JSON.parse(String(row.doc)) as {key:string;sourceMessageIds:string[]});
+  assert.deepEqual(stored.map(row=>row.key),['goal'],'read-only conversation memory must not silently promote other fields into persisted facts');
+  assert(stored.every(row=>row.sourceMessageIds.every(id=>conversation.some(message=>message.id===id&&message.role==='user'&&message.final))));
+  assert.equal(getUsageSummary('org-demo',caseId,true).records.length,0,'mock interview has no paid usage reservations');
+});
+
 test('focused mock interview handles progress and goodbye without facts, defers unclear budget, and offers an early finish', async () => {
   const advisor = new BrowserSession();
   await advisor.login('advisor1@aeconn.example');
@@ -155,6 +175,54 @@ test('focused mock interview handles progress and goodbye without facts, defers 
   const controls = new Set(messages.filter(message => ['focused-progress', 'focused-goodbye'].includes(message.eventId)).map(message => message.id));
   assert(!fields.some(field => field.sourceMessageIds.some(ref => controls.has(ref))));
   await advisor.action({ action: 'end', caseId });
+});
+
+test('local interview help is saved without provider calls, usage reservations, facts, or automatic handback', async (t) => {
+  const keys = ['LLM_PROVIDER', 'OPENAI_API_KEY', 'OPENAI_MODEL'];
+  const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const key of keys) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+  });
+  process.env.LLM_PROVIDER = 'openai';
+  process.env.OPENAI_API_KEY = 'synthetic-key';
+  process.env.OPENAI_MODEL = 'gpt-6-luna';
+  let providerCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    providerCalls += 1;
+    throw new Error('local help must not call the provider');
+  });
+
+  const advisor = new BrowserSession();
+  await advisor.login('advisor1@aeconn.example');
+  const caseId = await createCase(advisor, 'local-help');
+  await advisor.action({ action: 'enterClient', caseId });
+  await advisor.action({ action: 'chooseEntry', caseId, entry: 'life' });
+  for (const [eventId, text] of [
+    ['help-why', '为什么问这个？'],
+    ['help-advisor', '我想找顾问'],
+  ]) {
+    const response = await advisor.action({ action: 'message', caseId, text, eventId });
+    assert.equal(response.response.status, 200, JSON.stringify(response.data));
+  }
+  const repeated = await advisor.action({ action: 'message', caseId, text: '为什么问这个？', eventId: 'help-why' });
+  assert.equal(repeated.response.status, 200, JSON.stringify(repeated.data));
+
+  const state = (await advisor.bootstrap()).data as Bootstrap;
+  assert.equal(state.mode, 'client', 'help must not end the interview automatically');
+  const helpReplies = state.messages.filter(message => ['help-why:reply', 'help-advisor:reply'].includes(message.eventId));
+  assert.equal(helpReplies.length, 2);
+  assert.doesNotMatch(helpReplies[0].text, /[？?]/);
+  assert.match(helpReplies[1].text, /点击.*结束对话/);
+  const { db } = await import('../lib/db');
+  const storedMessages = db().prepare('SELECT doc FROM messages WHERE case_id=? ORDER BY rowid').all(caseId).map(row => JSON.parse(String(row.doc)) as Message);
+  assert.equal(storedMessages.filter(message => message.eventId === 'help-why').length, 1, 'duplicate customer event is idempotent');
+  assert.equal(storedMessages.filter(message => message.eventId === 'help-why:reply').length, 1, 'duplicate local-control reply is idempotent');
+  assert.equal(providerCalls, 0);
+  assert.equal((db().prepare('SELECT COUNT(*) count FROM profile_fields WHERE case_id=?').get(caseId) as {count:number}).count, 0, 'isolated database contains no facts from local controls');
+  assert.equal(getUsageSummary('org-demo', caseId, true).records.length, 0);
 });
 
 test('anonymous sessions, login integrity, CSRF/origin and role data boundaries', async () => {
@@ -454,7 +522,7 @@ test('text interview preserves unknown/declined and validates numeric currency/p
   assert.equal(byKey.get('income')?.currency, 'USD');
   assert.equal(byKey.get('income')?.period, 'month');
   assert.equal(byKey.get('income')?.sourceMessageIds.length, 1);
-  assert.ok(data.messages.some((message) => message.text.includes('关于收入') && message.text.includes('先跳过')));
+  assert.ok(data.messages.some((message) => message.text.includes('收入') && message.text.includes('先跳过')));
 });
 
 test('report PDF, fact versions, review queue and dry-run notification snapshots are immutable', async () => {
@@ -501,7 +569,7 @@ test('report PDF, fact versions, review queue and dry-run notification snapshots
   assert.ok(v3);
   assert.equal(v3.reviewStatus, 'reviewed');
   assert.match(v3.fullText, /本版本人工复核意见：approved：已核对合成案例的引用与缺失项/);
-  assert.ok(v3.headerLines?.some((line) => line === '复核状态：reviewed'));
+  assert.ok(v3.headerLines?.some((line) => line.includes('已复核')));
   assert.equal(reviewedData.reviews.at(-1)?.decision, 'approved');
   const approve = await advisor.action({ action: 'approveSend', caseId: 'case-1', version: 3, snapshotId: v3.snapshotId, recipientFingerprint: v3.recipientFingerprint });
   assert.equal(approve.response.status, 200, JSON.stringify(approve.data));
@@ -511,7 +579,8 @@ test('report PDF, fact versions, review queue and dry-run notification snapshots
   for (const job of afterApproval.notifications) {
     assert.equal(job.status, 'dry_run');
     assert.match(job.body, /Aeconn AI Agent 内部报告/);
-    assert.match(job.body, /case_id：case-1/);
+    assert.equal(job.caseId, 'case-1');
+    assert.match(job.body, /版本 3/);
     assert.match(job.attachmentUrl, /version=3/);
   }
 
@@ -546,8 +615,59 @@ test('reviewer can correct facts only on an assigned case and the subsequent rev
   const reviewedReport = final.reports.find((report) => report.version === 3);
   assert.ok(reviewedReport);
   assert.match(reviewedReport.fullText, /本版本人工复核意见：amended：已确认照护偏好；其余缺失项保留待顾问追问/);
-  assert.ok(reviewedReport.headerLines?.some((line) => line === '复核状态：reviewed'));
+  assert.ok(reviewedReport.headerLines?.some((line) => line.includes('已复核')));
   assert.equal(final.reviews.at(-1)?.reason, '已确认照护偏好；其余缺失项保留待顾问追问');
+});
+
+test('review report, record and audit commit atomically and identical retries are idempotent',async()=>{
+  await drainReportJobs();
+  const advisor=new BrowserSession();await advisor.login('advisor1@aeconn.example');
+  const caseId=await createCase(advisor,'复核事务');
+  await advisor.action({action:'enterClient',caseId});await advisor.action({action:'chooseEntry',caseId,entry:'life'});
+  await advisor.action({action:'message',caseId,text:'我想为家人准备保障',eventId:'review-atomic-goal'});
+  await advisor.action({action:'end',caseId});await drainReportJobs();
+  assert.equal((await advisor.action({action:'submitReview',caseId})).response.status,200);
+
+  const before=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  const beforeVersion=before.activeCase!.reportVersion,beforeReports=before.reports.length;
+  assert.equal(before.activeCase?.status,'pending_review');
+
+  const {db}=await import('../lib/db');
+  db().exec(`CREATE TEMP TRIGGER fail_review_atomic BEFORE INSERT ON reviews WHEN NEW.case_id='${caseId}' BEGIN SELECT RAISE(ABORT,'synthetic review rollback'); END`);
+  const charles=new BrowserSession();await charles.login('charles@aeconn.example');
+  const input={action:'review',caseId,decision:'approved',reason:'合成复核事务检查'};
+  try{
+    const failed=await charles.action(input);assert.equal(failed.response.status,500);
+  }finally{db().exec('DROP TRIGGER IF EXISTS fail_review_atomic');}
+
+  const rolledBack=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(rolledBack.activeCase?.reportVersion,beforeVersion);
+  assert.equal(rolledBack.activeCase?.status,'pending_review');
+  assert.equal(rolledBack.reports.length,beforeReports);
+  assert.equal(rolledBack.reviews.length,0);
+  assert.equal((db().prepare("SELECT COUNT(*) count FROM audit_events WHERE case_id=? AND action IN ('report.generated','review.recorded') AND json_extract(metadata,'$.version')>?").get(caseId,beforeVersion) as {count:number}).count,0);
+
+  db().exec(`CREATE TEMP TRIGGER fail_review_audit BEFORE INSERT ON audit_events WHEN NEW.case_id='${caseId}' AND NEW.action='review.recorded' BEGIN SELECT RAISE(ABORT,'synthetic review audit rollback'); END`);
+  try{
+    const failed=await charles.action({...input,decision:'quote_handoff',reason:'合成报价交接事务检查'});assert.equal(failed.response.status,500);
+  }finally{db().exec('DROP TRIGGER IF EXISTS fail_review_audit');}
+  const auditRolledBack=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(auditRolledBack.activeCase?.reportVersion,beforeVersion);
+  assert.equal(auditRolledBack.activeCase?.status,'pending_review');
+  assert.equal(auditRolledBack.reports.length,beforeReports);
+  assert.equal(auditRolledBack.reviews.length,0);
+
+  const first=await charles.action(input);assert.equal(first.response.status,200,JSON.stringify(first.data));
+  const stored=db().prepare('SELECT id,doc FROM reviews WHERE case_id=?').get(caseId) as {id:string;doc:string};
+  const legacy={...JSON.parse(stored.doc),id:`legacy-${stored.id}`};
+  db().prepare('UPDATE reviews SET id=?,doc=? WHERE id=?').run(legacy.id,JSON.stringify(legacy),stored.id);
+  const repeated=await charles.action(input);assert.equal(repeated.response.status,200,JSON.stringify(repeated.data));
+  assert.equal(repeated.data.version,first.data.version);
+  const final=(await advisor.bootstrap(caseId)).data as Bootstrap;
+  assert.equal(final.reviews.length,1);
+  assert.equal(final.reviews[0].reportVersion,first.data.version);
+  assert.equal((db().prepare("SELECT COUNT(*) count FROM audit_events WHERE case_id=? AND action='review.recorded' AND json_extract(metadata,'$.version')=?").get(caseId,Number(first.data.version)) as {count:number}).count,1);
+  assert.equal((db().prepare("SELECT actor_id FROM audit_events WHERE case_id=? AND action='report.generated' AND json_extract(metadata,'$.version')=?").get(caseId,Number(first.data.version)) as {actor_id:string}).actor_id,'charles');
 });
 
 test('recipient changes invalidate previews, and pending policy blocks unreviewed live send', async () => {

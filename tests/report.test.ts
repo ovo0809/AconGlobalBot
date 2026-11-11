@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import type { Client, Message, ProfileField, ReportInput, User } from '../lib/domain';
-import { analyzeDemo, buildReport, renderPdf, validateAnalyses, validateFacts } from '../lib/report';
+import { analyzeDemo, buildReport, renderPdf, validateAnalyses, validateFacts, reportClientContext } from '../lib/report';
 import { formatFactValue } from '../lib/report-labels';
 import { scenarios } from '../lib/scenarios';
 import type { KnowledgeContext } from '../lib/knowledge';
@@ -52,13 +52,97 @@ function reportInput(facts: ProfileField[]): ReportInput {
 const knowledgeRevision='0123456789abcdef0123456789abcdef01234567';
 function knowledgeContext():KnowledgeContext{return {revision:knowledgeRevision,status:'ready',notices:['固定到生成时版本。'],sources:[{id:'knowledge:retirement:1',title:'退休访谈参考',path:'knowledge/retirement.md',url:`https://github.com/ovo0809/AconGlobalBot/blob/${knowledgeRevision}/knowledge/retirement.md`,revision:knowledgeRevision,startLine:8,endLine:10,excerpt:'先确认客户目标、时间与流动性约束。',reviewStatus:'reference_only'}]};}
 
+test('coauthoring report saves a local reader check without approving or altering facts', () => {
+  const input=reportInput([
+    {key:'goal',value:'希望明年安排在家照护',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:['editorial-goal'],confirmedBy:null,confirmedAt:null},
+    {key:'budget',value:null,currency:null,period:null,factStatus:'declined',sourceMessageIds:['editorial-budget'],confirmedBy:null,confirmedAt:null},
+  ]);
+  input.incompleteTranscript=true;
+  const original=JSON.stringify(input);
+  const report=buildReport(input);
+  assert.ok(report.editorial,'new report snapshots must save their local reader check');
+  assert.equal(report.editorial.method,'local_rules');
+  assert.equal(report.editorial.version,'doc-coauthoring/1');
+  assert.equal(report.editorial.brief.incompleteTranscript,true);
+  assert.deepEqual(report.editorial.brief.declinedFactKeys,['budget']);
+  assert.equal(report.editorial.checks.length,5);
+  assert.equal(report.reviewStatus,'draft');
+  assert.match(report.summary,/希望明年安排在家照护/);
+  assert.ok(report.fullText.includes(report.summary),'screen summary must also be saved in PDF/email body');
+  assert.equal(JSON.stringify(input),original);
+});
+
+test('coauthoring prioritizes the current topic while retaining all original analysis candidates', () => {
+  const input=reportInput([]);
+  input.caseRecord.entry='ltc';
+  input.analyses.forEach(item=>{item.nextQuestions=[`${item.category==='ltc'?'请核对照护安排':item.category+' 合成问题'}？`];});
+  const original=JSON.stringify(input.analyses);
+  const report=buildReport(input);
+  const shown=report.sections[4].body.split('\n').filter(line=>line.startsWith('• '));
+  assert.equal(shown.length,3);
+  assert.match(shown[0],/请核对照护安排/);
+  assert.equal(JSON.stringify(report.analyses),original);
+  assert.equal(JSON.stringify(input.analyses),original);
+});
+
+test('reader feedback removes known-as-missing contradictions and repeated care questions in demo drafting', () => {
+  const fields:ProfileField[]=[
+    {key:'goal',value:'希望明年准备长期照护',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:['reader-goal'],confirmedBy:null,confirmedAt:null},
+    {key:'horizon',value:'明年',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:['reader-time'],confirmedBy:null,confirmedAt:null},
+    {key:'care',value:'希望在家照护',currency:null,period:null,factStatus:'reported_unverified',sourceMessageIds:['reader-care'],confirmedBy:null,confirmedAt:null},
+    {key:'existing_life',value:null,currency:null,period:null,factStatus:'unknown',sourceMessageIds:['reader-life'],confirmedBy:null,confirmedAt:null},
+    {key:'existing_ltc',value:null,currency:null,period:null,factStatus:'unknown',sourceMessageIds:['reader-ltc'],confirmedBy:null,confirmedAt:null},
+  ];
+  const original=JSON.stringify(fields);
+  const analyses=analyzeDemo(fields);
+  assert.ok(analyses.every(item=>!item.missingFields.includes('goal')&&!item.missingFields.includes('horizon')));
+  assert.doesNotMatch(analyses.find(item=>item.category==='ltc')!.nextQuestions.join(' '),/希望在哪里接受照护/);
+  assert.match(analyses.find(item=>item.category==='ltc')!.nextQuestions.join(' '),/保单|核对/);
+  assert.doesNotMatch(analyses.find(item=>item.category==='life')!.nextQuestions.join(' '),/目前已有何种人寿保障/);
+  assert.equal(JSON.stringify(fields),original);
+  const declined=fields.map(fact=>fact.key.startsWith('existing_')?{...fact,factStatus:'declined' as const}:fact);
+  assert.equal(analyzeDemo(declined).find(item=>item.category==='ltc')!.nextQuestions.length,0,'a declined existing-policy answer does not trigger another request');
+});
+
+test('company report separates readable business content from full audit provenance', () => {
+  const input = reportInput([{key:'income',value:120000,currency:'USD',period:'year',factStatus:'reported_unverified',sourceMessageIds:['internal-message-uuid'],confirmedBy:null,confirmedAt:null}]);
+  input.knowledge = knowledgeContext();
+  input.knowledge.sources[0].excerpt = '# 内部资料\n| 表头 |\n<br>不应直接印到正文';
+  input.analyses.forEach(item => { item.nextQuestions = ['请核对现有保单。','请补充退休账户资料。','请核对照护安排。','请重复所有收入信息。']; });
+  const report = buildReport(input);
+  assert.doesNotMatch(report.fullText, /internal-message-uuid|snapshot-immutable-1|client_id|case_id|<br>|\| 表头 \||knowledge\/retirement\.md/);
+  assert.match(report.fullText, /120,000 美元／年/);
+  assert.match(report.fullText, /来源 1/);
+  assert.equal(report.facts[0].sourceMessageIds[0], 'internal-message-uuid');
+  assert.equal(report.knowledge?.sources[0].excerpt, input.knowledge.sources[0].excerpt);
+  assert.equal(report.sections[4].body.split('\n').filter(line=>line.startsWith('• ')).length, 3);
+  assert.equal(report.analyses[0].nextQuestions.length, 4);
+});
+
+test('readable report never rounds a nonzero saved amount down to zero',()=>{
+  const report=buildReport(reportInput([{key:'income',value:1e-21,currency:'USD',period:'month',factStatus:'reported_unverified',sourceMessageIds:['m1'],confirmedBy:null,confirmedAt:null}]));
+  assert.match(report.sections[0].body,/1e-21 美元／月/);
+  assert.doesNotMatch(report.sections[0].body,/收入：0 /);
+});
+
+test('saved intake age is dated correctly and stays separate from sourced transcript facts',()=>{
+  const client={birthday:'1986-06-18',maritalStatus:'已婚',state:'CA'};
+  assert.equal(reportClientContext(client,'2026-06-17T12:00:00Z').ageYears,39);
+  assert.equal(reportClientContext(client,'2026-06-18T12:00:00Z').ageYears,40);
+  const report=buildReport(reportInput([]));
+  assert.match(report.sections[0].body,/建档资料：41岁；已婚；CA/);
+  assert.match(report.sections[0].body,/来源：顾问建档，非访谈转写/);
+  assert.deepEqual(report.facts,[]);
+});
+
 test('report validates knowledge citations separately and freezes their exact source snapshot',()=>{
   const input=reportInput([]);input.knowledge=knowledgeContext();input.analyses=analyzeDemo([]).map((item,index)=>({...item,knowledgeRefs:index===0?['knowledge:retirement:1']:[]}));
   const report=buildReport(input);
   assert.equal(report.sections.length,6);
-  assert.match(report.sections[2].body,/检索到的参考资料/);
+  assert.match(report.sections[2].body,/引用参考资料/);
   assert.match(report.sections[2].body,/不属于客户事实/);
-  assert.match(report.sections[2].body,/knowledge\/retirement\.md/);
+  assert.match(report.sections[2].body,/资料 1：退休访谈参考/);
+  assert.equal(report.knowledge?.sources[0].path,'knowledge/retirement.md');
   assert.match(report.sections[2].body,/未调用 AI/);
   assert.deepEqual(report.facts,[]);
   input.knowledge.sources[0].excerpt='修改后的资料';
@@ -97,8 +181,9 @@ test('recording facts retain advisor review and segment provenance in the report
   input.messages[0]={...input.messages[0],source:'customer',sourceKind:'advisor_reviewed_recording',actorId:'advisor-1',recordingSegmentIds:['segment-1','segment-2']};
   const report=buildReport(input);
   assert.match(report.fullText,/顾问核对的录音客户发言/);
-  assert.match(report.fullText,/actor_id=advisor-1/);
-  assert.match(report.fullText,/录音片段=segment-1,segment-2/);
+  assert.equal(report.sourceReferences?.[0].actorId,'advisor-1');
+  assert.deepEqual(report.sourceReferences?.[0].recordingSegmentIds,['segment-1','segment-2']);
+  assert.doesNotMatch(report.fullText,/actor_id=|segment-1/);
   assert.equal(report.facts[0].factStatus,'reported_unverified');
 });
 
@@ -167,15 +252,15 @@ test('report has immutable identifiers, programmatic contact data and six requir
   assert.ok(scenario);
   const report = buildReport(reportInput(scenario.facts));
   assert.equal(report.sections.length, 6);
-  assert.match(report.fullText, /client_id：client-1/);
-  assert.match(report.fullText, /case_id：case-1/);
-  assert.match(report.fullText, /顾问联系邮箱（程序字段）：advisor1@aeconn\.example/);
-  assert.match(report.fullText, /demo_unapproved/);
+  assert.equal(report.clientId,'client-1');
+  assert.equal(report.caseId,'case-1');
+  assert.equal(report.owner?.email,'advisor1@aeconn.example');
+  assert.equal(report.ruleVersion,'demo_unapproved/1.0');
   assert.match(report.fullText, /演示规则，待业务审核/);
   assert.match(report.fullText, /六、给 Charles 的交接摘要与专项审核项/);
   assert.match(report.fullText, /复核状态：草稿/);
   assert.match(report.fullText, /本版本人工复核意见：approved：已核对合成案例引用与缺失项/);
-  assert.ok(report.headerLines?.some((line) => line.includes('归属顾问：合成顾问 林 / advisor-1')));
+  assert.ok(report.headerLines?.some((line) => line.includes('归属顾问：合成顾问 林')));
   assert.match(report.sections[0].body, /来源：[^\n]+ \[合成资料\]/);
   assert.doesNotMatch(report.sections[0].body, /\b(?:goal|income|dependents|existing_life)：/);
 });
@@ -189,7 +274,7 @@ test('report groups repeated missing fields by Chinese label without dropping ca
     { category: 'disability_income', status: 'insufficient_information', evidenceRefs: [], reasonSummary: '资料不足。', missingFields: ['income'], constraints: [], nextQuestions: [] },
   ];
   const report = buildReport(input);
-  assert.equal(report.sections[0].body, '尚未提取到有来源的访谈事实，请先核对访谈记录。');
+  assert.match(report.sections[0].body, /尚未提取到有来源的访谈事实，请先核对访谈记录。/);
   assert.equal(report.sections[3].body.match(/待补充：主要目标/g)?.length, 1);
   assert.match(report.sections[3].body, /待补充：主要目标（涉及：人寿、年金／退休收入）/);
   assert.match(report.sections[3].body, /人寿：人寿限制。/);
@@ -210,9 +295,11 @@ test('report labels customer, advisor and synthetic fact sources without guessin
   ];
   input.analyses = analyzeDemo(facts);
   const report = buildReport(input);
-  assert.match(report.sections[0].body, /customer-source \[客户自述\]/);
-  assert.match(report.sections[0].body, /advisor-source \[顾问更正；actor_id=advisor-9\]/);
-  assert.match(report.sections[0].body, /synthetic-source \[合成资料\]/);
+  assert.match(report.sections[0].body, /来源 1 \[客户自述\]/);
+  assert.match(report.sections[0].body, /来源 2 \[顾问更正\]/);
+  assert.match(report.sections[0].body, /来源 3 \[合成资料\]/);
+  assert.equal(report.sourceReferences?.[1].id,'advisor-source');
+  assert.equal(report.sourceReferences?.[1].actorId,'advisor-9');
   assert.doesNotMatch(report.sections[0].body, /林顾问|Charles/);
 });
 
@@ -243,7 +330,8 @@ test('renders saved knowledge provenance into the report PDF',async()=>{
   const input=reportInput([]);input.knowledge=knowledgeContext();input.analyses=analyzeDemo([]).map((item,index)=>({...item,knowledgeRefs:index===0?['knowledge:retirement:1']:[]}));
   const report=buildReport(input);
   assert.match(report.fullText,/退休访谈参考/);
-  assert.match(report.fullText,/0123456789abcdef0123456789abcdef01234567/);
+  assert.doesNotMatch(report.fullText,/0123456789abcdef0123456789abcdef01234567/);
+  assert.equal(report.knowledge?.sources[0].revision,knowledgeRevision);
   assert.match(report.fullText,/第 8–10 行/);
   const plainPdf=await renderPdf(buildReport(reportInput([])));
   const knowledgePdf=await renderPdf(report);

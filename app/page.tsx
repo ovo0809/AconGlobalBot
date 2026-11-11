@@ -16,11 +16,11 @@ type Toast = { kind: 'success' | 'error' | 'info'; text: string } | null;
 
 function responseStatusLabel(status:Message['responseStatus']) { return status==='cancelled'?'回复已中断':status==='incomplete'||status==='failed'?'回复未完整生成':''; }
 
-const categories: { id: Category; title: string; caption: string; icon: string }[] = [
-  { id: 'life', title: '人寿', caption: '家庭责任与已有保障', icon: '◇' },
-  { id: 'disability_income', title: '伤残保险', caption: '收入中断与工作保障', icon: '◒' },
-  { id: 'annuity', title: '年金', caption: '退休目标与资金安排', icon: '◎' },
-  { id: 'ltc', title: '长期护理', caption: '照护偏好与家庭支持', icon: '⌁' },
+const categories: { id: Category; title: string; caption: string }[] = [
+  { id: 'life', title: '人寿', caption: '家庭责任与已有保障' },
+  { id: 'disability_income', title: '伤残保险', caption: '收入中断与工作保障' },
+  { id: 'annuity', title: '年金', caption: '退休目标与资金安排' },
+  { id: 'ltc', title: '长期护理', caption: '照护偏好与家庭支持' },
 ];
 
 const roleNames = { advisor: '顾问', reviewer: 'Charles 审核人', admin: '管理员' } as const;
@@ -39,7 +39,7 @@ function inReviewScope(record:Case, scope:ReviewScope) {
   return Boolean(record.assignedReviewerId) && (scope==='all' || record.status==='pending_review');
 }
 
-function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'trash' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
+function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | 'review' | 'settings' | 'trash' | 'exit' | 'mic' | 'mute' | 'send' | 'pause' | 'play' | 'speaker' | 'close' | 'check' | 'alert' | 'download' | 'retry' }) {
   const paths: Record<string, React.ReactNode> = {
     trash: <><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></>,
     search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>, plus: <><path d="M12 5v14M5 12h14"/></>,
@@ -48,7 +48,7 @@ function Icon({ name }: { name: 'search' | 'plus' | 'user' | 'chat' | 'file' | '
     settings: <><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.7-1L14.5 3h-5l-.4 3.1a8 8 0 0 0-1.7 1L5 6.1 3 9.5 5 11a7 7 0 0 0 0 2l-2 1.5L5 18l2.4-1a8 8 0 0 0 1.7 1l.4 3h5l.4-3a8 8 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></>,
     exit: <><path d="M10 17l5-5-5-5M15 12H3M21 3v18h-7"/></>, mic: <><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></>,
     mute: <><path d="m4 4 16 16M9.5 5.5V5a2.5 2.5 0 0 1 5 0v6M7 11a5 5 0 0 0 8 4M19 11a7 7 0 0 1-.8 3.2M12 18v4"/></>, send: <path d="m3 3 18 9-18 9 4-9-4-9Zm4 9h14"/>,
-    pause: <><path d="M9 5v14M15 5v14"/></>, speaker: <><path d="M11 5 6 9H3v6h3l5 4zM15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></>, close: <path d="m6 6 12 12M18 6 6 18"/>,
+    play: <path d="m8 4 12 8-12 8V4Z"/>, pause: <><path d="M9 5v14M15 5v14"/></>, speaker: <><path d="M11 5 6 9H3v6h3l5 4zM15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"/></>, close: <path d="m6 6 12 12M18 6 6 18"/>,
     check: <path d="m5 12 4 4L19 6"/>, alert: <><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/></>, download: <><path d="M12 3v12M7 11l5 5 5-5M4 21h16"/></>, retry: <><path d="M20 6v6h-6M4 18v-6h6"/><path d="M18 9a7 7 0 0 0-12-2L4 12M6 15a7 7 0 0 0 12 2l2-5"/></>,
   };
   return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>;
@@ -107,6 +107,15 @@ export default function Home() {
 
   const verifySession=useCallback(()=>{setLoading(true);void refresh(undefined,true).catch(()=>undefined);},[refresh]);
 
+  const discardWorkspace=useCallback(()=>{
+    // A confirmed access-boundary change must discard private DOM immediately,
+    // even while the replacement bootstrap is delayed or fails.
+    ++refreshVersion.current;
+    sessionCheckPending.current=true;
+    selectedCaseIdRef.current=undefined;
+    setData(null);setLoading(true);
+  },[]);
+
   useEffect(() => {
     refresh(undefined,true).catch((error: Error) => setToast({ kind: 'error', text: error.message }));
   }, [refresh]);
@@ -124,9 +133,12 @@ export default function Home() {
     const channel = new BroadcastChannel('aeconn-session-mode');
     sessionChannel.current=channel;
     channel.postMessage({ mode: sessionMode, userId: sessionUserId ?? null, at: Date.now() });
-    channel.onmessage = verifySession;
+    channel.onmessage = event=>{
+      if(sessionMode==='advisor'&&(event.data?.type==='session-boundary'||event.data?.mode==='client'||event.data?.mode==='anonymous'))discardWorkspace();
+      verifySession();
+    };
     return () => { sessionChannel.current=null;channel.close(); };
-  }, [sessionMode, sessionUserId, verifySession]);
+  }, [sessionMode, sessionUserId, verifySession, discardWorkspace]);
 
   useEffect(() => {
     if (!toast) return;
@@ -144,6 +156,12 @@ export default function Home() {
       });
       const result = await response.json() as ActionResult;
       if (!response.ok) throw new Error(result.error || '操作未完成，请重试。');
+      if(body.action==='enterClient'){
+        sessionChannel.current?.postMessage({type:'session-boundary'});
+        discardWorkspace();
+        await refresh(undefined,true);
+        return result;
+      }
       if(['deleteCase','restoreCase','purgeCase'].includes(body.action))sessionChannel.current?.postMessage({type:'cases-changed'});
       if (body.action === 'login' || body.action === 'logout') selectedCaseIdRef.current = undefined;
       if (!options?.noRefresh) await refresh(options?.caseId ?? result.caseId);
@@ -153,7 +171,7 @@ export default function Home() {
       setToast({ kind: 'error', text });
       throw error;
     } finally { setBusy(''); }
-  }, [data, refresh]);
+  }, [data, refresh, discardWorkspace]);
 
   if (loading && data?.mode !== 'advisor') return <LoadingScreen />;
   if (!data) return <main className="loading-screen"><Brand/><p role="alert">无法确认当前登录状态，请重新连接。</p><button className="button button-primary" onClick={verifySession}>重新连接</button></main>;
@@ -198,9 +216,12 @@ function LoginScreen({ busy, onLogin, toast, sharedDemo, publicAccess }: { busy:
   </main>;
 }
 
+const caseSortOptions={updated_desc:'最近更新',updated_asc:'最早更新',created_desc:'最新建档',created_asc:'最早建档',name:'客户姓名'} as const;
+
 function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, setToast, toast, selectedCaseIdRef }: { data:Bootstrap; busy:string; act:ActionFn; refresh:(caseId?:string)=>Promise<Bootstrap>; handback:boolean; setHandback:(value:boolean)=>void; setToast:(v:Toast)=>void; toast:Toast; selectedCaseIdRef:React.MutableRefObject<string|undefined> }) {
   const [nav, setNav] = useState<'workspace'|'review'|'settings'|'trash'|'materials'>(data.user?.role === 'admin' ? 'settings' : data.user?.role === 'reviewer' ? 'review' : 'workspace');
   const [search, setSearch] = useState('');
+  const [caseSort, setCaseSort] = useState<keyof typeof caseSortOptions>('updated_desc');
   const [newClient, setNewClient] = useState(false);
   const [reportOpen, setReportOpen] = useState(data.user?.role==='reviewer');
   const [reviewScope, setReviewScope] = useState<ReviewScope>('pending');
@@ -213,7 +234,12 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
   const activeCase = data.activeCase && scopedCases.some(item=>item.id===data.activeCase?.id) ? data.activeCase : null;
   const activeCaseId = data.activeCase?.id;
   const reportJob = data.reportJob;
-  const filteredCases = scopedCases.filter(item => (item.clientName || '').toLowerCase().includes(search.trim().toLowerCase()));
+  const caseDateKey=caseSort.startsWith('created_')?'createdAt':'updatedAt';
+  const filteredCases = scopedCases.filter(item => (item.clientName || '').toLowerCase().includes(search.trim().toLowerCase())).sort((left,right)=>{
+    if(caseSort==='name')return (left.clientName||'').localeCompare(right.clientName||'','zh-CN',{numeric:true,sensitivity:'base'});
+    const difference=Date.parse(left[caseDateKey])-Date.parse(right[caseDateKey]);
+    return caseSort.endsWith('_asc')?difference:-difference;
+  });
   const reviewTitle = reviewScope==='all' ? '已交接案例' : data.user?.role==='reviewer' ? '待我复核' : '待 Charles 复核';
   const reviewDescription = reviewScope==='all' ? '查看已交接案例的当前状态，包括已复核、退回补问和后续更新。' : data.user?.role==='reviewer' ? '仅显示分配给您的待复核案例。' : '仅显示已提交给 Charles、等待复核的案例。报告草稿请在“客户”中处理。';
   const reviewEmptyDescription = data.user?.role==='reviewer' ? '顾问提交并分配给您的案例会出现在这里。' : '在“客户”的内部报告中提交 Charles 复核后，案例会出现在这里。';
@@ -286,14 +312,14 @@ function InternalWorkspace({ data, busy, act, refresh, handback, setHandback, se
       <header><div><span className="eyebrow">{nav==='review'?'交接队列':'客户工作区'}</span><h2>{nav==='review'?reviewTitle:'我的客户'}<span className="case-count">{scopedCases.length}</span></h2></div>{data.user?.role==='advisor' && nav==='workspace' && <button className="icon-button" aria-label="新建客户" onClick={()=>setNewClient(true)}><Icon name="plus"/></button>}</header>
       {nav==='review'&&<div className="review-queue-controls"><label>复核范围<select value={reviewScope} onChange={event=>void openCaseList('review',event.target.value as ReviewScope)}><option value="pending">待复核</option><option value="all">全部已交接</option></select></label><p>{reviewDescription}</p></div>}
       <label className="search-field"><Icon name="search"/><input aria-label="搜索客户或案例" value={search} onChange={e=>setSearch(e.target.value)} placeholder="搜索客户或案例"/></label>
-      <div className="directory-summary"><span>{filteredCases.length} 份案例</span><span>最近更新</span></div><div className="case-list">{filteredCases.map(item=><button key={item.id} className={`case-item ${activeCase?.id===item.id?'selected':''}`} onClick={()=>void selectCase(item)}>
-        <span className="avatar avatar-soft">{(item.clientName||'客').slice(0,1)}</span><span className="case-copy"><b>{item.clientName||'合成客户'}</b><small>{statusNames[item.status]||item.status}</small></span><time>{new Date(item.updatedAt).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'})}</time>
+      <div className="directory-summary"><span>{filteredCases.length} 份案例</span><select className="case-sort" aria-label="案例排序" value={caseSort} onChange={event=>setCaseSort(event.target.value as keyof typeof caseSortOptions)}>{Object.entries(caseSortOptions).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></div><div className="case-list">{filteredCases.map(item=><button key={item.id} className={`case-item ${activeCase?.id===item.id?'selected':''}`} onClick={()=>void selectCase(item)}>
+        <span className="avatar avatar-soft">{(item.clientName||'客').slice(0,1)}</span><span className="case-copy"><b>{item.clientName||'合成客户'}</b><small>{statusNames[item.status]||item.status}</small></span><time dateTime={item[caseDateKey]} title={`${caseDateKey==='createdAt'?'建档时间':'更新时间'}：${new Date(item[caseDateKey]).toLocaleString('zh-CN')}`}>{new Date(item[caseDateKey]).toLocaleDateString('zh-CN',{month:'numeric',day:'numeric'})}</time>
       </button>)}</div>
       {filteredCases.length===0 && <EmptyState title={search.trim()?'没有匹配的案例':nav==='review'?(reviewScope==='pending'?'暂无待复核案例':'暂无已交接案例'):'暂无客户案例'} body={search.trim()?'换个关键词试试。':nav==='review'?reviewEmptyDescription:'建立一位合成客户即可开始。'}/>}
     </aside>}
 
     <section className={`workspace ${nav==='settings'||nav==='trash'||nav==='materials'?'no-sidebar':''} ${mobileDetail||nav==='settings'||nav==='trash'||nav==='materials'?'mobile-show':''}`}>
-      <header className="workspace-header"><div>{nav!=='settings'&&nav!=='trash'&&nav!=='materials'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<div className="workspace-title"><span className="workspace-eyebrow">{nav==='review'?'REVIEW DESK':nav==='settings'?'YOUR WORKSPACE':nav==='trash'?'CASE ARCHIVE':nav==='materials'?'PRIVATE LIBRARY':'CLIENT DOSSIER'}</span><h1>{nav==='settings'?'账户设置':nav==='trash'?'已删除案例':nav==='materials'?'参考资料库':activeCase?.clientName||'选择一个案例'}</h1></div>{activeCase && nav!=='settings'&&nav!=='trash'&&nav!=='materials' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">{data.publicAccess?'共享语音测试版':data.sharedDemo?'共享模拟测试版':'合成数据'}</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
+      <header className="workspace-header"><div>{nav!=='settings'&&nav!=='trash'&&nav!=='materials'&&<button className="icon-button mobile-back" aria-label="返回案例列表" onClick={()=>setMobileDetail(false)}>‹</button>}<div className="workspace-title"><h1>{nav==='settings'?'账户设置':nav==='trash'?'已删除案例':nav==='materials'?'参考资料库':activeCase?.clientName||'选择一个案例'}</h1></div>{activeCase && nav!=='settings'&&nav!=='trash'&&nav!=='materials' && <span className={`status status-${activeCase.status}`}>{statusNames[activeCase.status]||activeCase.status}</span>}</div><div className="header-actions">{data.demo&&<span className="demo-pill">{data.publicAccess?'共享语音测试版':data.sharedDemo?'共享模拟测试版':'合成数据'}</span>}<button className="text-button" onClick={()=>void logout()}><Icon name="exit"/>退出</button></div></header>
       {data.publicAccess&&<p className="shared-demo-notice">真实 AI 与连续语音测试 · 仅使用虚构资料 · 允许麦克风后开始 · 邮件仅预览</p>}
       {data.sharedDemo&&<p className="shared-demo-notice">仅使用虚构资料 · 文字回复与报告由演示规则生成 · 邮件仅预览 · 真实连续语音未启用</p>}
       {nav==='materials'&&data.user?.role==='reviewer' ? <MaterialLibrary csrf={data.csrf} cases={data.cases} activeCaseId={activeCase?.id}/> : nav==='settings'||nav==='materials' ? <UserSettings user={data.user!}/> : nav==='trash' ? <DeletedCases cases={data.deletedCases??[]} busy={Boolean(busy)} onRestore={restoreCase} onPurge={setPurgeTarget}/> : activeCase ? <CaseWorkspace key={`${nav}:${activeCase.id}`} data={data} busy={busy} act={act} reportOpen={reportOpen} reviewMode={nav==='review'} setReportOpen={setReportOpen} setToast={setToast} setHandoff={setHandoff} onDelete={()=>setDeleteTarget(activeCase)} onRefresh={async()=>{await refresh(activeCase.id);}}/> : nav==='review' ? <div className="welcome-workspace"><h2>{scopedCases.length?'请选择一个复核案例':'当前没有可查看的复核案例'}</h2><p>{scopedCases.length?'从左侧列表选择案例，查看报告与来源。':reviewDescription}</p></div> : <WelcomeWorkspace advisor={data.user?.name||''} onNew={()=>setNewClient(true)} reviewer={data.user?.role==='reviewer'}/>}{/* Materials are reviewer-only even if stale UI state survives a session change. */}
@@ -335,7 +361,7 @@ function CaseWorkspace({data,busy,act,reportOpen,reviewMode,setReportOpen,setToa
   const [recordingOpened,setRecordingOpened]=useState(recordingInProgress);
   const openRecording=()=>{setRecordingOpened(true);setTab('recording');setReportOpen(false);};
   useEffect(()=>{ if(reportOpen)setTab('report'); },[reportOpen]);
-  const enterClient=async()=>{ await act({action:'enterClient',caseId:caseRecord.id}); };
+  const enterClient=async()=>{try{await act({action:'enterClient',caseId:caseRecord.id});}catch{/* act keeps a failed session refresh on the safe reconnect screen. */}};
   return <>
     <div className="case-banner">
       <div className="dossier-heading"><div className="client-identity"><span className="avatar avatar-large">{(client?.name||'客').slice(0,1)}</span><div><span className="dossier-eyebrow">专属规划档案 · CASE {String(caseRecord.caseNumber||1).padStart(2,'0')}</span><b>{client?.name}</b><span>{client?.state||'州待补充'}<i aria-hidden="true"> · </i>{client?.language||'中文'}</span></div></div><div className="dossier-meta"><span>本次建档</span><b>{new Date(caseRecord.createdAt).toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'})}</b></div></div>
@@ -380,7 +406,8 @@ function ReportView({data,report,act,busy,setHandoff}:{data:Bootstrap;report?:Re
     <div className="disclosure"><Icon name="alert"/><p><b>{report.provider.includes('mock')?'演示规则，待业务审核':'已配置云端分析'}</b><br/>{report.provider.includes('mock')?'本报告由确定性演示规则生成，不代表保险建议或业务准确率。':`分析来源：${report.provider}`}</p></div>
     {report.stale&&<div className="disclosure warning"><Icon name="alert"/><p><b>这不是最新事实版本</b><br/>事实已修改，请重新生成后再确认发送。</p></div>}
     <div className="disclosure"><Icon name="file"/><p><b>报告依据 {report.facts.length} 项已保存事实</b><br/>“资料不足”表示本次未采集到足够信息，不代表客户没有需求。语音可能识别有误，未进入事实表的内容请到访谈记录核对。</p></div>
-    <div className="report-sections">{presentReport(report).sections.map((section,index)=><details open={index===0} key={section.title}><summary><span>{String(index+1).padStart(2,'0')}</span>{section.title}</summary><p>{section.body}</p></details>)}<details><summary>来源编号与版本信息</summary><p>客户事实来源和知识资料来源分开保存；下载的 PDF 与邮件预览保留生成时的版本。</p>{presentReport(report).references.map(ref=><p key={ref.id}>{ref.label}：{ref.id}</p>)}{presentReport(report).knowledgeSources.length?<KnowledgeSources sources={report.knowledge!.sources} analyses={report.analyses} allowPrivateLinks={data.user?.role==='reviewer'}/>:<p>本报告没有保存知识资料引用。</p>}<p>案例编号：{report.caseId}<br/>客户编号：{report.clientId}<br/>报告版本：{report.version}<br/>快照编号：{report.snapshotId}</p></details></div>
+    <div className="report-sections">{presentReport(report).sections.map((section,index)=><details open={index===0} key={section.title}><summary>{section.title}</summary><p>{section.body}</p></details>)}<details><summary>来源编号与版本信息</summary><p>客户事实来源和知识资料来源分开保存；下载的 PDF 与邮件预览保留生成时的版本。</p>{presentReport(report).references.map(ref=><p key={ref.id}>{ref.label}：{ref.id}</p>)}{presentReport(report).knowledgeSources.length?<KnowledgeSources sources={report.knowledge!.sources} analyses={report.analyses} allowPrivateLinks={data.user?.role==='reviewer'}/>:<p>本报告没有保存知识资料引用。</p>}<p>案例编号：{report.caseId}<br/>客户编号：{report.clientId}<br/>报告版本：{report.version}<br/>快照编号：{report.snapshotId}</p></details></div>
+    {report.editorial&&<div className="report-sections"><details className="report-editorial"><summary>报告校对 · {report.editorial.status==='needs_attention'?'有待核对项':'结构检查已完成'}</summary><p>此项仅检查结构与明显矛盾，不能代替事实核验或 Charles 人工复核。历史版本的校对结果不会随新事实重算。</p><p>阅读对象：{report.editorial.brief.audience}<br/>报告用途：{report.editorial.brief.purpose}</p>{report.editorial.checks.map(check=><p key={check.id}><b>{check.question}</b><br/>{check.answer}</p>)}{report.editorial.issues.map((issue,index)=><p key={`${issue.code}-${index}`}>待核对：{issue.message}</p>)}</details></div>}
     <div className="analysis-grid">{report.analyses.map(item=><article key={item.category}><span>{categories.find(c=>c.id===item.category)?.title}</span><b>{statusNames[item.status]||item.status.replaceAll('_',' ')}</b><p>{item.reasonSummary}</p><small>待补充：{[...new Set(item.missingFields.map(key=>factLabels[key]||key))].join('、')||'无列出项'}</small></article>)}</div>
     <div className="report-footer-actions">{data.user?.role==='advisor'&&<button className="button button-primary" disabled={busy==='submitReview'||data.activeCase?.status==='pending_review'} onClick={()=>void act({action:'submitReview',caseId:report.caseId})}>{data.activeCase?.status==='pending_review'?'已提交，等待 Charles 复核':'提交 Charles 复核'}</button>}{data.user?.role==='reviewer'&&<ReviewActions report={report} act={act} busy={busy} setHandoff={setHandoff}/>}</div>
   </section>;
@@ -395,7 +422,7 @@ function KnowledgeSources({sources,analyses,allowPrivateLinks=false}:{allowPriva
 function ReviewActions({report,act,busy,setHandoff}:{report:ReportRecord;act:ActionFn;busy:string;setHandoff:(v:boolean)=>void}) {
   const [reason,setReason]=useState('');
   const submit=async(decision:string)=>{await act({action:'review',caseId:report.caseId,decision,reason});if(decision==='approved')setHandoff(true);};
-  return <div className="review-actions"><label>复核理由／备注<textarea value={reason} onChange={e=>setReason(e.target.value)} placeholder="请记录复核依据；退回或修改时说明具体原因"/></label><div><button className="button button-secondary" disabled={!reason||busy==='review'} onClick={()=>void submit('returned')}>退回补问</button><button className="button button-secondary" disabled={!reason||busy==='review'} onClick={()=>void submit('amended')}>记录修改</button><button className="button button-primary" disabled={!reason||busy==='review'} onClick={()=>void submit('approved')}><Icon name="check"/>确认复核</button></div></div>;
+  return <div className="review-actions"><header><h3>人工复核</h3><p>核对报告与事实来源后，记录本次复核意见。</p></header><label>复核理由／备注<textarea value={reason} onChange={e=>setReason(e.target.value)} placeholder="请记录复核依据；退回或修改时说明具体原因"/></label><div><button className="button button-secondary" disabled={!reason||busy==='review'} onClick={()=>void submit('returned')}>退回补问</button><button className="button button-secondary" disabled={!reason||busy==='review'} onClick={()=>void submit('amended')}>记录修改</button><button className="button button-primary" disabled={!reason||busy==='review'} onClick={()=>void submit('approved')}><Icon name="check"/>确认复核</button></div></div>;
 }
 
 function MailView({data,report,act,busy}:{data:Bootstrap;report?:ReportRecord;act:ActionFn;busy:string}) {
@@ -462,6 +489,8 @@ function HandbackBanner({onClose}:{onClose:()=>void}) {return <div className="ha
 function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Bootstrap;busy:string;act:ActionFn;refresh:(caseId?:string)=>Promise<Bootstrap>;setHandback:(value:boolean)=>void;setToast:(v:Toast)=>void}) {
   const session=data.clientSession!; const [draft,setDraft]=useState(''); const [muted,setMuted]=useState(false); const [ending,setEnding]=useState(false); const [interim,setInterim]=useState<{role:'user'|'assistant';text:string}|null>(null); const [voiceState,setVoiceState]=useState<BrowserVoiceState>('idle'); const [voiceError,setVoiceError]=useState(''); const messagesEnd=useRef<HTMLDivElement>(null); const voiceRef=useRef<BrowserVoiceClient|null>(null);
   const [pendingText,setPendingText]=useState<{text:string;eventId:string;saved:boolean}|null>(null);
+  const [replayEventId,setReplayEventId]=useState<string|null>(null);
+  const [replaying,setReplaying]=useState(false);
   const [liveMessages,setLiveMessages]=useState(data.messages);
   useEffect(()=>setLiveMessages(data.messages),[data.messages]);
   useEffect(()=>()=>{void voiceRef.current?.stopAll()},[]);
@@ -475,7 +504,10 @@ function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Boot
   async function choose(entry:Category){await act({action:'chooseEntry',entry});setVoiceError('');setVoiceState('idle');}
   async function startVoice(){
     setVoiceError('');
-    if(!voiceRef.current) voiceRef.current=new BrowserVoiceClient({csrf:data.csrf,onState:setVoiceState,onInterim:event=>setInterim(event),onError:text=>{setVoiceError(text);setToast({kind:'error',text});},onInterrupted:()=>setInterim(null),onFinal:event=>{setInterim(null);setLiveMessages(previous=>[...previous,{id:crypto.randomUUID(),caseId:'client-safe',sessionId:session.id,turnId:crypto.randomUUID(),eventId:crypto.randomUUID(),role:event.role,text:event.text,final:true,interrupted:event.interrupted,createdAt:new Date().toISOString(),knowledge:event.knowledge,responseStatus:event.responseStatus}])}});
+    if(!voiceRef.current) voiceRef.current=new BrowserVoiceClient({csrf:data.csrf,onState:setVoiceState,onReplayAvailable:setReplayEventId,onReplayState:setReplaying,onInterim:event=>setInterim(event),onError:text=>{setVoiceError(text);setToast({kind:'error',text});},onInterrupted:()=>setInterim(null),onFinal:event=>{
+      setInterim(null);const eventId=event.eventId??crypto.randomUUID();
+      setLiveMessages(previous=>previous.some(message=>message.eventId===eventId&&message.role===event.role)?previous:[...previous,{id:eventId,caseId:'client-safe',sessionId:session.id,turnId:eventId,eventId,role:event.role,text:event.text,final:true,interrupted:event.interrupted,createdAt:new Date().toISOString(),knowledge:event.knowledge,responseStatus:event.responseStatus}]);
+    }});
     try{await voiceRef.current.start();setToast({kind:'info',text:voiceConfigured?'正在建立实时语音连接。':'实时服务未配置；请使用文字完成演示。'});}catch{/* client reports a safe error through callbacks */}
   }
   async function submitText(message:{text:string;eventId:string;saved:boolean}){
@@ -483,17 +515,60 @@ function ClientAssistant({data,busy,act,refresh,setHandback,setToast}:{data:Boot
     try{await act({action:'message',text:message.text,eventId:message.eventId});setPendingText(null);setVoiceState('idle');}
     catch(error){const saved=error instanceof Error&&error.message.includes('已保存');setPendingText({...message,saved});setVoiceState('idle');if(saved)await refresh().catch(()=>undefined);}
   }
-  function sendMessage(e:FormEvent){e.preventDefault();if(!draft.trim()||pendingText)return;const text=draft.trim();setDraft('');if(voiceRef.current?.sendText(text)){setVoiceState('thinking');return;}void submitText({text,eventId:crypto.randomUUID(),saved:false});}
-  async function togglePause(){setInterim(null);if(session.state==='paused'){await act({action:'resume'});voiceRef.current=null;}else{await voiceRef.current?.stopAll();voiceRef.current=null;await act({action:'pause'});}}
+  function sendMessage(e:FormEvent){e.preventDefault();if(!draft.trim()||pendingText||replaying)return;const text=draft.trim();setDraft('');if(voiceRef.current?.sendText(text)){setVoiceState('thinking');return;}void submitText({text,eventId:crypto.randomUUID(),saved:false});}
+  async function togglePause(){
+    setInterim(null);
+    if(session.state==='paused'){
+      await act({action:'resume'});voiceRef.current=null;
+      setMuted(false);setVoiceError('');setVoiceState('idle');
+    }else{
+      await voiceRef.current?.stopAll();voiceRef.current=null;await act({action:'pause'});
+    }
+  }
   function toggleMute(){const next=!muted;setMuted(next);voiceRef.current?.setMuted(next)}
   async function end(){setEnding(true);setInterim(null);await voiceRef.current?.stopAll();let caseId:string|undefined;try{const result=await act({action:'end'},{noRefresh:true});caseId=result?.caseId;setHandback(true);await refresh(caseId);}catch{setEnding(false);await refresh(caseId).catch(()=>undefined)}}
   if(ending)return <main className="client-page"><section className="generating-state"><div className="loader"/><span className="eyebrow">访谈已结束</span><h1>请将手机交还给顾问</h1><p>正在保存最后的确定转写。内部报告将在顾问界面后台生成，不会向客户展示或朗读。</p></section></main>;
   return <main className={`client-page ${started?'client-page-active':'client-page-welcome'}`}>
-    <section className="assistant-panel" aria-label="客户访谈"><header><div className="assistant-identity"><span className="assistant-avatar">A</span><div><b>Aeconn AI 助手</b><span>受限客户模式</span></div></div><div className="interview-header-actions"><span className="interview-status"><i className={`state-dot state-${voiceState}`}/>{started?stateLabel[voiceState]:'准备访谈'}</span>{started&&<button className="icon-button" aria-label={session.state==='paused'?'恢复访谈':'暂停访谈'} onClick={()=>void togglePause()}><Icon name="pause"/></button>}</div></header>
-      <div className="assistant-content">{!started?<WelcomeAssistant onChoose={choose} busy={busy==='chooseEntry'}/>:<><div className="privacy-intro"><Icon name="check"/><p>我们一次聊一件事。您可以随时回答“不知道”或“不愿提供”，也可以暂停对话。</p></div><span className="source-pill interview-source">{data.capabilities.interview?.includes('云端 AI')?'文字访谈 · 真实 API（待验收）':data.capabilities.interview==='云端配置不完整'?'文字访谈 · 云端配置不完整':'文字访谈 · 本地演示逻辑'}</span>{session.state==='paused'&&<div className="paused-card"><Icon name="pause"/><b>访谈已暂停</b><p>采集与播音均已停止。点击右上角按钮后才会恢复。</p></div>}<div className="chat-stream">{liveMessages.map(message=><div key={message.id} className={`bubble-row ${message.role}`}><div className="bubble"><p>{message.text}</p>{message.responseStatus&&<small className="warning-text">{responseStatusLabel(message.responseStatus)}</small>}{!data.sharedDemo&&message.role==='assistant'&&<button aria-label="重播这条回答" onClick={()=>void voiceRef.current?.replayLast()}><Icon name="speaker"/>重播</button>}</div></div>)}{interim&&<div className={`bubble-row ${interim.role} interim-row`} aria-live="polite"><div className="bubble"><span>实时字幕</span><p>{interim.text}</p></div></div>}<div ref={messagesEnd}/></div></>}</div>
-      {started&&<footer className="assistant-controls">{pendingText&&<div className="pending-message" role="status"><Icon name={pendingText.saved?'check':'alert'}/><div><b>{pendingText.saved?'回答已保存，云端回复未完成':'发送未完成'}</b><p>{pendingText.text}</p></div><button className="button button-secondary" disabled={busy==='message'} onClick={()=>void submitText(pendingText)}>用原回答重试</button></div>}{voiceState==='error'&&<div className="inline-error"><Icon name="alert"/><span>{voiceError||'实时语音暂时不可用，您仍可用文字继续。'}</span></div>}{!data.sharedDemo&&voiceState==='idle'&&session.state!=='paused'&&<button className="voice-start" onClick={()=>void startVoice()}><Icon name="mic"/><span><b>开始连续语音对话</b><small>授权后无需每句话点发送</small></span></button>}<div className="voice-row"><button disabled={data.sharedDemo} className={`voice-button ${voiceState==='listening'?'listening':''}`} onClick={()=>voiceState==='idle'||voiceState==='error'?void startVoice():toggleMute()} aria-label={muted?'取消静音':'麦克风静音'}><Icon name={muted?'mute':'mic'}/></button><div><b>{muted?'已静音':stateLabel[voiceState]}</b><span>{voiceConfigured?'真实服务已配置 · 待目标手机验证':'模拟界面 · 未调用实时语音服务'}</span></div><button className="end-button" disabled={busy==='end'} onClick={()=>void end()}>结束对话</button></div><form className="message-form" onSubmit={sendMessage}><input aria-label="文字回答" value={draft} onChange={e=>setDraft(e.target.value)} disabled={Boolean(pendingText)} placeholder={pendingText?'请先重试已保存的回答':'输入文字回答，或说‘不知道’…'}/><button aria-label="发送" disabled={!draft.trim()||busy==='message'||Boolean(pendingText)}><Icon name="send"/></button></form></footer>}
+    <section className="assistant-panel" aria-label="客户访谈"><header><div className="assistant-identity"><span className="assistant-avatar" aria-hidden="true">A</span><div><b>Aeconn</b><span>受限客户模式</span></div></div><div className="interview-header-actions"><span className="interview-status"><i className={`state-dot state-${voiceState}`}/>{started?(session.state==='paused'?'访谈已暂停':stateLabel[voiceState]):'准备访谈'}</span>{started&&<button className="icon-button" aria-label={session.state==='paused'?'恢复访谈':'暂停访谈'} onClick={()=>void togglePause()}><Icon name={session.state==='paused'?'play':'pause'}/></button>}</div></header>
+      <div className="assistant-content">{!started?<WelcomeAssistant onChoose={choose} busy={busy==='chooseEntry'}/>:<><div className="privacy-intro"><Icon name="check"/><p>我们一次聊一件事。您可以随时回答“不知道”或“不愿提供”，也可以暂停对话。</p></div><InterviewGuide/><span className="source-pill interview-source">{data.capabilities.interview?.includes('云端 AI')?'文字访谈 · 真实 API（待验收）':data.capabilities.interview==='云端配置不完整'?'文字访谈 · 云端配置不完整':'文字访谈 · 本地演示逻辑'}</span>{session.state==='paused'&&<div className="paused-card"><Icon name="pause"/><b>访谈已暂停</b><p>采集与播音均已停止。点击右上角按钮后才会恢复。</p></div>}<div className="chat-stream">{liveMessages.map(message=><div key={message.id} className={`bubble-row ${message.role}`}><div className="bubble"><span className="bubble-speaker">{message.role==='assistant'?'Aeconn AI 助手':'您'}</span><p>{message.text}</p>{message.responseStatus&&<small className="warning-text">{responseStatusLabel(message.responseStatus)}</small>}{!data.sharedDemo&&message.role==='assistant'&&replayEventId===message.eventId&&<button aria-label="重播这条回答" disabled={replaying||voiceState!=='listening'} onClick={()=>void voiceRef.current?.replayLast(message.eventId)}><Icon name="speaker"/>重播</button>}</div></div>)}{interim&&<div className={`bubble-row ${interim.role} interim-row`} aria-live="polite"><div className="bubble"><span>实时字幕</span><p>{interim.text}</p></div></div>}<div ref={messagesEnd}/></div></>}</div>
+      {started&&<footer className="assistant-controls">{pendingText&&<div className="pending-message" role="status"><Icon name={pendingText.saved?'check':'alert'}/><div><b>{pendingText.saved?'回答已保存，云端回复未完成':'发送未完成'}</b><p>{pendingText.text}</p></div><button className="button button-secondary" disabled={busy==='message'} onClick={()=>void submitText(pendingText)}>用原回答重试</button></div>}{voiceState==='error'&&<div className="inline-error"><Icon name="alert"/><span>{voiceError||'实时语音暂时不可用，您仍可用文字继续。'}</span></div>}{!data.sharedDemo&&voiceState==='idle'&&session.state!=='paused'&&<button className="voice-start" onClick={()=>void startVoice()}><Icon name="mic"/><span><b>开始连续语音对话</b><small>授权后无需每句话点发送</small></span></button>}<div className="voice-row"><button disabled={data.sharedDemo||replaying} className={`voice-button ${voiceState==='listening'?'listening':''}`} onClick={()=>voiceState==='idle'||voiceState==='error'?void startVoice():toggleMute()} aria-label={muted?'取消静音':'麦克风静音'}><Icon name={muted?'mute':'mic'}/></button><div><b>{session.state==='paused'?'访谈已暂停':replaying?'正在重播':muted?'已静音':stateLabel[voiceState]}</b></div><button className="end-button" disabled={busy==='end'} onClick={()=>void end()}>结束对话</button></div><form className="message-form" onSubmit={sendMessage}><input aria-label="文字回答" value={draft} onChange={e=>setDraft(e.target.value)} disabled={Boolean(pendingText)||replaying} placeholder={pendingText?'请先重试已保存的回答':'输入文字回答，或说‘不知道’…'}/><button aria-label="发送" disabled={!draft.trim()||busy==='message'||Boolean(pendingText)||replaying}><Icon name="send"/></button></form><p className="voice-service-note">{voiceConfigured?'真实服务已配置 · 待目标手机验证':'模拟界面 · 未调用实时语音服务'}</p></footer>}
     </section><ToastView toast={null}/>
   </main>;
 }
 
-function WelcomeAssistant({onChoose,busy}:{onChoose:(v:Category)=>Promise<void>;busy:boolean}) {return <div className="assistant-welcome"><span className="assistant-avatar assistant-avatar-large" aria-hidden="true">A</span><span className="section-kicker">A CONVERSATION FOR YOU</span><h2>您好，我是 Aeconn AI 助手</h2><p>从您最在意的一件事开始。<br/>选一个方向，我们按您的节奏聊。</p><div className="category-grid">{categories.map(category=><button key={category.id} disabled={busy} onClick={()=>void onChoose(category.id)}><span aria-hidden="true">{category.icon}</span><div><b>{category.title}</b><small>{category.caption}</small></div><span className="category-arrow" aria-hidden="true">↗</span></button>)}</div><p className="interview-welcome-note">可以说，也可以打字。不确定的地方，留给顾问一起核对。</p><div className="client-disclaimer"><Icon name="alert"/><span>本 Demo 不选择具体产品、不报价、不保证收益，也不会提交申请。</span></div></div>}
+function InterviewGuide() {
+  return <details className="interview-guide">
+    <summary>访谈怎么进行</summary>
+    <ol>
+      <li><b>先聊目标</b>，从您最在意的事开始。</li>
+      <li><b>补充关键情况</b>，已有回答会供后续问题参考；不确定的内容留待核对。</li>
+      <li><b>交还顾问</b>，开始访谈后，您可以随时点击“结束对话”停止音频并交还设备。</li>
+    </ol>
+    <p>访谈中，您可以说“为什么问这个”，也可以回答“不知道”或“不愿提供”。想先和顾问聊时，可以说“我想找顾问”；请点击“结束对话”完成交还。</p>
+  </details>;
+}
+
+function TopicIcon({category}:{category:Category}) {
+  const paths:Record<Category,React.ReactNode>={
+    life:<><path d="m3 11 9-8 9 8M5 10v11h14V10"/><path d="M9 21v-7h6v7"/></>,
+    disability_income:<><rect x="3" y="7" width="18" height="14" rx="2"/><path d="M8 7V3h8v4M3 12a20 20 0 0 0 18 0M12 11v4"/></>,
+    annuity:<><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2M3 12h2M19 12h2"/></>,
+    ltc:<><path d="M12 19 4.5 12a4.5 4.5 0 0 1 7.5-5 4.5 4.5 0 0 1 7.5 5Z"/><path d="M12 8v6M9 11h6"/></>,
+  };
+  return <svg className="icon" viewBox="0 0 24 24" aria-hidden="true">{paths[category]}</svg>;
+}
+
+function WelcomeAssistant({onChoose,busy}:{onChoose:(v:Category)=>Promise<void>;busy:boolean}) {
+  return <div className="assistant-welcome">
+    <p className="interview-greeting">您好，我是 Aeconn AI 助手。</p>
+    <h2>从您最在意的事，<br/>慢慢聊起。</h2>
+    <p>选一个方向开始，我们按您的节奏聊。</p>
+    <div className="category-grid">{categories.map(category=><button key={category.id} disabled={busy} onClick={()=>void onChoose(category.id)}>
+      <span><TopicIcon category={category.id}/></span>
+      <div><b>{category.title}</b><small>{category.caption}</small></div>
+    </button>)}</div>
+    <p className="interview-welcome-note">可以说，也可以打字。不确定的地方，留给顾问一起核对。</p>
+    <InterviewGuide/>
+    <div className="client-disclaimer"><Icon name="alert"/><span>本 Demo 不选择具体产品、不报价、不保证收益，也不会提交申请。</span></div>
+  </div>;
+}
